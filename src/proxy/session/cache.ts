@@ -176,6 +176,7 @@ export function lookupSession(
         lineageHash: shared.lineageHash || "",
         messageHashes: shared.messageHashes,
         sdkMessageUuids: shared.sdkMessageUuids,
+        passthroughResumeUuid: shared.passthroughResumeUuid,
         contextUsage: shared.contextUsage,
       }
       const result = classifyLineage(state, messages, sessionId)
@@ -204,6 +205,7 @@ export function lookupSession(
         lineageHash: shared.lineageHash || "",
         messageHashes: shared.messageHashes,
         sdkMessageUuids: shared.sdkMessageUuids,
+        passthroughResumeUuid: shared.passthroughResumeUuid,
         contextUsage: shared.contextUsage,
       }
       const result = classifyLineage(state, messages, fp)
@@ -241,6 +243,7 @@ export function getSessionByClaudeId(claudeSessionId: string): SessionState | un
       lineageHash: shared.lineageHash || "",
       messageHashes: shared.messageHashes,
       sdkMessageUuids: shared.sdkMessageUuids,
+      passthroughResumeUuid: shared.passthroughResumeUuid,
       contextUsage: shared.contextUsage,
     })
   }
@@ -258,7 +261,8 @@ export function storeSession(
   claudeSessionId: string,
   workingDirectory?: string,
   sdkMessageUuids?: Array<string | null>,
-  contextUsage?: TokenUsage
+  contextUsage?: TokenUsage,
+  passthroughResumeUuid?: string | null
 ) {
   if (!claudeSessionId) return
   const lineageHash = computeLineageHash(messages)
@@ -270,6 +274,7 @@ export function storeSession(
     lineageHash,
     messageHashes,
     sdkMessageUuids,
+    ...(passthroughResumeUuid ? { passthroughResumeUuid } : {}),
     ...(contextUsage ? { contextUsage } : {}),
   }
   // In-memory cache
@@ -291,7 +296,9 @@ export function storeSession(
       lineageHash,
       messageHashes,
       sdkMessageUuids,
-      contextUsage
+      contextUsage,
+      // undefined would preserve the stored boundary; a full store must rewrite it.
+      passthroughResumeUuid ?? null
     )
   }
 }

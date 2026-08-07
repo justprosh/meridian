@@ -102,6 +102,32 @@ describe("Shared session store", () => {
     expect(byClaudeId?.contextUsage).toEqual({ input_tokens: 9, output_tokens: 4 })
   })
 
+  it("should persist and clear the passthrough resume boundary", () => {
+    storeSharedSession(
+      "session-boundary",
+      "claude-sess-boundary",
+      1,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "deny-uuid"
+    )
+    expect(lookupSharedSession("session-boundary")?.passthroughResumeUuid).toBe("deny-uuid")
+
+    storeSharedSession(
+      "session-boundary",
+      "claude-sess-boundary",
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      null
+    )
+    expect(lookupSharedSession("session-boundary")?.passthroughResumeUuid).toBeUndefined()
+  })
+
   it("should return the freshest match when multiple keys share a Claude session ID", () => {
     storeSharedSession("session-old", "claude-shared")
     const first = lookupSharedSessionByClaudeId("claude-shared")
