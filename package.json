@@ -1,6 +1,6 @@
 {
   "name": "@rynfar/meridian",
-  "version": "1.60.0+deny-boundary.3",
+  "version": "1.60.0+deny-boundary.4",
   "description": "Local Anthropic API powered by your Claude Max subscription. One subscription, every agent.",
   "type": "module",
   "main": "./dist/server.js",
