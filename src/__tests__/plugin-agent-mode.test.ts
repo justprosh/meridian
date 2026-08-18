@@ -119,3 +119,59 @@ describe("plugin/meridian.ts agent-mode header", () => {
     expect((await headersFor(hooks, "general"))["x-opencode-agent-mode"]).toBe("subagent")
   })
 })
+
+/**
+ * title/summary run in the PARENT session and fire in parallel with the user's
+ * real turn, so sending the session id makes them race it for the per-session
+ * turn lease — the loser gets 400 session_turn_conflict. They must go out
+ * without the session header AND with x-meridian-source, which is what keeps
+ * the proxy's fingerprint fallback from gluing them back onto the session.
+ */
+describe("plugin/meridian.ts parent-session one-shots", () => {
+  it("title is detached from the session and declares a parallel stream", async () => {
+    const hooks = await instance()
+    const h = await headersFor(hooks, "title")
+    expect(h["x-opencode-session"]).toBeUndefined()
+    expect(h["x-meridian-source"]).toBe("subagent-title")
+    expect(h["x-opencode-request"]).toBe("msg_test")
+    expect(h["x-opencode-agent-name"]).toBe("title")
+    expect(h["x-opencode-agent-mode"]).toBe("subagent")
+  })
+
+  it("summary is detached from the session and declares a parallel stream", async () => {
+    const hooks = await instance()
+    const h = await headersFor(hooks, "summary")
+    expect(h["x-opencode-session"]).toBeUndefined()
+    expect(h["x-meridian-source"]).toBe("subagent-summary")
+  })
+
+  it("legacy object agent shape is detached too", async () => {
+    const hooks = await instance()
+    const h = await headersFor(hooks, { name: "title", mode: "subagent" })
+    expect(h["x-opencode-session"]).toBeUndefined()
+    expect(h["x-meridian-source"]).toBe("subagent-title")
+  })
+
+  it("primary agents keep the session header and get no source header", async () => {
+    const hooks = await instance()
+    const h = await headersFor(hooks, "build")
+    expect(h["x-opencode-session"]).toBe("ses_test")
+    expect(h["x-meridian-source"]).toBeUndefined()
+  })
+
+  it("compaction keeps the session header — the proxy needs it for lineage", async () => {
+    const hooks = await instance()
+    const h = await headersFor(hooks, "compaction")
+    expect(h["x-opencode-session"]).toBe("ses_test")
+    expect(h["x-meridian-source"]).toBeUndefined()
+  })
+
+  it("subagent-mode agents with their own session id keep the session header", async () => {
+    const hooks = await instance()
+    for (const agent of ["general", "explore"]) {
+      const h = await headersFor(hooks, agent)
+      expect(h["x-opencode-session"]).toBe("ses_test")
+      expect(h["x-meridian-source"]).toBeUndefined()
+    }
+  })
+})

@@ -50,6 +50,16 @@ const BUILTIN_AGENT_MODES: Record<string, string> = {
   compaction: "subagent",
 }
 
+/**
+ * One-shot utilities OpenCode runs inside the PARENT session instead of a
+ * child one (unlike general/explore, which carry their own session id), and
+ * concurrently with the user's turn. They are detached from the session in
+ * chat.headers — see the comment there.
+ * compaction is deliberately absent: the proxy excludes it from turn conflict
+ * itself and needs its session id to attach the compaction to the lineage.
+ */
+const PARENT_SESSION_ONE_SHOTS = new Set(["title", "summary"])
+
 const MeridianPlugin: Plugin = async () => {
   // Modes from the merged config, per plugin instance. Replaced wholesale on
   // every config-hook fire so a reload can't leave stale entries behind.
@@ -82,11 +92,22 @@ const MeridianPlugin: Plugin = async () => {
       // Only inject headers for Anthropic provider requests
       if (incoming.model.providerID !== "anthropic") return
 
-      // Session tracking
-      output.headers["x-opencode-session"] = incoming.sessionID
-      output.headers["x-opencode-request"] = incoming.message.id
-
       const { name, mode } = resolve(incoming.agent)
+
+      // Session tracking
+      output.headers["x-opencode-request"] = incoming.message.id
+      if (PARENT_SESSION_ONE_SHOTS.has(name)) {
+        // title/summary run inside the PARENT session and fire in parallel with
+        // the user's real turn: carrying its session id makes them race it for
+        // the per-session turn lease, and the loser gets 400
+        // session_turn_conflict. Dropping the session header alone is not
+        // enough — the fingerprint fallback would glue them back onto the same
+        // session (title's first user message is the conversation's own), so
+        // declare a parallel stream, which routes them to their own lineage.
+        output.headers["x-meridian-source"] = `subagent-${name}`
+      } else {
+        output.headers["x-opencode-session"] = incoming.sessionID
+      }
 
       // The proxy expects primary|subagent. "all" agents can act as either;
       // without per-request context, treat them as primary (full tier) to
