@@ -120,13 +120,6 @@ describe("plugin/meridian.ts agent-mode header", () => {
   })
 })
 
-/**
- * title/summary run in the PARENT session and fire in parallel with the user's
- * real turn, so sending the session id makes them race it for the per-session
- * turn lease — the loser gets 400 session_turn_conflict. They must go out
- * without the session header AND with x-meridian-source, which is what keeps
- * the proxy's fingerprint fallback from gluing them back onto the session.
- */
 describe("plugin/meridian.ts parent-session one-shots", () => {
   it("title is detached from the session and declares a parallel stream", async () => {
     const hooks = await instance()
