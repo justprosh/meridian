@@ -6384,6 +6384,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             buffer = lines.pop() ?? ""
 
             for (const line of lines) {
+              if (line.startsWith(":")) {
+                controller.enqueue(encoder.encode(`${line}\n\n`))
+                continue
+              }
               if (!line.startsWith("data: ")) continue
               const dataStr = line.slice(6).trim()
               if (!dataStr) continue
@@ -6512,6 +6516,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             const lines = buffer.split("\n")
             buffer = lines.pop() ?? ""
             for (const line of lines) {
+              if (line.startsWith(":")) {
+                controller.enqueue(encoder.encode(`${line}\n\n`))
+                continue
+              }
               if (!line.startsWith("data: ")) continue
               const dataStr = line.slice(6).trim()
               if (!dataStr) continue
