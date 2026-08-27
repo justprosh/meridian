@@ -22,6 +22,7 @@ import {
   makeRequest,
   makeToolResultRequest,
   parseSSE,
+  withMockSdkSessionId,
 } from "./helpers"
 
 // --- Capture SDK calls ---
@@ -35,7 +36,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     queryCallCount++
     return (async function* () {
       for (const msg of mockMessages) {
-        yield msg
+        yield withMockSdkSessionId(msg, params.options)
       }
     })()
   },
@@ -107,7 +108,9 @@ describe("Phase 3: Concurrent request support", () => {
 
     const app = createTestApp()
 
-    // Fire two requests simultaneously (like OpenCode does with main + title gen)
+    // Fire two headerless requests simultaneously (like OpenCode does with
+    // main + title generation). A weak conversation fingerprint must not turn
+    // these independent requests into one strict session lock.
     const [r1, r2] = await Promise.all([
       postMessages(app, makeRequest({ stream: true })),
       postMessages(app, makeRequest({ stream: true })),

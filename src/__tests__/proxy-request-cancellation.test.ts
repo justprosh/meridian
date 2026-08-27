@@ -24,13 +24,16 @@ function assistantMessage() {
   }
 }
 
+import { withMockSdkSessionId } from "./helpers"
+
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
-  query: (params: { options?: { abortController?: AbortController } }) => {
+  query: (params: { options?: { abortController?: AbortController; sessionId?: string } }) => {
     capturedController = params.options?.abortController
     notifyQueryStarted?.()
     return (async function* () {
       if (mode === "complete") {
-        yield assistantMessage()
+        const message = assistantMessage()
+        yield withMockSdkSessionId(message, params.options)
         return
       }
 
@@ -108,7 +111,7 @@ describe("request cancellation propagation", () => {
     expect(capturedController).toBeDefined()
     expect(capturedController!.signal.aborted).toBe(true)
     expect(capturedController!.signal.reason).toBe("client timeout")
-    expect(response.status).toBeGreaterThanOrEqual(500)
+    expect(response.status).toBe(499)
   })
 
   it("aborts a streaming SDK query when the response body is cancelled", async () => {

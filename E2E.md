@@ -90,6 +90,11 @@ kill $(lsof -ti :3456)
 | E35 | [SDK boundary assumptions (#694/#708/#710)](#e35-sdk-boundary-assumptions-694708710) | **Automated**: `bun scripts/e2e-sdk-boundary.mjs` — real SDK: rate-limit reset units land in a sane window, every live content-block type is classified for hashing, resume survives a client dropping thinking blocks, and reports whether the gitStatus block still misstates its provenance. **Run after any `@anthropic-ai/claude-agent-sdk` bump** and before releases touching lineage, rate limits, or the system prompt | 2026-07-29 |
 | E36 | [Client detection after an upgrade (#733)](#e36-client-detection-after-an-upgrade-733) | **Automated**: `bun scripts/e2e-client-detection.mjs` — drives each installed client against a local stub, captures its real headers, and asserts the adapter Meridian resolves. **Run after upgrading any client**; costs no tokens | 2026-07-31 |
 | E37 | [WebFetch preflight scope (#748)](#e37-webfetch-preflight-scope-748) | **Automated**: `bun scripts/e2e-webfetch-preflight.mjs` — stubbed `claude` + isolated HOME: the toggle reaches the right adapter's `--settings`, and only `cherry` can actually run the built-in WebFetch, so the documented scope is asserted rather than assumed. **Run before releases touching sdkFeatures, query settings, or tool config**; costs no tokens | 2026-08-03 |
+| E38 | [Silent turns (#768)](#e38-silent-turns-768) | **Automated**: `bun scripts/e2e-silent-turn.mjs` — real CLI, SSE mode. Asserts four things per attempt: the client got text or a tool call; recovered content sits BEFORE the terminal `message_delta` (content behind it is dropped by a correct client); exactly one `message_delta` per message; and a third turn after a recovery still resumes. Attribution is read from `/telemetry/logs`, not stdout. Pair `MERIDIAN_DEBUG_FORCE_SILENT_TURN=1` against `MERIDIAN_SILENT_TURN_RECOVERY=0` for the before/after. **Run before any release touching the passthrough tool loop, prompt assembly, or session resume** | 2026-08-11 |
+| E39 | [OpenCode internal-agent session key (#845)](#e39-opencode-internal-agent-session-key-845) | **Manual**, real OpenCode: its `title` agent runs under the USER'S session id, so the user's first turn used to queue behind it and then get HTTP 400 `session_turn_conflict`. Asserts the first turn succeeds, waits ~0ms on the session lease, and every later request is `lineage=continuation`. **Run after any OpenCode upgrade and before releases touching session keys or the turn coordinator** | 2026-08-19 |
+| E40 | [Passthrough digest-turn cap](#e40-passthrough-digest-turn-cap) | **Automated**: `bun scripts/e2e-digest-turn-cap.mjs` — real SDK. Asserts the capped tool turn generates no digest text, costs materially less than uncapped on an identical prompt, still RESUMES at its captured checkpoint, leaves text-only turns returning `success`, and does not truncate parallel tool calls. **Run before any release touching the passthrough tool loop, `maxTurns`, or the early-stop checkpoint** | 2026-08-20 |
+| E41 | [Passthrough multi-turn: one call, one answer](#e41-passthrough-multi-turn-one-call-one-answer) | **Automated**: `bun scripts/e2e-passthrough-turns.mjs [--stream]` — real proxy + SDK + Claude Max. Chain and `PROBE_PARALLEL=1` modes assert exact tool-call batching, a distinct durable fork per result round, one real answer per delivered call in the active transcript, and full prompt-cache continuity. **Run all four chain/parallel × stream/non-stream combinations before releases touching passthrough resume or the deny hook** | 2026-08-26 |
+| E42 | [OpenCode V2 beta compatibility](#e42-opencode-v2-beta-compatibility) | **Manual**, pinned `@opencode-ai/cli@0.0.0-beta-18314`: hidden title/summary isolation, durable continuation and restart, passthrough tools, supported undo/fork/compaction, and concurrent general subagents. **Run after any V2 plugin/API change; another beta version is not a pass** | 2026-08-27 |
 
 | P1 | [Profile: List & Auth Status](#p1-profile-list--auth-status) | `/profiles/list` returns profiles with emails, login status, auth timestamps | - |
 | P2 | [Profile: Switch via API](#p2-profile-switch-via-api) | `POST /profiles/active` switches profile; health endpoint reflects new email | - |
@@ -119,6 +124,8 @@ cat /tmp/proxy-e2e.log | strings | grep "\[PROXY\]" | tail -5
 ```
 
 **Session header.** All curl tests use `x-opencode-session` to control session identity. This is the header the OpenCode adapter reads.
+
+**Diagnostics vs gates.** `scripts/e2e-*.mjs` are gates: they assert and exit non-zero. Real-session gates must inspect history only through supported Agent SDK APIs such as `getSessionMessages()`. Never locate, parse, rewrite, or mutate Claude's private transcript files.
 
 **Cleanup.** Each test section is independent. Kill the proxy and clear the session store between sections if you need isolation:
 ```bash
@@ -991,32 +998,41 @@ curl -s -X POST http://127.0.0.1:3456/auth/refresh
 
 ## E23: Subagent Model Selection
 
-**Verifies:** When the `x-opencode-agent-mode: subagent` header is present, the proxy selects the base model (200k) instead of the 1M variant, conserving rate limit budget for the primary agent. The `meridian-agent-mode.ts` plugin sets this header automatically based on the agent's runtime `mode` field.
+**Verifies:** When the `x-opencode-agent-mode: subagent` header or a generic `x-meridian-source: subagent-*` declaration is present, the proxy selects the base model (200k) instead of the 1M variant, conserving rate limit budget for the primary agent. The `meridian-agent-mode.ts` plugin sets the OpenCode header automatically based on the agent's runtime `mode` field. SDK-native Task agent definitions also receive the matching base tier explicitly, so they do not inherit an `opus[1m]` parent.
 
 ### Part A — header routing (curl, no plugin needed)
 
 ```bash
-# Primary agent → sonnet[1m]
+# Primary agent → opus[1m]
 curl -s http://127.0.0.1:3456/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: dummy" \
   -H "x-opencode-agent-mode: primary" \
-  -d '{"model":"claude-sonnet-4-6","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}' > /dev/null
-# Proxy log: model=sonnet[1m] ... agent=primary
+  -d '{"model":"claude-opus-4-6","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}' > /dev/null
+# Proxy log: model=opus[1m] ... agent=primary
 
-# Subagent → sonnet (base)
+# Subagent → opus (base)
 curl -s http://127.0.0.1:3456/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: dummy" \
   -H "x-opencode-agent-mode: subagent" \
-  -d '{"model":"claude-sonnet-4-6","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}' > /dev/null
-# Proxy log: model=sonnet ... agent=subagent
+  -d '{"model":"claude-opus-4-6","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}' > /dev/null
+# Proxy log: model=opus ... agent=subagent
+
+# Generic source declaration (works across adapters) → base opus
+curl -s http://127.0.0.1:3456/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: dummy" \
+  -H "x-meridian-source: subagent-reviewer" \
+  -d '{"model":"claude-opus-4-6","max_tokens":10,"stream":false,"messages":[{"role":"user","content":"hi"}]}' > /dev/null
+# Proxy log: model=opus ... source=subagent-reviewer agent=subagent
 ```
 
 **Pass criteria (Part A):**
-- Primary request proxy log: `model=sonnet[1m] ... agent=primary`
-- Subagent request proxy log: `model=sonnet ... agent=subagent` — base model, no `[1m]`
-- No header → `model=sonnet[1m]` (default primary behaviour)
+- Primary request proxy log: `model=opus[1m] ... agent=primary`
+- Subagent request proxy log: `model=opus ... agent=subagent` — base model, no `[1m]`
+- Generic `subagent-*` source: base tier and `agent=subagent`, even outside OpenCode
+- No header → `model=opus[1m]` (default primary behaviour)
 
 ### Part B — plugin integration (requires OpenCode)
 
@@ -1035,17 +1051,17 @@ cp /path/to/meridian/examples/opencode-plugin/meridian-agent-mode.ts ./meridian-
 **Test:**
 ```bash
 # Run a task that uses the Task tool to spawn the researcher agent
-opencode run --model anthropic/claude-sonnet-4-6 \
+opencode run --model anthropic/claude-opus-4-6 \
   "Use the researcher agent to find out what day it is, then summarise."
 ```
 
 **Pass criteria (Part B):**
-- Primary session log line: `model=sonnet[1m] agent=primary`
-- Subagent session log line: `model=sonnet agent=subagent`
+- Primary session log line: `model=opus[1m] agent=primary`
+- Subagent session log line: `model=opus agent=subagent`
 - Both requests succeed — no errors
 - Two distinct proxy log entries visible (parent + subagent turn)
 
-**What's being tested:** `mapModelToClaudeModel()` `agentMode` parameter in `models.ts`, `x-opencode-agent-mode` header reading in `server.ts`, and the `meridian-agent-mode.ts` plugin's use of `(incoming.agent as any).mode` to detect subagents without any API calls.
+**What's being tested:** `mapModelToClaudeModel()` subagent tier selection in `models.ts`, OpenCode agent-mode extraction through its adapter, generic `x-meridian-source` fallback in `server.ts`, base-tier SDK agent definitions in `agentDefs.ts`, and the `meridian-agent-mode.ts` plugin's use of the runtime agent mode without any API calls.
 
 ---
 
@@ -3326,3 +3342,301 @@ removing `cherry` from `ADAPTER_LABELS` fails the static counterpart in
 **Static counterpart:** the `WebFetch preflight scope` block in `query.test.ts`
 pins the same three adapter shapes at the `buildQueryOptions` level, so tool
 config drift fails in CI without starting a proxy.
+
+## E38: Silent turns (#768)
+
+**Automated**, costs real tokens (two turns per attempt, plus one per silence
+the recovery repairs):
+
+```bash
+bun scripts/e2e-silent-turn.mjs
+E2E_ATTEMPTS=10 bun scripts/e2e-silent-turn.mjs
+
+# The pair that actually proves the guard, on demand:
+MERIDIAN_DEBUG_FORCE_SILENT_TURN=1 MERIDIAN_SILENT_TURN_RECOVERY=0 bun scripts/e2e-silent-turn.mjs  # FAILS
+MERIDIAN_DEBUG_FORCE_SILENT_TURN=1 bun scripts/e2e-silent-turn.mjs                                  # passes
+```
+
+**Why this exists:** three separate defects have now ended in the same shape —
+`stop_reason: "end_turn"`, HTTP 200, `error: null`, and nothing the client can
+act on. An interrupted tail, an unsettled client abort, a spent deny at the
+boundary seam. Each was found by reading a transcript after the fact; each
+mocked suite stayed green while the field kept breaking.
+
+They have nothing in common except their outcome, so the outcome is what this
+measures. Every turn is asked one question — did the client receive text or a
+tool call? — which a cause nobody has found yet fails exactly like the three
+known ones.
+
+It drives the shape all three took: a tool call, then the turn that must answer
+its result, in a fresh session each attempt. Every observed silence landed on a
+session's **second** turn, where the deny is the largest thing in a still-short
+context.
+
+**Fault injection, and why it is not optional.** The live rate is about three in
+five hundred requests. A ten-attempt run expects 0.06 occurrences, so a green
+run without injection is ambiguous — the guard works, or the defect simply did
+not happen. That ambiguity is what let two earlier "verified" fixes ship broken.
+`MERIDIAN_DEBUG_FORCE_SILENT_TURN=1` drops the upstream turn's text deltas while
+leaving its block start and stop, which is the production signature exactly;
+detection, recovery, envelope and telemetry then run for real against a real
+model. Only the trigger is synthetic.
+
+**Pass criteria:**
+
+- every turn under test carries text or ≥1 tool call
+- exactly one `message_stop` per turn
+- any `error` event precedes `message_stop` — behind it, clients have already
+  stopped reading and the failure is invisible
+- a failed turn with no text does not claim `stop_reason: "end_turn"`
+- an attempt where the model never called a tool is reported as **skipped**,
+  not counted as a pass: it never reached the shape under test
+
+**Reading the output:** `silent: 0` says the client always got an answer, not
+that nothing broke upstream — `upstream: N silent turns detected, M recovered`
+is where the mechanism shows itself. Compare an injected run with recovery ON
+against the same run with `MERIDIAN_SILENT_TURN_RECOVERY=0`; comparing a single
+recovery-ON run against nothing tells you almost nothing.
+
+**Verified:** 2026-08-11. Injected, recovery OFF: 2/2 attempts FAIL with
+`text=0 tools=0`. Injected, recovery ON: 2/2 pass, the answer arriving as real
+text deltas. Uninjected, both settings: 3/3 pass, no silences — the live rate is
+far below what a run this size can see, which is the whole reason injection
+exists.
+
+---
+
+## E39: OpenCode internal-agent session key (#845)
+
+**Verifies:** OpenCode's internal `title` agent cannot break or de-cache the
+user's conversation.
+
+OpenCode runs `title` (and `summary`, `compaction`) under the **user's** session
+id, and fires it concurrently with the user's first real turn. Both requests
+carried the same `x-opencode-session`, so they shared one lineage and one
+per-session turn lease. Whichever arrived first committed its own conversation
+under the shared key; the other was then measured against a history that was not
+its own.
+
+Mocked tests cover the key derivation and the HTTP outcome. This exists because
+neither can prove OpenCode still *sends* what the fix keys on — a client upgrade
+that renames or drops `x-opencode-agent-mode` / `x-opencode-agent-name` puts the
+collision straight back with every suite green.
+
+```bash
+# Isolated OpenCode config. OPENCODE_CONFIG_DIR alone is NOT enough — OpenCode
+# merges ~/.config/opencode/opencode.json on top of it, which drags in the real
+# config's MCP servers and can hang `init` for minutes. XDG_CONFIG_HOME is what
+# actually isolates it.
+BASE=/tmp/e39; rm -rf $BASE; mkdir -p $BASE/{proj,cfg}
+printf 'alpha\nbeta\ngamma\n' > $BASE/proj/notes.txt
+cat > $BASE/cfg/opencode.json <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["/absolute/path/to/meridian/plugin/meridian.ts"],
+  "provider": { "anthropic": { "options": { "apiKey": "dummy", "baseURL": "http://127.0.0.1:3499" } } },
+  "model": "anthropic/claude-haiku-4-5",
+  "small_model": "anthropic/claude-haiku-4-5"
+}
+JSON
+
+MERIDIAN_TELEMETRY_PERSIST=1 MERIDIAN_TELEMETRY_DB=$BASE/t.db MERIDIAN_PORT=3499 \
+  node dist/cli.js > $BASE/proxy.log 2>&1 &
+sleep 6
+
+cd $BASE/proj
+export OPENCODE_CONFIG_DIR=$BASE/cfg XDG_CONFIG_HOME=$BASE/xdg
+OUT=$(opencode run --model anthropic/claude-haiku-4-5 --format json \
+  "Read notes.txt and report how many lines it has." 2>&1)
+SID=$(echo "$OUT" | grep -o '"sessionID":"[^"]*"' | head -1 | cut -d'"' -f4)
+opencode run --model anthropic/claude-haiku-4-5 --session "$SID" --format json \
+  "Append a line 'delta' to notes.txt using the edit tool." >/dev/null 2>&1
+opencode run --model anthropic/claude-haiku-4-5 --session "$SID" --format json \
+  "Read notes.txt and list every line." >/dev/null 2>&1
+
+grep -c session_turn_conflict $BASE/proxy.log     # → 0
+grep 'agent=primary' $BASE/proxy.log | head -1    # → sessionWait=0ms, lineage=new
+grep -c 'lineage=continuation' $BASE/proxy.log    # → ≥1 per later request
+```
+
+**Pass criteria:**
+- No `session_turn_conflict` anywhere in the log, and no `"session advanced
+  while the request was waiting"` in any turn's JSON output
+- The first `agent=primary` request shows `sessionWait=0ms` — it does not queue
+  behind the `agent=subagent` title request
+- The title request appears with `agent=subagent` and a session key of its own
+- Every request after the first carries `lineage=continuation` with a non-zero
+  `cache_read`
+
+**Verified:** 2026-08-19, OpenCode 1.18.11. Before the fix, 3/3 runs: the title
+request took the lease, the user's turn waited 9,836 ms and returned HTTP 400
+`session_turn_conflict`, and OpenCode reported it as a non-retryable `APIError` —
+the first turn was simply lost. After: 0 conflicts, `sessionWait=0ms` on the
+user's turn, and 6/6 later requests `lineage=continuation` at 83-99% cache hit.
+
+---
+
+## E40: Passthrough digest-turn cap
+
+**What it proves:** that capping `maxTurns` at 1 for passthrough turns removes
+the billed digest turn *without* costing the session.
+
+**Why it needs a live SDK:** the thing under test is the SDK's own turn
+accounting — when it decides a turn is finished, when it declines to start
+another, and whether it still flushes its transcript on the way out. A mocked
+SDK can only replay assumptions about that; this asserts them.
+
+```bash
+bun scripts/e2e-digest-turn-cap.mjs
+```
+
+**Pass criteria** (the script asserts all of these and exits non-zero on any):
+
+- Capped, the tool call still reaches the client, the SDK stops with
+  `subtype: error_max_turns`, and **no digest text is generated**
+- Uncapped (`maxTurns: 3`) *does* generate digest text, costs more, and emits
+  more output tokens on the identical prompt
+- The capped session **resumes** at the captured assistant UUID and answers from
+  the client's real `tool_result`
+- A text-only turn returns `success`, not `error_max_turns`
+- Parallel tool calls are all still forwarded
+
+**Do not assert an assistant-message count.** The SDK splits one turn across
+several assistant messages — a thinking message, then one per parallel tool
+call — so the count tracks the model's phrasing, not turns. The digest turn's
+signature is text produced *after* the tool call.
+
+**If the resume check ever fails, take the cap off.** It is the claim #837 was
+defending: a lost transcript costs a full cold replay on every tool call, which
+is far worse than the digest turn the cap removes.
+
+**Verified:** 2026-08-20, sonnet. Capped vs uncapped on one tool call:
+121 vs 244 output tokens and $0.0046 vs $0.0469 (10.3x) in one run, $0.0046 vs
+$0.7687 (168x) in another where the uncapped digest turn wrote a large cache
+entry. Through the live proxy (E17 shape): output 306 → 144 and cache_read
+12k → 4k on the tool turn. The discarded digest text was captured verbatim —
+*"I attempted to read that file, but the tool call w…"* — content the client
+never sees and the account is billed for.
+
+## E41: Passthrough multi-turn: one call, one answer
+
+**What it proves:** across dependent and parallel forwarded tool calls, the active
+SDK session contains exactly one answer per delivered call — the client's real
+result — and never replays the forwarding hook's denial.
+
+**Why it needs the real SDK and several turns:** `resumeSessionAt` only trims a
+suffix of the source transcript. A plain resume leaves the denial in that source,
+and the CLI loader can splice it back on a later turn. Meridian therefore resumes
+the assistant checkpoint with the supported `forkSession` option. The child fork
+makes the replacement tail durable while the superseded source becomes dead
+history. Mocked tests cannot prove the CLI loader or prompt-cache behavior.
+
+Run the full matrix:
+
+```bash
+bun scripts/e2e-passthrough-turns.mjs
+bun scripts/e2e-passthrough-turns.mjs --stream
+PROBE_PARALLEL=1 bun scripts/e2e-passthrough-turns.mjs
+PROBE_PARALLEL=1 bun scripts/e2e-passthrough-turns.mjs --stream
+```
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- Chain mode returns three batches of one call; parallel mode returns one batch
+  of all three calls. Eventually returning three serial calls does not pass the
+  parallel gate.
+- The final answer quotes all three delivered results and never claims a call
+  went unanswered.
+- Every result round advances to a distinct continuation session, proving the
+  replacement tail was committed to a fork rather than only rewound for one
+  query.
+- A follow-up resumes the active fork. Supported `getSessionMessages()` output
+  contains exactly one real `tool_result` for every delivered id and no
+  forwarding denial for those ids.
+- Every continuation, including the follow-up, reads at least 95% of the prior
+  turn's `cache_read_input_tokens + cache_creation_input_tokens`.
+
+The gate resolves Meridian's published session from its own durable store and
+uses the supported Agent SDK `getSessionMessages()` API for the history check.
+It does not inspect Claude's private persistence format.
+
+**Verified:** 2026-08-27 at implementation SHA `73a966f2`, sonnet, chain and
+parallel, stream and non-stream. The active fork held one real answer per
+delivered call and every continuation read the prior cached prefix in full.
+
+The same SHA also passed an actual headless OpenCode 1.18.11 gate. It performed
+a real read, three parallel reads, two ordinary continuations, a supported
+OpenCode revert, a post-undo continuation, and two full Meridian restarts. The
+ordinary and cross-process continuations used supported SDK forks with 99–100%
+cache reuse. The undo was detected as a prefix rollback and replayed into a
+fresh prepared transcript with 98% cache reuse. With
+`MERIDIAN_MAX_STORED_SESSIONS=1`, Meridian retained one mapping and exactly its
+current and direct-predecessor transcripts. Supported SDK GC then deleted ten
+retired transcripts, retained both pinned transcripts, and verified every
+history only through `getSessionMessages()`.
+
+## E42: OpenCode V2 beta compatibility
+
+**What it proves:** the V2-native plugin separates OpenCode's primary session,
+hidden title/summary work, attached compaction, and child sessions without
+changing request bodies. It also proves that durable primary lineage survives
+real V2 tools, a Meridian restart, undo, fork, and parallel subagents.
+
+Use only the pinned beta. The beta CLI can update itself, so verify the version
+before and after the run and disable automatic updates:
+
+```bash
+npm install -g --prefix ~/.local @opencode-ai/cli@0.0.0-beta-18314
+export OPENCODE_DISABLE_AUTOUPDATE=1
+BIN=$HOME/.local/bin/opencode2
+$BIN --version                 # → opencode2 v0.0.0-beta-18314
+npm run build
+meridian setup --v2 --opencode-bin "$BIN"
+```
+
+Use an isolated `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`,
+`XDG_STATE_HOME`, project directory, and `MERIDIAN_SESSION_STORE_DIR`. The
+OpenCode config must load only `dist/meridian-v2.js` plus the Anthropic provider
+pointed at the test Meridian port. Do not use third-party plugins, MCP servers,
+custom agents, or unrelated credentials for this gate.
+
+Run this real-client sequence:
+
+1. Start a fresh primary session while the hidden title request runs. The
+   primary must answer and the proxy log must show `source=subagent-title`
+   separately from `agent=primary`.
+2. Continue the same OpenCode session, drive a write/read tool loop, restart
+   Meridian while preserving the isolated durable store, and continue again.
+3. Run `--agent summary` and require `source=subagent-summary` with no primary
+   mapping write.
+4. Use V2's supported `/api/session/:id/revert/stage` and `revert/commit`
+   endpoints, then continue. Meridian must log `lineage=undo` and the removed
+   tool turn must not be visible.
+5. Run with `--fork --session <id>`. The fork must get a different OpenCode
+   session id, and a later turn on the original must not contain the fork reply.
+6. Ask the primary to launch two `general` subagents in parallel. Both child
+   requests must show `agent=subagent`, overlap in the proxy, and return to the
+   primary without a session conflict.
+7. On a persistent V2 API server, call `/api/session/:id/compact`, wait with
+   `/api/session/:id/wait`, inspect the supported message API for the compaction
+   summary, and continue the primary successfully.
+
+**Pass criteria:**
+
+- The exact V2 version is unchanged at the end of the gate.
+- No `session_turn_conflict`, "session advanced while the request was waiting",
+  dangling tool envelope, or plugin schema error appears.
+- Title and summary are detached with their exact source names. Compaction stays
+  attached but is classified as a subagent. Primary and visible child requests
+  carry their trusted V2 session identities.
+- Ordinary continuation reads the cached prefix; restart continuation uses the
+  same durable mapping; undo logs `lineage=undo`; fork and original histories
+  remain isolated.
+- The packaged `dist/meridian-v2.js` is the plugin under test, not the TypeScript
+  source or a diagnostic plugin.
+
+**Verified:** 2026-08-27 on `0.0.0-beta-18314`. The exact pinned binary returned
+`EXACTFIRST`, `EXACTCONT`, `EXACTTOOL`, `EXACTRESTART`, `EXACTSUMMARY`,
+`EXACTUNDO`, `EXACTFORK`, `EXACTORIGINAL`,
+`EXACTPARALLEL[ALPHA,BRAVO]`, and `EXACTAFTERCOMPACT`. The binary SHA-256 stayed
+unchanged through the matrix.

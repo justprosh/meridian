@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, it, expect, mock } from "bun:test"
 
-import { mapModelToClaudeModel, isClosedControllerError, resetCachedClaudeAuthStatus, stripExtendedContext, hasExtendedContext, recordExtendedContextUnavailable, isExtendedContextKnownUnavailable, resetExtendedContextUnavailable, resetWarnedTierOverrides, resolveSdkModelDefaults, CANONICAL_FABLE_MODEL, CANONICAL_OPUS_MODEL, CANONICAL_SONNET_MODEL, CANONICAL_HAIKU_MODEL } from "../proxy/models"
+import { mapModelToClaudeModel, isClosedControllerError, resetCachedClaudeAuthStatus, stripExtendedContext, hasExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, resetExtendedContextUnavailable, resetWarnedTierOverrides, resolveSdkModelDefaults, subscriptionIncludesExtendedContext, CANONICAL_FABLE_MODEL, CANONICAL_OPUS_MODEL, CANONICAL_SONNET_MODEL, CANONICAL_HAIKU_MODEL } from "../proxy/models"
 
 describe("mapModelToClaudeModel", () => {
   const originalSonnetModel = process.env.CLAUDE_PROXY_SONNET_MODEL
@@ -405,6 +405,37 @@ describe("hasExtendedContext", () => {
   })
 })
 
+describe("subscriptionIncludesExtendedContext", () => {
+  it("includes max and its usage variants", () => {
+    expect(subscriptionIncludesExtendedContext("max")).toBe(true)
+    expect(subscriptionIncludesExtendedContext("max_5x")).toBe(true)
+    expect(subscriptionIncludesExtendedContext("max_20x")).toBe(true)
+  })
+
+  it("includes team and enterprise", () => {
+    expect(subscriptionIncludesExtendedContext("team")).toBe(true)
+    expect(subscriptionIncludesExtendedContext("enterprise")).toBe(true)
+  })
+
+  it("excludes pro, free, and unknown tiers", () => {
+    expect(subscriptionIncludesExtendedContext("pro")).toBe(false)
+    expect(subscriptionIncludesExtendedContext("free")).toBe(false)
+    expect(subscriptionIncludesExtendedContext("something-else")).toBe(false)
+  })
+
+  it("is case and whitespace insensitive", () => {
+    expect(subscriptionIncludesExtendedContext("  Team ")).toBe(true)
+    expect(subscriptionIncludesExtendedContext("MAX_20X")).toBe(true)
+  })
+
+  it("excludes missing or empty tiers", () => {
+    expect(subscriptionIncludesExtendedContext(undefined)).toBe(false)
+    expect(subscriptionIncludesExtendedContext(null)).toBe(false)
+    expect(subscriptionIncludesExtendedContext("")).toBe(false)
+    expect(subscriptionIncludesExtendedContext("   ")).toBe(false)
+  })
+})
+
 describe("Extra Usage cooldown", () => {
   beforeEach(() => resetExtendedContextUnavailable())
   afterEach(() => resetExtendedContextUnavailable())
@@ -538,5 +569,42 @@ describe("resolveSdkModelDefaults", () => {
     expect(typeof pins.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("string")
     expect(typeof pins.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("string")
     expect(typeof pins.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("string")
+  })
+})
+
+describe("extended-context bench is per profile (#862)", () => {
+  afterEach(() => {
+    resetExtendedContextUnavailable()
+  })
+
+  it("keeps one account's Extra Usage failure from benching [1m] on another", () => {
+    recordExtendedContextUnavailable("work")
+    expect(mapModelToClaudeModel("opus", "max", undefined, "work")).toBe("opus")
+    // "personal" may well include the 1M window; benching it because a
+    // different account ran out of Extra Usage costs it the window for an hour.
+    expect(mapModelToClaudeModel("opus", "max", undefined, "personal")).toBe("opus[1m]")
+  })
+
+  it("benches [1m] until the supplied rate-limit reset", () => {
+    recordExtendedContextRateLimited("work", Date.now() + 60_000)
+    expect(mapModelToClaudeModel("opus", "max", undefined, "work")).toBe("opus")
+  })
+
+  it("does not bench when the supplied reset has already passed", () => {
+    recordExtendedContextRateLimited("work", Date.now() - 1_000)
+    expect(mapModelToClaudeModel("opus", "max", undefined, "work")).toBe("opus[1m]")
+  })
+
+  it("lets a later bench extend an earlier one, but never lets an earlier shorten it", () => {
+    recordExtendedContextRateLimited("work", Date.now() + 60_000)
+    recordExtendedContextRateLimited("work", Date.now() + 1)
+    // The near-term mark must not un-bench the profile.
+    expect(mapModelToClaudeModel("opus", "max", undefined, "work")).toBe("opus")
+  })
+
+  it("reports the bench through isExtendedContextKnownUnavailable per profile", () => {
+    recordExtendedContextUnavailable("work")
+    expect(isExtendedContextKnownUnavailable("work")).toBe(true)
+    expect(isExtendedContextKnownUnavailable("personal")).toBe(false)
   })
 })

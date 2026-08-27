@@ -1,10 +1,22 @@
 /**
  * Stream Error Recovery Tests
  *
- * When an error occurs mid-stream (after message_start has been emitted),
- * the proxy must emit message_delta + message_stop before the error event
- * so clients get a well-formed message lifecycle and don't crash accessing
- * usage.input_tokens on an incomplete response.
+ * When an error occurs mid-stream (after message_start has been emitted), the
+ * proxy must close the message lifecycle so clients don't crash accessing
+ * usage.input_tokens on an incomplete response (#168) — AND the error must
+ * reach them.
+ *
+ * Order changed deliberately: the error event now precedes message_stop. #168
+ * put it after, which satisfied the lifecycle but hid the failure — clients stop
+ * reading the body at message_stop, so the error was written into a stream
+ * nobody was consuming. A failed turn then looked exactly like a successful
+ * empty one, and an autonomous loop treated it as a completed turn. The
+ * lifecycle guarantee is unchanged; only the frame that carries the bad news
+ * moved ahead of the marker that ends the read.
+ *
+ * The failed turn also stops claiming stop_reason "end_turn" when it produced no
+ * text: a cut-off turn is truncated, and "max_tokens" is the wire's word for
+ * that.
  *
  * See: https://github.com/rynfar/meridian/issues/168
  */
@@ -16,17 +28,18 @@ import {
   textDelta,
   blockStop,
   parseSSE,
+  withMockSdkSessionId,
 } from "./helpers"
 
 let mockMessages: any[] = []
 let mockErrorAfter: number | null = null
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
-  query: () => {
+  query: (params: any) => {
     return (async function* () {
       let yielded = 0
       for (const msg of mockMessages) {
-        yield msg
+        yield withMockSdkSessionId(msg, params.options)
         yielded++
         if (mockErrorAfter !== null && yielded >= mockErrorAfter) {
           throw new Error("429 Too Many Requests - rate limit exceeded")
@@ -84,7 +97,7 @@ describe("Stream error recovery after message_start", () => {
     clearSessionCache()
   })
 
-  it("should emit message_delta and message_stop before error when message_start was sent", async () => {
+  it("closes the message lifecycle and puts the error where the client will read it", async () => {
     mockMessages = [
       messageStart("msg_1"),
       textBlockStart(0),
@@ -109,10 +122,11 @@ describe("Stream error recovery after message_start", () => {
     expect(errorIdx).toBeGreaterThan(-1)
     expect(messageDeltaIdx).toBeLessThan(errorIdx)
 
-    // Should have message_stop before error
+    // message_stop comes AFTER the error: it is the marker at which clients
+    // stop reading, so anything queued behind it is never seen.
     const messageStopIdx = eventTypes.lastIndexOf("message_stop")
     expect(messageStopIdx).toBeGreaterThan(-1)
-    expect(messageStopIdx).toBeLessThan(errorIdx)
+    expect(messageStopIdx).toBeGreaterThan(errorIdx)
 
     // The recovery message_delta should have usage with output_tokens
     const recoveryDelta = events[messageDeltaIdx]
@@ -122,6 +136,36 @@ describe("Stream error recovery after message_start", () => {
     // The error should still be present
     const errorEvent = events[errorIdx]
     expect((errorEvent?.data as any).error.type).toBe("rate_limit_error")
+
+    // #770: a turn that streamed text and THEN failed used to close with
+    // "end_turn" — the wire's word for a clean finish. The client commits a
+    // successful message and never retries. Partial output followed by a crash
+    // is a truncation, and nothing here can know the answer was complete.
+    expect((recoveryDelta?.data as any).delta.stop_reason).toBe("max_tokens")
+  })
+
+  it("closes a dangling content block before the terminal error envelope", async () => {
+    mockMessages = [
+      messageStart("msg_dangling"),
+      textBlockStart(4),
+      textDelta(4, "partial"),
+    ]
+    mockErrorAfter = 3
+
+    const app = createTestApp()
+    const events = await postStream(app)
+    const eventTypes = events.map((event) => event.event)
+    const blockStopIndex = eventTypes.indexOf("content_block_stop")
+    const messageDeltaIndex = eventTypes.indexOf("message_delta")
+    const errorIndex = eventTypes.indexOf("error")
+    const messageStopIndex = eventTypes.indexOf("message_stop")
+
+    expect(blockStopIndex).toBeGreaterThan(-1)
+    expect(messageDeltaIndex).toBeGreaterThan(blockStopIndex)
+    expect(errorIndex).toBeGreaterThan(messageDeltaIndex)
+    expect(messageStopIndex).toBeGreaterThan(errorIndex)
+    expect(events.slice(messageDeltaIndex + 1).some((event) =>
+      event.event.startsWith("content_block_"))).toBe(false)
   })
 
   it("should emit error immediately when message_start was NOT sent", async () => {
@@ -186,11 +230,16 @@ describe("Stream error recovery after message_start", () => {
     expect(eventTypes).toContain("message_stop")
     expect(eventTypes).toContain("error")
 
-    // message_delta and message_stop should come before error
+    // The lifecycle closes, but the error is reachable: delta, error, stop.
     const messageDeltaIdx = eventTypes.lastIndexOf("message_delta")
     const messageStopIdx = eventTypes.lastIndexOf("message_stop")
     const errorIdx = eventTypes.indexOf("error")
     expect(messageDeltaIdx).toBeLessThan(errorIdx)
-    expect(messageStopIdx).toBeLessThan(errorIdx)
+    expect(messageStopIdx).toBeGreaterThan(errorIdx)
+
+    // A turn that died before producing text must not claim it finished: that
+    // is the shape an autonomous loop reads as a completed, empty turn.
+    const delta = events[messageDeltaIdx]?.data as any
+    expect(delta.delta.stop_reason).toBe("max_tokens")
   })
 })

@@ -8,14 +8,35 @@
  * thinking pass per tool step, roughly doubling per-step output spend and
  * adding a full model round-trip of latency.
  *
- * The fix: the SDK emits each denied call's tool_result as a `user` message in
- * the stream (verified against the real SDK) BEFORE it fires the digest turn's
- * API request. So the proxy can watch the stream, and the moment every
- * client-forwarded tool_use from the assistant turn has its deny persisted,
- * abort the query — the digest turn never generates. Because the denies are
- * already recorded in the SDK session history at that point, the session stays
- * coherent and can be stored + resumed (unlike the #580 duplicate-abort case,
- * which fires mid-hook before persistence).
+ * The SDK emits each denied call's tool_result as a `user` message before it
+ * fires the hidden digest turn. Those messages identify a stable assistant
+ * checkpoint, but they are NOT a durability acknowledgement: a live PTY E2E
+ * observed the assistant and deny in the iterator while neither existed in the
+ * durable SDK transcript after an immediate abort. The proxy therefore freezes the
+ * assistant UUID/tool IDs at deny settlement and stores the checkpoint only
+ * after the SDK's canonical terminal result commits the transcript.
+ *
+ * What stops the digest turn is the maxTurns cap in query.ts, not this module:
+ * capped at 1, the SDK reaches the tool-use boundary and then declines to start
+ * another turn, so the digest never generates AND the terminal result still
+ * arrives (as `error_max_turns`) to commit the transcript. That is the
+ * combination an immediate abort could not give — it skipped the commit.
+ *
+ * This module still drains rather than aborts, because the cap is lifted for
+ * deferred tools, advisors, structured output, and the kill switch. In those
+ * configurations the digest turn does generate and is discarded here.
+ *
+ * Settlement is necessary but NOT sufficient to freeze the checkpoint. Two
+ * further conditions belong to the caller, which owns the wire:
+ *
+ *   - the turn has stopped generating, so no further call can appear, and
+ *   - trackerCoversStreamedCalls agrees the tracker has caught up with every
+ *     forwarded call the wire carried.
+ *
+ * Both exist because `expected` is armed from assistant messages, which the SDK
+ * can surface after the deny that settles them — so "everything I know about is
+ * answered" is true long before "everything is answered". Freezing on the
+ * former drops the calls still in flight, silently, from the client's set.
  *
  * Pure module — no I/O, no imports from server.ts or session/.
  */
@@ -29,10 +50,13 @@ const CLIENT_TOOL_PREFIX = "mcp__oc__"
 const INTERNAL_TOOLS = new Set(["ToolSearch"])
 
 export interface EarlyStopTracker {
-  /** tool_use ids of client-forwarded calls awaiting a persisted deny result */
+  /** tool_use ids of client-forwarded calls awaiting an iterator-observed deny */
   expected: Set<string>
   /** subset of `expected` whose tool_result has been observed in the stream */
   resolved: Set<string>
+  /** Last assistant message containing a forwarded tool_use.
+   *  The SDK's resumeSessionAt option only accepts assistant UUIDs. */
+  toolCallAssistantUuid?: string
   /** true once shouldEarlyStop has returned true — it fires at most once */
   fired: boolean
 }
@@ -49,7 +73,13 @@ export function createEarlyStopTracker(): EarlyStopTracker {
  * or as bare names (read) — the SDK strips the prefix in some event paths.
  * Internal MCP tools (mcp__opencode__*) and ToolSearch are excluded.
  */
-export function isClientForwardedToolUse(block: unknown): boolean {
+export interface ClientForwardedToolUse {
+  type: "tool_use"
+  id: string
+  name: string
+}
+
+export function isClientForwardedToolUse(block: unknown): block is ClientForwardedToolUse {
   const b = block as { type?: unknown; id?: unknown; name?: unknown } | null | undefined
   if (!b || b.type !== "tool_use") return false
   if (typeof b.id !== "string" || b.id.length === 0) return false
@@ -66,13 +96,37 @@ export function noteAssistantContent(tracker: EarlyStopTracker, content: unknown
   if (!Array.isArray(content)) return
   for (const block of content) {
     if (isClientForwardedToolUse(block)) {
-      tracker.expected.add((block as { id: string }).id)
+      tracker.expected.add(block.id)
     }
   }
 }
 
 /**
- * Record persisted tool_results from a user message's content.
+ * Record one SDK assistant message and remember the only boundary type the
+ * Agent SDK supports for resumeSessionAt: an SDKAssistantMessage UUID.
+ *
+ * The SDK may surface parallel tool calls as multiple assistant messages. The
+ * final such message is an ancestor containing the complete tool-use turn, so
+ * updating the boundary for every forwarded call leaves the correct stable
+ * checkpoint.
+ */
+export function noteAssistantMessage(tracker: EarlyStopTracker, message: unknown): void {
+  const m = message as { type?: unknown; uuid?: unknown; message?: { content?: unknown } } | null | undefined
+  if (m?.type !== "assistant") return
+  const content = m.message?.content
+  const before = tracker.expected.size
+  noteAssistantContent(tracker, content)
+  if (tracker.expected.size > before) {
+    // A newer tool-bearing assistant message supersedes the older checkpoint.
+    // Fail closed when its UUID is absent: the older message may not contain
+    // every parallel call, so it is not a safe resumeSessionAt target.
+    tracker.toolCallAssistantUuid =
+      typeof m.uuid === "string" && m.uuid.length > 0 ? m.uuid : undefined
+  }
+}
+
+/**
+ * Record iterator-observed tool_results from a user message's content.
  *
  * Records EVERY tool_result id, not just already-expected ones: the CLI
  * dispatches hooks per-block while later blocks are still streaming, and it
@@ -93,15 +147,178 @@ export function noteUserContent(tracker: EarlyStopTracker, content: unknown): vo
 
 /**
  * True exactly once: when at least one client tool call was forwarded and
- * every forwarded call's deny has been observed in the stream. At that point
- * the digest turn hasn't generated yet — the caller should abort the query.
+ * every forwarded call's deny has been observed in the stream. The caller may
+ * freeze the checkpoint then, but must drain to a canonical SDK result before
+ * treating the UUID as durably resumable.
  */
-export function shouldEarlyStop(tracker: EarlyStopTracker): boolean {
-  if (tracker.fired) return false
+export function allForwardedCallsResolved(tracker: EarlyStopTracker): boolean {
   if (tracker.expected.size === 0) return false
   for (const id of tracker.expected) {
     if (!tracker.resolved.has(id)) return false
   }
+  return true
+}
+
+/**
+ * Verify that a resumed tool-result delta settles exactly the tool calls at the
+ * stored assistant checkpoint, then coalesce queued user turns into one SDK
+ * input. Tool results must precede any ordinary user content, matching the
+ * Anthropic Messages protocol.
+ */
+export function coalesceCompleteToolResultContinuation(
+  messages: Array<{ role?: unknown; content?: unknown }>,
+  expectedIds: readonly string[]
+): Array<{ role: "user"; content: unknown[] }> | undefined {
+  if (expectedIds.length === 0 || messages.length === 0) return undefined
+  const expected = new Set(expectedIds)
+  const actual = new Set<string>()
+  const echoedCalls = new Set<string>()
+  const content: unknown[] = []
+  let sawUser = false
+  let sawNonToolResult = false
+
+  for (const message of messages) {
+    // The client echoes the just-produced assistant tool_use before its user
+    // result. That assistant turn already exists at resumeSessionAt, so the
+    // structured SDK delta below intentionally filters it out.
+    if (message.role === "assistant" && !sawUser) {
+      let sawToolUse = false
+      if (Array.isArray(message.content)) {
+        for (const rawBlock of message.content) {
+          const block = rawBlock as { type?: unknown; id?: unknown } | null | undefined
+          if (block?.type !== "tool_use") continue
+          sawToolUse = true
+          if (typeof block.id !== "string" || !expected.has(block.id) || echoedCalls.has(block.id)) return undefined
+          echoedCalls.add(block.id)
+        }
+      }
+      if (!sawToolUse) return undefined
+      continue
+    }
+    if (message.role !== "user") return undefined
+    // A queued user turn may follow only after the first turn settled the full
+    // checkpoint batch. Splitting results across turns is not a valid resume.
+    if (sawUser && actual.size !== expected.size) return undefined
+    const userContent = Array.isArray(message.content)
+      ? message.content
+      : typeof message.content === "string"
+        ? [{ type: "text", text: message.content }]
+        : undefined
+    if (!userContent) return undefined
+    sawUser = true
+    for (const rawBlock of userContent) {
+      const block = rawBlock as { type?: unknown; tool_use_id?: unknown } | null | undefined
+      if (block?.type === "tool_result") {
+        if (sawNonToolResult || typeof block.tool_use_id !== "string") return undefined
+        if (!expected.has(block.tool_use_id) || actual.has(block.tool_use_id)) return undefined
+        actual.add(block.tool_use_id)
+      } else {
+        sawNonToolResult = true
+      }
+      content.push(rawBlock)
+    }
+  }
+
+  if (
+    actual.size !== expected.size ||
+    (echoedCalls.size !== 0 && echoedCalls.size !== expected.size)
+  ) return undefined
+  return [{ role: "user", content }]
+}
+
+/** Find and validate the exact echoed assistant checkpoint plus its result tail. */
+export function findCompleteToolResultCheckpoint(
+  messages: Array<{ role?: unknown; content?: unknown }>,
+  expectedIds: readonly string[],
+): Array<{ role: "user"; content: unknown[] }> | undefined {
+  if (expectedIds.length === 0) return undefined
+  const expected = new Set(expectedIds)
+  if (expected.size !== expectedIds.length) return undefined
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue
+    const ids: string[] = []
+    let malformed = false
+    for (const rawBlock of message.content) {
+      const block = rawBlock as { type?: unknown; id?: unknown } | null | undefined
+      if (block?.type !== "tool_use") continue
+      if (typeof block.id !== "string") { malformed = true; break }
+      ids.push(block.id)
+    }
+    if (malformed || ids.length !== expected.size || new Set(ids).size !== ids.length) continue
+    if (!ids.every((id) => expected.has(id))) continue
+    return coalesceCompleteToolResultContinuation(messages.slice(index), expectedIds)
+  }
+  return undefined
+}
+
+/**
+ * Has the tracker caught up with every forwarded call the wire actually
+ * carried?
+ *
+ * `expected` is armed from assistant messages, which the SDK can surface AFTER
+ * the deny that settles them. Settlement alone therefore proves only that the
+ * calls seen SO FAR are answered — freeze on that and any call whose assistant
+ * fragment is still in flight lands past the checkpoint and is dropped from the
+ * client-facing set. Silently: a dropped call is not a malformed envelope, so
+ * nothing downstream looks wrong.
+ *
+ * `streamedToolUseIds` comes from content_block_start, which cannot lag, so it
+ * is the completeness oracle both paths gate on. Callers build it with
+ * isClientForwardedToolUse so the two sets are comparable by construction.
+ */
+export function trackerCoversStreamedCalls(
+  tracker: EarlyStopTracker,
+  streamedToolUseIds: ReadonlySet<string>
+): boolean {
+  if (streamedToolUseIds.size === 0) return false
+  if (tracker.expected.size !== streamedToolUseIds.size) return false
+  for (const id of streamedToolUseIds) {
+    if (!tracker.expected.has(id)) return false
+  }
+  return true
+}
+
+/** The cache-stable assistant boundary after every forwarded call settled. */
+export function settledToolCallAssistantUuid(tracker: EarlyStopTracker): string | undefined {
+  return allForwardedCallsResolved(tracker) ? tracker.toolCallAssistantUuid : undefined
+}
+
+export function shouldEarlyStop(tracker: EarlyStopTracker): boolean {
+  // Without an assistant UUID there is no valid resumeSessionAt checkpoint.
+  // The caller still drains canonically, then evicts the unusable mapping.
+  if (tracker.fired || !settledToolCallAssistantUuid(tracker)) return false
   tracker.fired = true
   return true
+}
+
+/** What a client-aborted stream must do with its session mapping. */
+export type ClientAbortDisposition =
+  | { action: "evict" }
+  | { action: "none" }
+
+/**
+ * Decide the fate of a session whose stream the CLIENT aborted (the user hit
+ * stop, or the connection dropped).
+ *
+ * A client abort leaves the SDK session ending in an interrupted tail. Even an
+ * assistant UUID already seen in the iterator is not known durable until the
+ * canonical result: the live PTY regression yielded that UUID but never wrote
+ * it durably after abort. Therefore every owned mapping is evicted; a replay
+ * costs one cache miss but cannot wedge on a missing or interrupted boundary.
+ */
+export function clientAbortDisposition(input: {
+  isIndependentSession: boolean
+  profileSessionId?: string
+  currentSessionId?: string
+  sawDuplicateToolUse: boolean
+  toolCallAssistantUuid?: string
+  /** Only passthrough turns create synthetic denial side branches. */
+  passthrough: boolean
+}): ClientAbortDisposition {
+  // Fork/subagent requests never write the cache, so they have nothing to undo.
+  if (input.isIndependentSession || !input.profileSessionId) return { action: "none" }
+  // Iterator-observed UUIDs are not durable across an interrupted query, in
+  // passthrough or internal mode. Evict and replay every owned mapping.
+  return { action: "evict" }
 }

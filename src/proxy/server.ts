@@ -9,11 +9,13 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
 import { linkRequestAbort } from "./requestAbort"
-import { fetchOAuthUsage } from "./oauthUsage"
+import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
+import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
+import { fetchOAuthUsage, fetchOAuthUsageResult } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG } from "./types"
-import { env, envBool } from "../env"
+import { env, envBool, envInt } from "../env"
 import type { ProxyConfig, ProxyInstance, ProxyServer } from "./types"
 export type { ProxyConfig, ProxyInstance, ProxyServer }
 // Public plugin-authoring types. Plugins import these to type their
@@ -36,20 +38,22 @@ export type {
 // transforms through the same runner meridian uses internally.
 export { runTransformHook, runObserveHook, buildPipeline, createRequestContext } from "./transform"
 import { claudeLog } from "../logger"
+import { PASSTHROUGH_DENY_REASON } from "./passthroughDenial"
 import { exec as execCallback } from "child_process"
 import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
 import { createPassthroughMcpServer, stripMcpPrefix, normalizeToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX } from "./passthroughTools"
 import { detectServerTools, serverToolErrorMessage } from "./tools"
-import { createEarlyStopTracker, noteAssistantContent, noteUserContent, shouldEarlyStop } from "./passthroughEarlyStop"
+import { clientAbortDisposition, coalesceCompleteToolResultContinuation, createEarlyStopTracker, findCompleteToolResultCheckpoint, isClientForwardedToolUse, noteAssistantMessage, noteUserContent, settledToolCallAssistantUuid, shouldEarlyStop, trackerCoversStreamedCalls } from "./passthroughEarlyStop"
 import { checkEmptyToolInputs, checkUndeliveredToolUses, type EnvelopeViolation } from "./envelopeIntegrity"
+import { classifyTurnOutcome, createRecoveryLifter, shouldAttemptRecovery, shouldInjectSilentTurn, SILENT_TURN_NUDGE } from "./turnOutcome"
 import { resolveAgentAlias } from "./agentMatch"
 import { LRUMap } from "../utils/lruMap"
 
 import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics } from "../telemetry"
 import type { RequestMetric } from "../telemetry"
-import { classifyError, extractSdkTermination, formatSdkTermination, isStaleSessionError, isBusySessionError, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError } from "./errors"
+import { canRecoverCapturedToolUses, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal } from "./errors"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, getAuthRenewalStatus, resolveRenewalWarnDays, type CredentialStore } from "./tokenRefresh"
 import {
   createFileDesignTokenStore,
@@ -61,15 +65,18 @@ import {
   isDesignAuthFailure,
   DESIGN_UPSTREAM_ORIGIN,
 } from "./design"
-import { checkPluginConfigured } from "./setup"
-import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable } from "./models"
+import { checkPluginConfigured, notePluginlessOpenCodeRequest } from "./setup"
+import { describeBuildDrift, getBuildInfo } from "./buildInfo"
+import { getLatestVersion, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
+import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator } from "./openai"
+import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, consolidateMultimodalOntoLastUser, MULTIMODAL_TYPES, buildToolUseIndex, describeToolCall, frameReplayTurns } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
-import { buildQueryOptions, type QueryContext } from "./query"
+import { buildQueryOptions, resolveQueryConfigDir, type QueryContext } from "./query"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -77,7 +84,7 @@ import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
-import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion, AssignmentStore } from "./routing"
+import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion, AssignmentStore, resolveCooldownUntil } from "./routing"
 import { getSetting, setSetting } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
@@ -89,15 +96,52 @@ import {
   hashMessage,
   computeMessageHashes,
   normalizeContextUsage,
+  withClientAssistantUuid,
+  reconcileReturnedSessionUuids,
   type LineageResult,
   type TokenUsageIteration,
   type TokenUsage,
 } from "./session/lineage"
-import { getPriorityAssignmentKey } from "./session/fingerprint"
+import { getConversationFingerprint, getPriorityAssignmentKey } from "./session/fingerprint"
 // Re-export for backwards compatibility (existing tests import from here)
 
-import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession, getSessionByClaudeId } from "./session/cache"
-import { lookupSessionRecovery, listStoredSessions } from "./sessionStore"
+import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession as evictCachedSession, getSessionByClaudeId } from "./session/cache"
+import { processSessionTurns, type SessionTurnLease } from "./session/turnCoordinator"
+import {
+  CrossProcessTurnAcquireTimeoutError,
+  CrossProcessTurnCoordinator,
+  type CrossProcessTurnLease,
+} from "./session/crossProcessTurnCoordinator"
+import {
+  attachSharedTranscriptLocator,
+  getSessionStoreDir,
+  lookupSessionRecovery,
+  lookupSharedSession,
+  lookupSharedSessionResult,
+  listStoredSessions,
+  readSessionStoreSnapshot,
+  readSessionStoreGenerationSnapshot,
+  type StoredSessionGeneration,
+} from "./sessionStore"
+import {
+  abandonFork,
+  acquireActiveTranscriptLease,
+  attachActiveTranscriptExecutor,
+  attachPinnedTranscript,
+  commitFork,
+  canonicalizeTranscriptLocator,
+  ensureTranscriptJournaled,
+  prepareFork,
+  publishPinnedTranscript,
+  registerLiveTranscript,
+  releaseActiveTranscriptLease,
+  runGc as runSessionGc,
+  getTranscriptResourceKey,
+  SessionLifecycleError,
+  type SessionLifecycleOptions,
+  type TranscriptLocator,
+} from "./sessionLifecycle"
+import { createSdkProcessGate } from "./session/sdkProcessGate"
 // Re-export for backwards compatibility (existing tests import from here)
 export { computeLineageHash, hashMessage, computeMessageHashes }
 export { clearSessionCache, getMaxSessionsLimit }
@@ -121,7 +165,107 @@ let claudeExecutable = ""
 // Must be > slowest legitimate TTFB / server-side thinking pause, and < the
 // "feels dead" threshold. Pylon's turn watchdog (120s warn / 180s abort) is the
 // looser backstop, so this fires first.
-const UPSTREAM_IDLE_MS = 90_000
+//
+// Overridable via MERIDIAN_UPSTREAM_IDLE_MS because the 90s default is not
+// always above the "slowest legitimate thinking pause" it assumes: a deep
+// agentic turn that reasons for a long stretch before emitting anything gets
+// killed mid-turn, and the kill reaches the client as a finished-but-empty
+// message (termination reason is `unknown`, so the tool_use recovery path
+// cannot fire). The default is left at 90s so upstream behaviour is unchanged;
+// keep any override BELOW Pylon's STALL_ABORT_MS (180s), or the two layers race
+// to abort the same hung model — see the coordination contract in
+// streamIdleGuard.ts.
+const UPSTREAM_IDLE_MS = envInt("UPSTREAM_IDLE_MS", 90_000)
+
+// How long a passthrough deny may be held waiting for the turn-generation
+// boundary. Derived from UPSTREAM_IDLE_MS, never a standalone number, because
+// this is the same coordination contract: guardUpstreamIdle owns model-stream
+// liveness, so every other timer must sit ABOVE it and let it decide.
+//
+// The hazard this guards is a CLI version that serialises hook-then-stream, in
+// which case a held deny blocks generation forever. That case is already
+// covered by the layer that owns it: no upstream messages flow, so
+// guardUpstreamIdle throws UpstreamIdleError and the turn fails loudly. A
+// shorter timer here would only pre-empt that with a WORSE outcome — releasing
+// mid-generation lets the CLI cancel the in-flight request, which beheads every
+// parallel call still generating and hands the client a truncated tool set
+// under a 200 (measured: 1 of 3 calls delivered).
+//
+// An override BELOW UPSTREAM_IDLE_MS deliberately re-enables that race for
+// regression tests; production defaults must remain above the upstream guard.
+const DENY_HOLD_TIMEOUT_MS = envInt("DENY_HOLD_TIMEOUT_MS", UPSTREAM_IDLE_MS + 30_000)
+
+// Bounds how long ProxyInstance.close() waits for in-flight /v1/messages
+// requests to finish (after beginDrain() stops admitting new ones) before it
+// closes the HTTP server anyway. Plugins that already call close() for
+// graceful shutdown (see the Stable API Contract) get this drain for free.
+const SHUTDOWN_GRACE_MS = envInt("SHUTDOWN_GRACE_MS", 30_000)
+
+interface RequestMeta {
+  requestId: string
+  endpoint: string
+  queueEnteredAt: number
+  sessionQueueWaitMs: number
+  sdkQueueWaitMs: number
+  sdkActiveDurationMs: number
+  /** Start of the SDK attempt currently running — the TTFB anchor. */
+  currentSdkStartedAt?: number
+  /**
+   * Captured against the attempt that actually produced the first chunk, not
+   * against the request's first attempt: a fresh-replay or failover retry must
+   * not report the abandoned attempt's runtime as time-to-first-byte.
+   */
+  ttfbMs?: number
+  sessionTurnLease?: SessionTurnLease
+  /** Durable revisions observed before cross-process turn acquisition. */
+  sharedSessionRevisionsAtArrival?: Record<string, string | null>
+  /** Permanently retain the session lease when mandatory durable cleanup fails. */
+  retainSessionTurnFence?: () => void
+}
+
+interface HandleMessagesOptions {
+  body: any
+  forcedProfileId?: string
+  turnWatchdogSignal?: AbortSignal
+}
+
+function totalQueueWaitMs(meta: RequestMeta): number {
+  return meta.sessionQueueWaitMs + meta.sdkQueueWaitMs
+}
+
+/**
+ * Derive an independent telemetry identity for one failover candidate.
+ *
+ * Each candidate is its own upstream attempt: sharing the caller's meta would
+ * make every attempt inherit the previous one's accumulated SDK timings, so
+ * the surviving row would bill the winner for every account that refused
+ * first. The session-turn lease is deliberately shared by reference — the
+ * request holds exactly one turn no matter how many accounts it tries.
+ *
+ * `requestId` is deliberately NOT forked. Both telemetry backends append
+ * (SQLite always INSERTs against a non-unique `request_id`; the memory store
+ * is a ring buffer), so distinct ids were never needed to keep the rows — and
+ * rewriting a caller-supplied `x-request-id` to `<id>.1` silently breaks the
+ * client's ability to correlate its own request with the row that served it.
+ * Attempts stay distinguishable without it: the served row carries `profileId`
+ * plus a 2xx status, the refusals carry the failure in `error`/`status`.
+ * (The refusal row does not yet record which profile refused — a pre-existing
+ * gap on the error path, unrelated to the id.)
+ */
+function forkAttemptMeta(meta: RequestMeta, attempt: number): RequestMeta {
+  if (attempt === 0) return meta
+  return {
+    ...meta,
+    queueEnteredAt: Date.now(),
+    // The wait happened once, before the first attempt; re-reporting it on
+    // every row would multiply one queue delay across the whole failover.
+    sessionQueueWaitMs: 0,
+    sdkQueueWaitMs: 0,
+    sdkActiveDurationMs: 0,
+    currentSdkStartedAt: undefined,
+    ttfbMs: undefined,
+  }
+}
 
 function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | undefined {
   if (profile.type !== "claude-max") return undefined
@@ -166,19 +310,27 @@ function stripCacheControlDeep(content: any): any {
   })
 }
 
-function normalizeStructuredUserContent(content: any): any {
+function normalizeStructuredUserContent(
+  content: any,
+  preserveToolResultWrapper = false
+): any {
   if (!Array.isArray(content)) return content
   const normalized: any[] = []
   for (const block of content) {
     if (!block || typeof block !== "object") continue
-    if (block.type === "tool_result" && Array.isArray(block.content) && hasMultimodalContent(block.content)) {
+    if (
+      !preserveToolResultWrapper &&
+      block.type === "tool_result" &&
+      Array.isArray(block.content) &&
+      hasMultimodalContent(block.content)
+    ) {
       normalized.push(...normalizeStructuredUserContent(block.content))
       continue
     }
     if (block.type === "tool_result" && Array.isArray(block.content)) {
       normalized.push({
         ...block,
-        content: normalizeStructuredUserContent(block.content),
+        content: normalizeStructuredUserContent(block.content, preserveToolResultWrapper),
       })
       continue
     }
@@ -383,53 +535,288 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   proxyLogSilent = finalConfig.silent
   const serverVersion = finalConfig.version ?? "unknown"
 
+  // What code is actually running, for /health. Recomputed per request rather
+  // than frozen at startup because `latest` arrives asynchronously from the
+  // registry check — everything else in it is static.
+  const currentBuild = () =>
+    getBuildInfo({ version: serverVersion, modulePath: import.meta.url, latest: getLatestVersion() })
+
   // Restore persisted active profile from last session
   restoreActiveProfile(finalConfig.profiles)
 
   // Track cumulative discovered tools per SDK session (survives across requests)
-  const sessionDiscoveredTools = new Map<string, Set<string>>()
+  // Bounded for the same reason as sessionMcpCache below: this is per-session
+  // state on a long-lived process, so an unbounded map is a slow leak whose
+  // eventual restart costs every live conversation a cold prompt cache.
+  const sessionDiscoveredTools = new LRUMap<string, Set<string>>(getMaxSessionsLimit())
 
   // Cache last-seen tool definitions per agent session to prevent prompt cache
   // invalidation when clients intermittently omit tools on continuation requests.
-  const sessionToolCache = new Map<string, any[]>()
+  const sessionToolCache = new LRUMap<string, any[]>(getMaxSessionsLimit())
   // Cache the passthrough MCP server per session. Reusing the same server
   // across turns (when the tool set is unchanged) avoids subtle prompt-cache
   // invalidation from MCP server re-creation. Key hashes tool name + schema
   // so silently-updated tool definitions force a rebuild.
   const sessionMcpCache = new LRUMap<string, { key: string; mcp: ReturnType<typeof createPassthroughMcpServer> }>(getMaxSessionsLimit())
 
-  // In-flight session stores. The streaming drain design ends the client's
-  // response at the turn boundary (fast), while deny persistence + the early
-  // stop + storeSession continue in the background for ~a second. A client
-  // that executes its tools quickly (small file reads) can send the follow-up
-  // BEFORE the store lands — its lookup misses and the conversation falls to
-  // a fresh replay. Follow-ups briefly await their session's pending store.
-  const PENDING_STORE_WAIT_MS = 3000
-  const PENDING_STORE_AUTO_RESOLVE_MS = 10000
+  // A --resume spawned while the session's previous subprocess is still
+  // exiting is refused, in two wordings: "currently running as a background
+  // agent" (#630, a consequence of #628's CLAUDE_CODE_SESSION_KIND=bg) and
+  // "No conversation found …". Neither means the session is gone — the stale
+  // process exits within ~a second — so retry the same resume with linear
+  // backoff, and fork only what can be branched. Delay is overridable so
+  // tests don't sleep for real.
+  const RESUME_REFUSAL_MAX_RETRIES = 3
+  // The env name predates the wider refusal set and stays as it is: renaming it
+  // would silently drop anyone's existing override.
+  const RESUME_REFUSAL_RETRY_DELAY_MS = parseInt(process.env.MERIDIAN_BUSY_RETRY_DELAY_MS ?? "500", 10)
 
-  // #630: a --resume spawned while the session's previous subprocess is
-  // still exiting is refused ("currently running as a background agent",
-  // a consequence of #628's CLAUDE_CODE_SESSION_KIND=bg). The stale
-  // process exits within ~a second — retry the same resume with linear
-  // backoff, then fork the session as a last resort. Delay is overridable
-  // so tests don't sleep for real.
-  const BUSY_SESSION_MAX_RETRIES = 3
-  const BUSY_SESSION_RETRY_DELAY_MS = parseInt(process.env.MERIDIAN_BUSY_RETRY_DELAY_MS ?? "500", 10)
-  const pendingSessionStores = new Map<string, { promise: Promise<void>; resolve: () => void }>()
-  const registerPendingStore = (key: string): (() => void) => {
-    let resolveFn: () => void = () => {}
-    const promise = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, PENDING_STORE_AUTO_RESOLVE_MS)
-      resolveFn = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-    })
-    const entry = { promise, resolve: resolveFn }
-    pendingSessionStores.set(key, entry)
+  // Hard ceiling on how long one turn may hold its session lease. The lease is
+  // released when the request finishes, which for a stream means when the body
+  // completes — so any path that leaves that promise unsettled would wedge the
+  // session for the lifetime of the process. On timeout the session degrades to
+  // pre-coordination behavior (concurrent turns, possibly a replay), which is
+  // recoverable; a permanent deadlock is not. Read per instance (like the busy
+  // retry delay above) so tests don't have to wait out the real ceiling.
+  const SESSION_TURN_MAX_HOLD_MS = envInt("SESSION_TURN_MAX_HOLD_MS", 600_000)
+  // The in-memory coordinator prevents overlap only inside this process. Most
+  // Meridian deployments run one proxy per terminal, so the same OpenCode
+  // session must also be serialized through the shared session directory.
+  const crossProcessTurnStaleMs = Math.max(1_000, envInt("SESSION_TURN_STALE_MS", 30_000))
+  const crossProcessSessionTurns = new CrossProcessTurnCoordinator(
+    join(getSessionStoreDir(), "turn-locks"),
+    {
+      acquireTimeoutMs: Math.max(
+        1_000,
+        envInt("SESSION_TURN_ACQUIRE_TIMEOUT_MS", SESSION_TURN_MAX_HOLD_MS + 30_000),
+      ),
+      staleAfterMs: crossProcessTurnStaleMs,
+      heartbeatIntervalMs: Math.max(1, Math.floor(crossProcessTurnStaleMs / 3)),
+      retryDelayMs: Math.max(1, envInt("SESSION_TURN_RETRY_MS", 25)),
+    },
+  )
+  const sessionGcOptions: SessionLifecycleOptions = {
+    maxPending: Math.max(1, envInt("SESSION_GC_MAX_PENDING", 256)),
+    maxDeletesPerRun: Math.max(1, envInt("SESSION_GC_MAX_DELETES", 16)),
+    // A prepared fork is an active write lease. Never age it out before the
+    // request watchdog plus a drain margin, even if an unsafe lower value is configured.
+    preparedGraceMs: Math.max(
+      SESSION_TURN_MAX_HOLD_MS + 60_000,
+      envInt("SESSION_GC_PREPARED_GRACE_MS", SESSION_TURN_MAX_HOLD_MS + 60_000),
+    ),
+    retiredGraceMs: Math.max(
+      0,
+      envInt("SESSION_GC_GRACE_MS", SESSION_TURN_MAX_HOLD_MS + 60_000),
+    ),
+    deletionTimeoutMs: Math.max(1_000, envInt("SESSION_GC_DELETE_TIMEOUT_MS", 30_000)),
+    runTimeoutMs: Math.max(1_000, envInt("SESSION_GC_RUN_TIMEOUT_MS", 30_000)),
+  }
+  let sessionGcRunning: Promise<void> | undefined
+
+  const activeSessionGcPins = new Map<string, { locator: TranscriptLocator; refs: number }>()
+  const pinActiveSessionGcLocators = (...locators: TranscriptLocator[]): (() => void) => {
+    const keys: string[] = []
+    for (const locator of locators) {
+      const key = getTranscriptResourceKey(locator)
+      const existing = activeSessionGcPins.get(key)
+      if (existing) existing.refs++
+      else activeSessionGcPins.set(key, { locator, refs: 1 })
+      keys.push(key)
+    }
+    let released = false
     return () => {
-      entry.resolve()
-      if (pendingSessionStores.get(key) === entry) pendingSessionStores.delete(key)
+      if (released) return
+      released = true
+      for (const key of keys) {
+        const existing = activeSessionGcPins.get(key)
+        if (!existing) continue
+        if (existing.refs <= 1) activeSessionGcPins.delete(key)
+        else existing.refs--
+      }
+    }
+  }
+
+  const collectSessionGcPins = (): TranscriptLocator[] => {
+    const pins: TranscriptLocator[] = [...activeSessionGcPins.values()].map((entry) => entry.locator)
+    for (const session of Object.values(readSessionStoreSnapshot())) {
+      if (session.currentTranscript?.sessionId === session.claudeSessionId) {
+        pins.push(session.currentTranscript)
+      }
+      if (
+        session.previousTranscript
+        && session.previousTranscript.sessionId === session.previousClaudeSessionId
+      ) {
+        pins.push(session.previousTranscript)
+      }
+    }
+    return pins
+  }
+  sessionGcOptions.pinProvider = collectSessionGcPins
+
+  const sweepSessionGc = (): Promise<void> => {
+    if (sessionGcRunning) return sessionGcRunning
+    sessionGcRunning = (async () => {
+      const result = await runSessionGc(collectSessionGcPins(), sessionGcOptions)
+      if (result.deleted || result.notFound || result.failed) {
+        claudeLog("session.gc", { ...result })
+        if (result.failed) {
+          plog(`[PROXY] session GC deferred ${result.failed} failed deletion(s); retry is scheduled`)
+        }
+      }
+    })().catch((error) => {
+      // Corrupt or contended metadata is fail-closed: keep transcripts and try
+      // later instead of guessing at ownership.
+      const message = error instanceof Error ? error.message : String(error)
+      claudeLog("session.gc_failed_closed", { error: message })
+      plog(`[PROXY] session GC postponed: ${message}`)
+    }).finally(() => {
+      sessionGcRunning = undefined
+    })
+    return sessionGcRunning
+  }
+
+  // Default: share the process-wide budget, because the failure this guards
+  // against (many SDK subprocesses spawned at once) is a property of the host
+  // process, not of any one instance. `maxConcurrent` is the opt-out for
+  // embedders that deliberately want isolated budgets per instance.
+  const sdkSemaphore = finalConfig.maxConcurrent !== undefined
+    ? new AbortableSemaphore(finalConfig.maxConcurrent)
+    : getProcessSdkSemaphore()
+  const responseCompletions = new WeakMap<Response, Promise<void>>()
+
+  // Graceful shutdown (#drain): once true, handleWithQueue fast-fails new
+  // requests instead of queueing them, and /health reports it so a fleet
+  // manager (e.g. a gateway's account-pool scheduler) can stop routing here
+  // before the process actually exits. inFlightRequests only counts requests
+  // that were admitted past that gate, so it drains to 0 on its own — no
+  // separate bookkeeping of queued vs. active is needed.
+  let draining = false
+  let durableWritesRevoked = false
+  let inFlightRequests = 0
+  const activeRequestAborts = new Set<AbortController>()
+
+  // Admission belongs at the PUBLIC entrypoint. /v1/chat/completions and
+  // /v1/responses translate their body before re-entering /v1/messages, so
+  // gating only the inner hop let a request accepted while healthy be refused
+  // halfway through its own translation — and the refusal then arrived wearing
+  // the wrong contract. Public routes check the gate; the internal hop is
+  // exempted by a per-instance token rather than a fixed header name, so the
+  // exemption can never be claimed from the wire.
+  const internalHopToken = randomUUID()
+  /** Which error envelope a public route speaks. */
+  type ErrorShape = "anthropic" | "openai"
+  const errorEnvelope = (shape: ErrorShape, type: string, message: string) =>
+    shape === "anthropic"
+      ? { type: "error", error: { type, message } }
+      : { error: { type, message, code: null } }
+  const DRAIN_MESSAGE = "Meridian is shutting down and is not accepting new requests. Retry against another instance."
+  // Each route answers in its own envelope. /v1/responses reports every other
+  // error (both 400s below it) in the OpenAI shape, so handing it the
+  // Anthropic one here would make the drain 503 the single reply on that route
+  // a Codex-style client cannot parse the way it parses everything else.
+  const drainingResponse = (shape: ErrorShape = "anthropic"): Response =>
+    new Response(JSON.stringify(errorEnvelope(shape, "overloaded_error", DRAIN_MESSAGE)), {
+      status: 503,
+      headers: { "Content-Type": "application/json", "x-meridian-draining": "1" },
+    })
+
+  /**
+   * Relay what the internal /v1/messages hop actually said.
+   *
+   * The compat routes used to flatten every inner failure into
+   * `upstream_error` with the raw JSON stringified into `message`. That
+   * collapsed two contracts a caller must be able to act on: the drain 503
+   * lost its `x-meridian-draining` header, and the session-conflict 400 —
+   * "your history is stale, refetch it" — arrived as an opaque upstream fault
+   * that a gateway would retry or fail over instead of resolving.
+   */
+  async function relayInnerError(
+    internalRes: Response,
+    shape: ErrorShape,
+  ): Promise<Response> {
+    const errBody = await internalRes.text()
+    let innerType: string | undefined
+    let innerMessage: string | undefined
+    try {
+      const parsed = JSON.parse(errBody) as { error?: { type?: string; message?: string } }
+      innerType = parsed?.error?.type
+      innerMessage = parsed?.error?.message
+    } catch { /* not JSON — fall back to the raw text */ }
+    const payload = errorEnvelope(shape, innerType ?? "upstream_error", innerMessage ?? errBody)
+    const headers: Record<string, string> = { "Content-Type": "application/json" }
+    const drainingHeader = internalRes.headers.get("x-meridian-draining")
+    if (drainingHeader) headers["x-meridian-draining"] = drainingHeader
+    return new Response(JSON.stringify(payload), { status: internalRes.status, headers })
+  }
+
+  async function* runSdkQueryAttempt(
+    params: Parameters<typeof query>[0],
+    signal: AbortSignal,
+    requestMeta: RequestMeta,
+    mode: string,
+    activeLocators: readonly TranscriptLocator[],
+  ) {
+    // Measured around the wait itself, not read from the granted lease: an
+    // aborted wait never produces a lease, and crediting queue time only on
+    // success dumped the entire wait of every cancelled request into
+    // proxyOverheadMs — corrupting the one number that says "the proxy is the
+    // bottleneck" precisely under the load that makes clients cancel.
+    const acquireStartedAt = Date.now()
+    let lease: SemaphoreLease
+    try {
+      lease = await sdkSemaphore.acquire(signal)
+    } catch (error) {
+      requestMeta.sdkQueueWaitMs += Date.now() - acquireStartedAt
+      throw error
+    }
+    requestMeta.sdkQueueWaitMs += lease.waitedMs
+    const startedAt = Date.now()
+    requestMeta.currentSdkStartedAt = startedAt
+    let sdkQuery: ReturnType<typeof query> | undefined
+    let activeTranscriptLease: Awaited<ReturnType<typeof acquireActiveTranscriptLease>> | undefined
+    let processGate: Awaited<ReturnType<typeof createSdkProcessGate>> | undefined
+    let writerJoined = true
+    try {
+      for (const locator of activeLocators) {
+        await ensureTranscriptJournaled(locator, sessionGcOptions)
+      }
+      activeTranscriptLease = await acquireActiveTranscriptLease(activeLocators, sessionGcOptions)
+      // Unit SDK doubles never create an OS child. Production and real E2E runs
+      // always use the gated exact-incarnation writer path.
+      if (process.env.MERIDIAN_TEST_DISABLE_SDK_PROCESS_GATE !== "1") {
+        processGate = await createSdkProcessGate(
+          join(getSessionStoreDir(), "sdk-process-gates"),
+          (executor, recoverableAfterCrash) => attachActiveTranscriptExecutor(
+            activeTranscriptLease!,
+            executor,
+            sessionGcOptions,
+            recoverableAfterCrash,
+          ),
+          params.options?.stderr,
+        )
+        params.options ??= {}
+        params.options.spawnClaudeCodeProcess = processGate.spawnClaudeCodeProcess
+      }
+      sdkQuery = query(params)
+      yield* guardUpstreamIdle(sdkQuery, UPSTREAM_IDLE_MS, (sinceLastMs) =>
+        claudeLog("upstream.stalled", { mode, sinceLastMs }))
+    } finally {
+      try {
+        // Production Query objects expose close(); test doubles and older SDK
+        // shims may be plain async generators whose iterator return() is
+        // already invoked by guardUpstreamIdle.
+        if (typeof sdkQuery?.close === "function") sdkQuery.close()
+        if (processGate) writerJoined = await processGate.closeAndJoin()
+        if (!writerJoined) {
+          throw new SessionLifecycleError("SDK writer could not be joined; transcript remains fenced")
+        }
+        if (activeTranscriptLease) {
+          await releaseActiveTranscriptLease(activeTranscriptLease, sessionGcOptions)
+        }
+      } finally {
+        requestMeta.sdkActiveDurationMs += Date.now() - startedAt
+        lease.release()
+      }
     }
   }
 
@@ -467,15 +854,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   // --- Priority routing (opt-in, routing="priority") ---
   // Ordered account pool with per-request failover. The /v1/messages handler
-  // becomes a thin dispatcher in this mode: it re-enters itself with a pinned
-  // x-meridian-profile header per candidate (the same internal-hop pattern as
-  // /v1/chat/completions), so ALL failover logic lives here — no changes to
-  // the deep request machinery. State is per proxy instance.
+  // becomes a thin dispatcher in this mode: it calls handleMessages directly
+  // with a forcedProfileId per candidate, so ALL failover logic lives here —
+  // no changes to the deep request machinery. Calling in-process rather than
+  // re-entering over HTTP matters for more than speed: an internal hop would
+  // take a second slot from the same concurrency budget as its own parent and
+  // deadlock the pool whenever MERIDIAN_MAX_CONCURRENT is 1. State is per
+  // proxy instance.
   const priorityExhaustion = new ProfileExhaustion()
   const PRIORITY_ASSIGNMENTS_MAX = 5000
   const priorityAssignments = new AssignmentStore(PRIORITY_ASSIGNMENTS_MAX)
+  // The per-window reset cap lives in routing.ts (cooldownCapMs): a single
+  // constant here is what let a 6-hour bound flatten a weekly reset (#790).
   const PRIORITY_DEFAULT_COOLDOWN_MS = 10 * 60_000
-  const PRIORITY_COOLDOWN_CAP_MS = 6 * 60 * 60_000
 
   function priorityProfileOrderSetting(): string[] | undefined {
     const env = process.env.MERIDIAN_PROFILE_ORDER
@@ -498,11 +889,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
    *  the conservative default so tier 2 isn't left refining a wrong mark
    *  it has no way to challenge. */
   function priorityCooldownUntil(profileId: string, now: number): number {
-    const fiveHour = rateLimitStore.getAll(profileId)
-      .find(e => e.rateLimitType === "five_hour" && (e.resetsAt ?? 0) > now
-        && (e.status === "rejected" || (e.utilization ?? 0) >= 1))
-    const until = fiveHour?.resetsAt ?? now + PRIORITY_DEFAULT_COOLDOWN_MS
-    return Math.min(until, now + PRIORITY_COOLDOWN_CAP_MS)
+    const windows = rateLimitStore.getAll(profileId).map(e => ({
+      type: e.rateLimitType ?? "",
+      resetsAt: e.resetsAt,
+      exhausted: e.status === "rejected" || (e.utilization ?? 0) >= 1,
+    }))
+    return resolveCooldownUntil(windows, now, PRIORITY_DEFAULT_COOLDOWN_MS)
   }
 
   /** Tier 2: the authoritative per-account reset from Anthropic's usage
@@ -531,7 +923,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
    *  right when it's needed. `force` only skips the cache read — the
    *  in-flight-request de-dupe still applies after it, so concurrent
    *  exhaustions of the same profile still share one upstream call rather
-   *  than stampeding it. A `stale: true` snapshot (served when a fresh fetch
+   *  than stampeding it. The per-profile 429 cooldown suppresses forced
+   *  callers too, so an upstream rate limit leaves this refinement on the
+   *  conservative default instead of stampeding a limited endpoint. A
+   *  `stale: true` snapshot (served when a fresh fetch
    *  failed transiently) is not authoritative about the current window, so
    *  it's skipped too — the conservative default is the safer thing to
    *  leave standing. */
@@ -551,12 +946,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     void fetchOAuthUsage({ profileId, claudeConfigDir: target?.claudeConfigDir, force: true })
       .then(usage => {
         if (!usage || usage.stale) return
-        const fiveHour = usage.windows.find(w => w.type === "five_hour")
-        if (!fiveHour || (fiveHour.utilization ?? 0) < 1) return
         const now = Date.now()
-        const resetsAt = fiveHour.resetsAt
-        if (!resetsAt || resetsAt <= now) return
-        const until = Math.min(resetsAt, now + PRIORITY_COOLDOWN_CAP_MS)
+        const windows = usage.windows.map(w => ({
+          type: w.type,
+          resetsAt: w.resetsAt,
+          exhausted: (w.utilization ?? 0) >= 1,
+        }))
+        // Sentinel: resolveCooldownUntil falls back to `now + defaultMs` when
+        // nothing is exhausted. Passing 0 makes that fallback identifiable, so
+        // a snapshot showing a healthy account refines nothing and tier 3's
+        // conservative default stands — the same early-return the five-hour-only
+        // version did with its `utilization < 1` guard.
+        const until = resolveCooldownUntil(windows, now, 0)
+        if (until <= now) return
         priorityExhaustion.mark(profileId, until, "rate_limit_error")
         claudeLog("priority.cooldown_refined", { profile: profileId, until, source: "oauth_usage" })
       })
@@ -568,25 +970,37 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       })
   }
 
-  /** Inspect an inner response for a quota failure without destroying it.
-   *  Non-stream: a 429 body. Stream: an `event: error` frame with
-   *  rate_limit_error BEFORE any content frame (mid-content errors pass
-   *  through — never yank a stream a client is already consuming). */
-  async function sniffQuotaFailure(res: Response): Promise<{ failed: boolean; errorPayload: unknown; response: Response }> {
+  /** Inspect an inner response for an account-level failure without destroying
+   *  it. Non-stream: an error body on a non-OK status. Stream: an
+   *  `event: error` frame BEFORE any content frame (mid-content errors pass
+   *  through — never yank a stream a client is already consuming).
+   *
+   *  `isAccountFailoverError` decides which classified types are worth another
+   *  account; anything else is this account's honest answer and belongs to the
+   *  client untouched. The non-stream status gate is `!res.ok` rather than a
+   *  literal 429 because the qualifying types do not share one status — a
+   *  spent quota window is 429, a refused subscription 402. */
+  async function sniffAccountFailure(res: Response): Promise<
+    | { failed: true; errorPayload: unknown; errorType: string; response: Response }
+    | { failed: false; errorPayload: null; errorType: null; response: Response }
+  > {
     const contentType = res.headers.get("content-type") ?? ""
     if (!contentType.includes("text/event-stream")) {
-      if (res.status === 429) {
+      if (!res.ok) {
         const body = await res.clone().json().catch(() => null) as { error?: { type?: string } } | null
-        if (body?.error?.type === "rate_limit_error") return { failed: true, errorPayload: body, response: res }
+        const errorType = body?.error?.type
+        if (isAccountFailoverError(errorType)) {
+          return { failed: true, errorPayload: body, errorType, response: res }
+        }
       }
-      return { failed: false, errorPayload: null, response: res }
+      return { failed: false, errorPayload: null, errorType: null, response: res }
     }
     const reader = res.body?.getReader()
-    if (!reader) return { failed: false, errorPayload: null, response: res }
+    if (!reader) return { failed: false, errorPayload: null, errorType: null, response: res }
     const decoder = new TextDecoder()
     const consumed: Uint8Array[] = []
     let text = ""
-    let failedPayload: unknown = null
+    let failure: { payload: unknown; type: string } | null = null
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -599,16 +1013,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const dataLine = frame.split("\n").find(l => l.startsWith("data: "))
         try {
           const parsed = dataLine ? JSON.parse(dataLine.slice(6)) as { error?: { type?: string } } : null
-          if (parsed?.error?.type === "rate_limit_error") {
-            failedPayload = parsed
+          const parsedType = parsed?.error?.type
+          if (isAccountFailoverError(parsedType)) {
+            failure = { payload: parsed, type: parsedType }
           }
-        } catch { /* not a quota frame — pass through below */ }
+        } catch { /* not an account-failure frame — pass through below */ }
       }
       break // first complete frame decides
     }
-    if (failedPayload) {
+    if (failure) {
       await reader.cancel().catch(() => {})
-      return { failed: true, errorPayload: failedPayload, response: res }
+      return { failed: true, errorPayload: failure.payload, errorType: failure.type, response: res }
     }
     const rest = new ReadableStream<Uint8Array>({
       start(ctrl) { for (const chunk of consumed) ctrl.enqueue(chunk) },
@@ -619,44 +1034,73 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       },
       cancel(reason) { void reader.cancel(reason).catch(() => {}) },
     })
-    return { failed: false, errorPayload: null, response: new Response(rest, { status: res.status, headers: res.headers }) }
+    const response = new Response(rest, { status: res.status, headers: res.headers })
+    const completion = responseCompletions.get(res)
+    if (completion) responseCompletions.set(response, completion)
+    return { failed: false, errorPayload: null, errorType: null, response }
   }
 
-  async function dispatchPriority(c: Context, orderedCandidateIds: string[], sessionKey: string | null, wantsStream: boolean): Promise<Response> {
-    const bodyBuf = await c.req.arrayBuffer()
+  async function dispatchPriority(
+    c: Context,
+    body: any,
+    requestMeta: RequestMeta,
+    orderedCandidateIds: string[],
+    sessionKey: string | null,
+    wantsStream: boolean,
+    turnWatchdogSignal?: AbortSignal,
+  ): Promise<Response> {
     let lastError: unknown = null
+    let lastStatus = 429
     let previous: string | null = null
-    for (const candidate of orderedCandidateIds) {
-      const headers = new Headers(c.req.raw.headers)
-      headers.set("x-meridian-profile", candidate)
-      headers.set("x-meridian-priority-dispatch", "1")
-      const inner = await app.fetch(new Request(c.req.url, { method: "POST", headers, body: bodyBuf }))
-      const { failed, errorPayload, response } = await sniffQuotaFailure(inner)
-      if (!failed) {
+    let previousReason = "rate_limit_error"
+    for (const [attempt, candidate] of orderedCandidateIds.entries()) {
+      const inner = await handleMessages(c, forkAttemptMeta(requestMeta, attempt), {
+        body,
+        forcedProfileId: candidate,
+        turnWatchdogSignal,
+      })
+      const sniffed = await sniffAccountFailure(inner)
+      if (!sniffed.failed) {
         if (sessionKey) priorityAssignments.set(sessionKey, candidate)
         if (previous) {
-          claudeLog("profile.failover", { from: previous, to: candidate, reason: "rate_limit_error", sessionKey })
-          plog(`[PROXY] PRIORITY failover ${previous} -> ${candidate}`)
+          claudeLog("profile.failover", { from: previous, to: candidate, reason: previousReason, sessionKey })
+          plog(`[PROXY] PRIORITY failover ${previous} -> ${candidate} (${previousReason})`)
         }
-        return response
+        return sniffed.response
       }
-      const cooldownUntil = priorityCooldownUntil(candidate, Date.now())
-      priorityExhaustion.mark(candidate, cooldownUntil, "rate_limit_error")
-      claudeLog("priority.exhausted", { profile: candidate, until: cooldownUntil })
-      refinePriorityCooldown(candidate)
-      lastError = errorPayload
+      await responseCompletions.get(inner)?.catch(() => {})
+      const reason = sniffed.errorType
+      // Only a quota refusal has a reset to look up. Both cooldown tiers read
+      // the account's five-hour window, which says nothing about entitlement:
+      // a refused subscription would be suppressed until an unrelated quota
+      // boundary, and `refinePriorityCooldown` could only push that further
+      // out (`mark` lets a later refinement extend a cooldown, never shorten
+      // it). The conservative default stands instead, so the account is
+      // re-probed once the subscription may plausibly have been fixed.
+      const quotaRefusal = isQuotaRefusal(reason)
+      const cooldownUntil = quotaRefusal
+        ? priorityCooldownUntil(candidate, Date.now())
+        : Date.now() + PRIORITY_DEFAULT_COOLDOWN_MS
+      priorityExhaustion.mark(candidate, cooldownUntil, reason)
+      claudeLog("priority.exhausted", { profile: candidate, until: cooldownUntil, reason })
+      if (quotaRefusal) refinePriorityCooldown(candidate)
+      lastError = sniffed.errorPayload
+      lastStatus = inner.status
       previous = candidate
+      previousReason = reason
     }
     // Every candidate failed: surface the LAST tried profile's error (owner
     // decision). Stream sniff consumed the inner body, so reconstruct the
-    // exact frame for SSE requests; non-stream errors pass through as JSON.
+    // exact frame for SSE requests; non-stream errors pass through as JSON,
+    // carrying the status that came with them — a pool refused for billing
+    // must not reach the client as a 429 it would dutifully back off from.
     if (wantsStream) {
       return new Response(`event: error\ndata: ${JSON.stringify(lastError)}\n\n`, {
         status: 200,
         headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
       })
     }
-    return new Response(JSON.stringify(lastError), { status: 429, headers: { "content-type": "application/json" } })
+    return new Response(JSON.stringify(lastError), { status: lastStatus, headers: { "content-type": "application/json" } })
   }
   app.use("/auth/*", requireAuth)
 
@@ -674,45 +1118,108 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.html(landingHtml)
   })
 
-  // --- Concurrency Control ---
-  // Each request spawns an SDK subprocess (cli.js, ~11MB). Spawning multiple
-  // simultaneously can crash the process. Serialize SDK queries with a queue.
-  const MAX_CONCURRENT_SESSIONS = parseInt((process.env.MERIDIAN_MAX_CONCURRENT ?? process.env.CLAUDE_PROXY_MAX_CONCURRENT) || "10", 10)
-  let activeSessions = 0
-  const sessionQueue: Array<{ resolve: () => void }> = []
-
-  async function acquireSession(): Promise<void> {
-    if (activeSessions < MAX_CONCURRENT_SESSIONS) {
-      activeSessions++
-      return
-    }
-    return new Promise<void>((resolve) => {
-      sessionQueue.push({ resolve })
-    })
-  }
-
-  function releaseSession(): void {
-    activeSessions--
-    const next = sessionQueue.shift()
-    if (next) {
-      activeSessions++
-      next.resolve()
-    }
-  }
-
   const handleMessages = async (
     c: Context,
-    requestMeta: { requestId: string; endpoint: string; queueEnteredAt: number; queueStartedAt: number }
+    requestMeta: RequestMeta,
+    options: HandleMessagesOptions,
   ) => {
-    const requestStartAt = Date.now()
-    const requestAbort = linkRequestAbort(c.req.raw.signal)
+    const requestStartAt = requestMeta.queueEnteredAt
+    const requestSignal = options.turnWatchdogSignal
+      ? AbortSignal.any([c.req.raw.signal, options.turnWatchdogSignal])
+      : c.req.raw.signal
+    const requestAbort = linkRequestAbort(requestSignal)
     let streamOwnsAbortLink = false
 
     return withClaudeLogContext({ requestId: requestMeta.requestId, endpoint: requestMeta.endpoint }, async () => {
       // Hoist adapter detection before try so it's available in the catch block for telemetry
       const adapter = detectAdapter(c)
+      const assertDurableWritesAllowed = (): void => {
+        if (durableWritesRevoked) throw new Error("Proxy shutdown revoked this request's durable writes")
+        if (requestAbort.controller.signal.aborted) {
+          throw new Error("Request cancellation revoked this request's durable writes")
+        }
+      }
+      // Becomes true immediately before an SDK resume can mutate its source
+      // transcript. A failed durable invalidation after that point must retain
+      // the logical-turn fence; failures before any resume are safe to release.
+      let resumedMappingMayBeAdvanced = false
+      const evictSession = (...args: Parameters<typeof evictCachedSession>): boolean => {
+        try {
+          const evicted = evictCachedSession(...args)
+          if (!evicted && resumedMappingMayBeAdvanced) {
+            // A failed generation-fenced invalidation of a mapping this turn
+            // actually resumed is just as uncertain as an exception. Keep both
+            // turn fences held so no peer can resume a transcript this request
+            // may already have advanced physically. Fresh turns have no source
+            // generation to quarantine, so an absent mapping is harmless.
+            requestMeta.retainSessionTurnFence?.()
+          }
+          if (evicted) resumedMappingMayBeAdvanced = false
+          return evicted
+        } catch (error) {
+          // If durable cleanup is uncertain, keep both process-local and
+          // cross-process turn fences held. Releasing would let another proxy
+          // resume the mapping we failed to invalidate.
+          if (resumedMappingMayBeAdvanced) requestMeta.retainSessionTurnFence?.()
+          throw error
+        }
+      }
+      let managedForkTarget: TranscriptLocator | undefined
+      let managedForkSource: TranscriptLocator | undefined
+      let managedForkCommitted = false
+      let managedForkPublished = false
+      let managedForkAbandoned = false
+      let managedForkSuperseded = false
+      // A fresh transcript uses the caller-selected SDK sessionId as its
+      // identity. Returned event IDs are advisory for this supported SDK path;
+      // resumed forks remain strict because they must prove fork identity.
+      let managedFreshTarget = false
+      let unexpectedManagedForkTarget: TranscriptLocator | undefined
+      let releaseManagedForkPins: (() => void) | undefined
+
+      const releaseManagedPins = (): void => {
+        releaseManagedForkPins?.()
+        releaseManagedForkPins = undefined
+      }
+
+      const abandonManagedFork = async (reason: string): Promise<void> => {
+        if (unexpectedManagedForkTarget) {
+          const unexpected = unexpectedManagedForkTarget
+          unexpectedManagedForkTarget = undefined
+          await registerLiveTranscript(unexpected, sessionGcOptions)
+            .then((exact) => abandonFork(exact, sessionGcOptions))
+            .catch((error) => {
+              claudeLog("session.unexpected_fork_track_failed", {
+                reason,
+                sessionId: unexpected.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            })
+        }
+        if (!managedForkTarget || managedForkPublished || managedForkAbandoned) {
+          if (managedForkPublished || !managedForkTarget) releaseManagedPins()
+          return
+        }
+        managedForkAbandoned = true
+        await abandonFork(managedForkTarget, sessionGcOptions).catch((error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          claudeLog("session.fork_abandon_failed", { reason, error: message })
+        })
+        releaseManagedPins()
+        void sweepSessionGc()
+      }
+
+      const commitManagedFork = async (): Promise<void> => {
+        if (!managedForkTarget || managedForkSuperseded || managedForkCommitted) return
+        // Promote under the lifecycle lock before publishing the mapping. A
+        // crash here leaves an unpinned live resource that reconciliation can
+        // retire; the reverse order could expose a mapping to a deleted target.
+        await commitFork(managedForkTarget, sessionGcOptions)
+        managedForkCommitted = true
+      }
+
       try {
-        const body = await c.req.json()
+        const body = options.body
 
         // Validate required fields
         if (!Array.isArray(body.messages)) {
@@ -732,6 +1239,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             400
           )
         }
+        // Keep request-scoped client metadata available to the model, but do
+        // not persist it as durable conversation ancestry.
+        const lineageMessages = adapter.canonicalizeMessagesForLineage?.(body.messages)
+          ?? body.messages
 
         // Native Anthropic server tools (web_search_*, web_fetch_*) can't run
         // through the Max/SDK path — fail fast with an actionable message
@@ -765,7 +1276,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // ordered pool with per-request failover. Pinned requests (explicit
         // x-meridian-profile — including our own internal hops) bypass the
         // pool entirely and take the normal path below.
-        if (routingMode === "priority" && !c.req.header("x-meridian-profile")) {
+        if (routingMode === "priority" && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
           const effectivePool = getEffectiveProfiles(finalConfig.profiles)
           if (effectivePool.length > 1) {
             const { order, unknown } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
@@ -783,7 +1294,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               ?? adapter.extractWorkingDirectory(body)
             const sessionKey = getPriorityAssignmentKey(
               adapter.getSessionId(c, body),
-              body.messages,
+              lineageMessages,
               assignmentCwd,
             )
             const assigned = sessionKey ? priorityAssignments.get(sessionKey) : undefined
@@ -798,13 +1309,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               first = pick?.id ?? order[0]!
             }
             const candidates = [first, ...order.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
-            return dispatchPriority(c, candidates, sessionKey, body.stream === true)
+            return dispatchPriority(
+              c,
+              body,
+              requestMeta,
+              candidates,
+              sessionKey,
+              body.stream === true,
+              options.turnWatchdogSignal,
+            )
           }
         }
         const profile = resolveProfile(
           finalConfig.profiles,
           finalConfig.defaultProfile,
-          c.req.header("x-meridian-profile") || undefined,
+          options.forcedProfileId || c.req.header("x-meridian-profile") || undefined,
           routingMode === "sticky"
             ? { routingMode, stickySessionKey: adapter.getSessionId(c, body) }
             : undefined
@@ -814,14 +1333,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           profile.id !== "default" ? profile.id : undefined,
           Object.keys(profile.env).length > 0 ? profile.env : undefined
         )
-        const agentMode = c.req.header("x-opencode-agent-mode") ?? null
         // Opaque tag clients can send to distinguish concurrent request flows
         // from the same conversation (e.g., pylon's main chat vs. memory-extract fork vs. subagent).
         // Logged for observability; fork-*/subagent-* values also skip fingerprint cache (see below).
         // Examples: "main", "fork-memory-extract", "subagent-scout".
         const requestSource = c.req.header("x-meridian-source")?.slice(0, 64) || undefined
+        // NOTE: OpenCode-specific legacy fallback. Older integrations sent
+        // this header even when another adapter was selected; preserve that
+        // behavior while adapters migrate to the normalized extension point.
+        const declaredAgentMode =
+          adapter.getAgentMode?.(c, body) ?? c.req.header("x-opencode-agent-mode") ?? null
+        // A generic subagent source and an adapter-specific mode declaration
+        // describe the same semantic fact. Treat either as authoritative so a
+        // client cannot accidentally get cache isolation without the base model
+        // tier (or the base tier without safe headerless cache isolation).
+        const isSubagentRequest =
+          declaredAgentMode === "subagent" || requestSource?.startsWith("subagent-") === true
+        const agentMode = isSubagentRequest ? "subagent" : declaredAgentMode
         const requestedModel = typeof body.model === "string" ? body.model : "sonnet"
-        let model = mapModelToClaudeModel(requestedModel, authStatus?.subscriptionType, agentMode)
+        let model = mapModelToClaudeModel(requestedModel, authStatus?.subscriptionType, agentMode, profile.id)
         // Explicitly versioned ids override their tier's canonical pin for
         // this request (spread last in query.ts env, so they also beat
         // operator env) — a proxy must never substitute models. Bare aliases
@@ -976,6 +1506,62 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Instances (#476): base-resolved features with the instance's own
         // overrides layered on top.
         const sdkFeatures = { ...getFeaturesForAdapter(adapterBase), ...(adapter.instanceFeatures ?? {}) }
+        const transcriptConfigDir = resolveQueryConfigDir(
+          profileEnv,
+          sdkFeatures.sharedMemory,
+          workingDirectory,
+        )
+        const transcriptLocator = (sessionId: string): TranscriptLocator => ({
+          sessionId,
+          configDir: transcriptConfigDir,
+          projectDir: workingDirectory,
+        })
+        const managedSdkAttemptLocators = (): TranscriptLocator[] => {
+          const locators = [
+            managedForkSource,
+            managedForkTarget,
+          ].filter((locator): locator is TranscriptLocator => locator !== undefined)
+          return [...new Map(
+            locators.map((locator) => [getTranscriptResourceKey(locator), locator]),
+          ).values()]
+        }
+
+        const publicationTranscriptLocator = (sessionId: string): TranscriptLocator => {
+          if (managedForkTarget?.sessionId === sessionId) return managedForkTarget
+          if (managedForkSource?.sessionId === sessionId) return managedForkSource
+          return transcriptLocator(sessionId)
+        }
+
+      const validateManagedForkResult = (returnedSessionId: string | undefined): void => {
+        if ((!managedForkTarget || managedForkSuperseded) && resumeSessionId) {
+          if (returnedSessionId === resumeSessionId) return
+          if (returnedSessionId) {
+            unexpectedManagedForkTarget = transcriptLocator(returnedSessionId)
+          }
+          throw new Error(
+            `Resumed SDK session returned ${returnedSessionId || "no session ID"}; expected ${resumeSessionId}`,
+          )
+        }
+        if (!managedForkTarget || managedForkSuperseded) return
+        // The supported fresh-session path does not require the SDK to echo an
+        // ID on every event, but any ID it does echo must agree with the
+        // caller-selected target. Contradiction means the physical transcript
+        // may exist under another identity and must fail closed.
+        if (managedFreshTarget && returnedSessionId === undefined) return
+        if (returnedSessionId !== managedForkTarget.sessionId) {
+          if (returnedSessionId && returnedSessionId !== managedForkSource?.sessionId) {
+            unexpectedManagedForkTarget = {
+              sessionId: returnedSessionId,
+              configDir: managedForkTarget.configDir,
+              ...(managedForkTarget.projectDir ? { projectDir: managedForkTarget.projectDir } : {}),
+            }
+          }
+          throw new Error(
+            `Managed SDK fork returned ${returnedSessionId || "no session ID"}; expected ${managedForkTarget.sessionId}`,
+          )
+        }
+      }
+
 
         // Resolve thinking against the per-adapter setting.
         //
@@ -1017,11 +1603,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
         // Session resume: look up cached Claude SDK session and classify mutation
         const agentSessionId = adapter.getSessionId(c, body)
+        // NOTE: agent-specific (opencode). A plugin-less OpenCode client cannot
+        // have its internal title/summary agents told apart from the user's
+        // conversation, and that exposure is otherwise silent — the startup
+        // warning is gated on an OpenCode config file existing. Once per
+        // session; the helper owns the bookkeeping.
+        const pluginlessWarning = notePluginlessOpenCodeRequest({
+          userAgent: c.req.header("user-agent"),
+          agentModeHeader: c.req.header("x-opencode-agent-mode"),
+          sessionId: agentSessionId,
+        })
+        if (pluginlessWarning) {
+          plog(`[PROXY] ${requestMeta.requestId} ${pluginlessWarning}`)
+          diagnosticLog.log({
+            level: "warn",
+            category: "session",
+            message: `${requestMeta.requestId} ${pluginlessWarning}`,
+            requestId: requestMeta.requestId,
+          })
+        }
         // Scope session keys by profile to isolate resume state across accounts.
         // For agents with session IDs (OpenCode): prefix the key.
         // For agents without (Pi): pass profile-scoped workingDirectory to fingerprint lookup.
         const profileSessionId = profile.id !== "default" && agentSessionId
           ? `${profile.id}:${agentSessionId}` : agentSessionId
+        // The turn lease is keyed by the raw client session id (the profile
+        // isn't resolved yet when it's acquired, and under priority routing it
+        // can differ per attempt), but "did this session advance" is only
+        // meaningful within one profile's cache scope — so commits and the
+        // conflict check below both carry profileSessionId.
+        const commitSessionTurn = () => {
+          if (profileSessionId) requestMeta.sessionTurnLease?.markCommitted(profileSessionId)
+        }
         // Use the client-local CWD for fingerprint bucketing so that two
         // independent client projects don't collide on the same first-user-
         // message hash even when they share an SDK cwd on the proxy host.
@@ -1035,12 +1648,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // each flow writes different message hashes to the shared key.
         //
         // When x-meridian-source marks a request as an independent fork or
-        // subagent, skip fingerprint lookup (no reclassification) and skip the
-        // write at end of turn (no cache pollution). The main conversation
-        // keeps its cache entry intact across forks.
+        // either supported signal marks it as a subagent, skip fingerprint
+        // lookup (no reclassification) and skip the write at end of turn (no
+        // cache pollution). The main conversation keeps its cache entry intact.
         //
-        // Opt-in via header value: clients that don't set the header are
-        // unaffected — behavior is byte-identical to today.
+        // Clients that declare neither an independent source nor a subagent
+        // mode retain the normal fingerprint-cache behavior.
         // Client-driven passthrough loop: the last message is a tool_result,
         // i.e. the client executed a forwarded tool and is sending the result
         // back to continue its own loop. These requests are self-contained
@@ -1062,32 +1675,55 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // as unrelated headerless workflow requests.
         const isClientDrivenLoop = adapterBase !== "claude-code" && !agentSessionId && lastIsToolResult
         // The fork/subagent independence guard protects HEADERLESS flows from
-        // colliding on the shared (firstUserMessage, cwd) fingerprint. An
+        // colliding on the shared (firstUserMessage, cwd) fingerprint. Adapter
+        // mode and generic source declarations share the subagent behavior. An
         // explicit session key can't collide — distinct flows carry distinct
         // keys — so keyed requests resume normally even when marked as a
         // fork/subagent source. Without this, pylon's long-lived subagent
         // workers fresh-replayed every turn: prompt-cache hits decayed to the
         // static-prefix floor and turn latency grew with conversation length.
-        const isIndependentSession =
-          (!agentSessionId && (requestSource?.startsWith("fork-") || requestSource?.startsWith("subagent-"))) ||
+        let isIndependentSession =
+          (!agentSessionId && (requestSource?.startsWith("fork-") || isSubagentRequest)) ||
           isClientDrivenLoop || false
-        // If the previous turn's background drain is still persisting this
-        // session (streaming early stop), wait briefly so the lookup below
-        // sees the stored session instead of falling to a fresh replay.
-        if (!isIndependentSession && profileSessionId) {
-          const pendingStore = pendingSessionStores.get(profileSessionId)
-          if (pendingStore) {
-            const waitStart = Date.now()
-            await Promise.race([
-              pendingStore.promise,
-              new Promise((resolve) => setTimeout(resolve, PENDING_STORE_WAIT_MS)),
-            ])
-            claudeLog("session.pending_store_awaited", { waitedMs: Date.now() - waitStart })
-          }
+        const durableMappingKey = profileSessionId
+          || getConversationFingerprint(lineageMessages, profileScopedCwd)
+        // Image-only and otherwise text-free headerless requests have no stable
+        // cache identity. Run them fresh instead of manufacturing a generation
+        // for an empty key or failing before the SDK is called.
+        if (!durableMappingKey) isIndependentSession = true
+        const durableMappingAtTurn = durableMappingKey
+          ? lookupSharedSessionResult(durableMappingKey)
+          : { status: "missing" as const }
+        if (durableMappingAtTurn.status === "error") {
+          throw new Error(`Shared session store is unavailable: ${durableMappingAtTurn.error.message}`)
         }
+        const mappingGenerationAtTurn = durableMappingAtTurn.generation
+        if (durableMappingKey && !mappingGenerationAtTurn) {
+          throw new Error("Shared session store did not return a durable key generation")
+        }
+        let mappingExpectedGeneration = mappingGenerationAtTurn
+        const refreshGenerationAfterEviction = (): StoredSessionGeneration => {
+          if (!durableMappingKey) throw new Error("Cannot refresh an empty durable mapping key")
+          const refreshed = lookupSharedSessionResult(durableMappingKey)
+          if (refreshed.status === "error") throw refreshed.error
+          if (refreshed.status === "found" || !refreshed.generation) {
+            throw new Error("Session mapping changed while it was being evicted")
+          }
+          return refreshed.generation
+        }
+        // Legacy passthrough boundaries are intentionally treated as a missing
+        // resumable session, but their real durable generation still fences the
+        // replay that replaces them.
+        const currentDurableRevision = mappingGenerationAtTurn
+        const arrivalRevision = profileSessionId && requestMeta.sharedSessionRevisionsAtArrival
+          ? requestMeta.sharedSessionRevisionsAtArrival[profileSessionId]
+          : undefined
+        const advancedAcrossProcesses = arrivalRevision !== undefined
+          ? arrivalRevision !== currentDurableRevision
+          : durableMappingAtTurn.status === "found"
         let lineageResult: LineageResult = isIndependentSession
           ? { type: "diverged", reason: "independent-request" }
-          : lookupSession(profileSessionId, body.messages || [], profileScopedCwd)
+          : lookupSession(profileSessionId, lineageMessages, profileScopedCwd)
         // NOTE: agent-specific (opencode) — when OpenCode's chat.headers plugin
         // hook doesn't fire (category-dispatched or title-generation requests),
         // the request has no session header and falls through to fingerprint
@@ -1097,15 +1733,198 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         if (lineageResult.type === "undo" && adapterBase === "opencode" && !agentSessionId) {
           lineageResult = { type: "diverged", reason: "missing-session-header" }
         }
-        const isResume = lineageResult.type === "continuation" || lineageResult.type === "compaction"
-        const isUndo = lineageResult.type === "undo"
+        // Clients that declare a concurrent flow (a fork source or either
+        // subagent signal) knowingly run parallel turns under one session key — see
+        // the keyed fork/subagent note above. Serializing them is still worth
+        // doing, but a reclassification is their normal cost; refusing them
+        // would break flows that worked before turn coordination existed.
+        const declaresConcurrentFlow =
+          requestSource?.startsWith("fork-") === true || isSubagentRequest
+        // NOTE: agent-specific (opencode) — OpenCode begins the tool-result
+        // request as soon as the visible checkpoint closes, while Meridian is
+        // still draining and committing that checkpoint. Its prompt envelope
+        // may change enough that hash lineage is "unrelated-history". Echoing
+        // every exact pending tool ID is nevertheless a causal continuation,
+        // not a stale competing branch.
+        const durableCheckpointIds = durableMappingAtTurn.status === "found"
+          ? durableMappingAtTurn.session.passthroughToolCallIds
+          : undefined
+        const durableCheckpointContinuation = durableCheckpointIds?.length
+          ? findCompleteToolResultCheckpoint(body.messages || [], durableCheckpointIds)
+          : undefined
+        const advancesDurableCheckpoint = Boolean(durableCheckpointContinuation)
+        if (
+          advancesDurableCheckpoint &&
+          lineageResult.type !== "continuation" &&
+          lineageResult.type !== "compaction" &&
+          durableMappingAtTurn.status === "found"
+        ) {
+          const checkpointSession = getSessionByClaudeId(durableMappingAtTurn.session.claudeSessionId)
+          if (checkpointSession) {
+            lineageResult = {
+              type: "continuation",
+              session: checkpointSession,
+              resumeFrom: checkpointSession.messageCount,
+            }
+          }
+        }
+        if (
+          agentSessionId &&
+          profileSessionId &&
+          !declaresConcurrentFlow &&
+          !advancesDurableCheckpoint &&
+          (requestMeta.sessionTurnLease?.advancedWhileWaiting(profileSessionId) || advancedAcrossProcesses) &&
+          lineageResult.type !== "continuation" &&
+          lineageResult.type !== "compaction"
+        ) {
+          const reason = lineageResult.type === "diverged" ? lineageResult.reason : lineageResult.type
+          const message = "This session advanced while the request was waiting. Retry with the latest conversation history or use a distinct session ID."
+          claudeLog("session.concurrent_conflict", {
+            reason,
+            sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+          })
+          diagnosticLog.session(
+            `${requestMeta.requestId} session.concurrent_conflict reason=${reason} wait=${requestMeta.sessionQueueWaitMs}ms`,
+            requestMeta.requestId,
+          )
+          // Every other terminal path records; this one must too, or the single
+          // event operators most need to count — how often concurrency actually
+          // refuses a turn — is invisible in /telemetry, SQLite and Prometheus.
+          // The error tag is deliberately more specific than the wire type so a
+          // conflict can be separated from ordinary request-validation errors.
+          const conflictTotalMs = Date.now() - requestStartAt
+          const conflictQueueWaitMs = totalQueueWaitMs(requestMeta)
+          telemetryStore.record({
+            requestId: requestMeta.requestId,
+            timestamp: Date.now(),
+            adapter: adapter.name,
+            model,
+            requestModel: requestedModel,
+            mode: stream ? "stream" : "non-stream",
+            isResume: false,
+            isPassthrough: envBool("PASSTHROUGH"),
+            hasDeferredTools: undefined,
+            deferredToolCount: undefined,
+            toolCount: body.tools?.length ?? 0,
+            lineageType: lineageResult.type,
+            messageCount: Array.isArray(body.messages) ? body.messages.length : 0,
+            sdkSessionId: undefined,
+            status: 400,
+            queueWaitMs: conflictQueueWaitMs,
+            sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+            sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
+            proxyOverheadMs: Math.max(0, conflictTotalMs - conflictQueueWaitMs),
+            ttfbMs: null,
+            // The turn is refused before any SDK query is spawned.
+            upstreamDurationMs: 0,
+            totalDurationMs: conflictTotalMs,
+            contentBlocks: 0,
+            textEvents: 0,
+            error: "session_turn_conflict",
+            profileId: profile.id,
+          })
+          return new Response(
+            JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }),
+            {
+              // Keep the public response within the Anthropic-compatible
+              // Messages API contract. The diagnostic event above retains the
+              // more specific reason for operators.
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            },
+          )
+        }
+        // Publish the decision to plugins. Core has always known WHICH message
+        // stopped matching; the log line only ever reported how many matched
+        // ("prefix overlap 50/51"), which is why #767 had to hand-patch a build
+        // to get any further. The detail is computed only on a divergence — the
+        // one case that is both rare and already about to cost a full replay —
+        // and carries digests and shapes, never content.
+        if (pipeline.some(t => t.onSession)) {
+          // verifyLineage attaches the detail on modified-history, where it has
+          // the stored digests in hand; nothing recomputes it here.
+          const mismatch = lineageResult.type === "diverged" ? lineageResult.mismatch : undefined
+          runTransformHook(pipeline, "onSession", {
+            adapter: adapterBase,
+            lineage: lineageResult.type,
+            reason: lineageResult.type === "diverged" ? lineageResult.reason : undefined,
+            sessionKey: profileSessionId,
+            storedCount: mismatch?.storedCount,
+            incomingCount: (body.messages || []).length,
+            prefixOverlap: lineageResult.type === "diverged" ? lineageResult.prefixOverlap : undefined,
+            mismatch: mismatch && mismatch.index >= 0 ? {
+              index: mismatch.index,
+              storedDigest: mismatch.storedDigest,
+              incomingDigest: mismatch.incomingDigest,
+              previousDigest: mismatch.previousDigest,
+              incomingShape: mismatch.incomingShape,
+            } : undefined,
+          }, adapterBase)
+        }
+
+        let isResume = lineageResult.type === "continuation" || lineageResult.type === "compaction"
+        let isUndo = lineageResult.type === "undo"
         const cachedSession = lineageResult.type !== "diverged" ? lineageResult.session : undefined
-        const resumeSessionId = cachedSession?.claudeSessionId
+        let resumeSessionId = cachedSession?.claudeSessionId
+        // --- Passthrough mode ---
+        // When enabled, ALL tool execution is forwarded to OpenCode instead of
+        // being handled internally. This enables multi-model agent delegation
+        // (e.g., oracle on GPT-5.2, explore on Gemini via oh-my-opencode).
+        // Adapter can override the global passthrough env var per-agent.
+        // Droid always uses internal mode; OpenCode defers to the env var.
+        // Instance passthrough override (#476) beats the adapter transform's
+        // default, which beats the global env var.
+        const passthrough = adapter.instancePassthrough !== undefined
+          ? adapter.instancePassthrough
+          : pipelineCtx.passthrough !== undefined
+            ? pipelineCtx.passthrough
+            : envBool("PASSTHROUGH")
         const resumeFrom = lineageResult.type === "continuation" || lineageResult.type === "compaction"
           ? lineageResult.resumeFrom
           : undefined
+        const resumeContentFrom = lineageResult.type === "continuation"
+          ? lineageResult.resumeContentFrom
+          : undefined
         // For undo: fork the session at the rollback point
-        const undoRollbackUuid = isUndo && lineageResult.type === "undo" ? lineageResult.rollbackUuid : undefined
+        let undoRollbackUuid = isUndo && lineageResult.type === "undo" ? lineageResult.rollbackUuid : undefined
+        let sdkUndo = isUndo && Boolean(undoRollbackUuid)
+        if (isUndo && !undoRollbackUuid) {
+          // Forks remap copied-history UUIDs. Without a valid boundary in the
+          // preserved prefix, replay fresh rather than first attempting a
+          // deterministic missing-message resume against the returned session.
+          resumeSessionId = undefined
+        }
+        const expectedResumeTranscript = resumeSessionId
+          ? canonicalizeTranscriptLocator(transcriptLocator(resumeSessionId))
+          : undefined
+        if (
+          resumeSessionId
+          && cachedSession?.currentTranscript
+          && expectedResumeTranscript
+          && (
+            cachedSession.currentTranscript.configDir !== expectedResumeTranscript.configDir
+            || cachedSession.currentTranscript.projectDir !== expectedResumeTranscript.projectDir
+          )
+        ) {
+          // A session ID is scoped to the config root that created it. Never
+          // relabel an old transcript with a newly selected profile: replay the
+          // structured history under the new root and leave the old locator for
+          // recovery/GC in its original namespace.
+          claudeLog("session.transcript_locator_changed", {
+            fromConfigDir: cachedSession.currentTranscript.configDir,
+            toConfigDir: transcriptConfigDir,
+            fromProjectDir: cachedSession.currentTranscript.projectDir,
+            toProjectDir: workingDirectory,
+          })
+          isResume = false
+          isUndo = false
+          sdkUndo = false
+          undoRollbackUuid = undefined
+          resumeSessionId = undefined
+        }
+        // Early-stopped sessions resume at the assistant tool-use turn, before synthetic denials.
+        let passthroughToolCallAssistantUuid = passthrough && isResume ? cachedSession?.passthroughToolCallAssistantUuid : undefined
+        const passthroughToolCallIds = passthrough && isResume ? cachedSession?.passthroughToolCallIds : undefined
 
         // Debug: log request details
         const msgSummary = body.messages?.map((m: any) => {
@@ -1117,7 +1936,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const lineageType = lineageResult.type === "diverged" && !cachedSession ? "new" : lineageResult.type
         const msgCount = Array.isArray(body.messages) ? body.messages.length : 0
         const toolCount = body.tools?.length ?? 0
-        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name}${requestSource ? ` source=${requestSource}` : ""}${profile.id !== "default" ? ` profile=${profile.id}${routingMode === "sticky" ? "(sticky)" : c.req.header("x-meridian-priority-dispatch") ? "(priority)" : ""}` : ""} model=${model} stream=${stream} tools=${toolCount} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} active=${activeSessions}/${MAX_CONCURRENT_SESSIONS} msgCount=${msgCount}`
+        const sdkSnapshot = sdkSemaphore.snapshot
+        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name}${requestSource ? ` source=${requestSource}` : ""}${profile.id !== "default" ? ` profile=${profile.id}${routingMode === "sticky" ? "(sticky)" : options.forcedProfileId ? "(priority)" : ""}` : ""} model=${model} stream=${stream} tools=${toolCount} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} sdkActive=${sdkSnapshot.active}/${sdkSnapshot.limit} sdkQueued=${sdkSnapshot.queued} sessionWait=${requestMeta.sessionQueueWaitMs}ms msgCount=${msgCount}`
         plog(`[PROXY] ${requestLogLine} msgs=${msgSummary}`)
         diagnosticLog.session(`${requestLogLine}`, requestMeta.requestId)
 
@@ -1136,7 +1956,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         claudeLog("request.received", {
           model,
           stream,
-          queueWaitMs: requestMeta.queueStartedAt - requestMeta.queueEnteredAt,
+          queueWaitMs: totalQueueWaitMs(requestMeta),
+          sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+          sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
           messageCount: Array.isArray(body.messages) ? body.messages.length : 0,
           hasSystemPrompt: Boolean(body.system)
         })
@@ -1166,36 +1988,179 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const allMessages = body.messages || []
       let messagesToConvert: typeof allMessages
 
-      if ((isResume || isUndo) && cachedSession) {
+      if (passthroughToolCallAssistantUuid && durableCheckpointContinuation) {
+        // Envelope drift can move the exact echoed checkpoint relative to the
+        // stored message count. Use the validated tail itself, never re-slice
+        // it through a stale lineage index.
+        messagesToConvert = durableCheckpointContinuation
+      } else if ((isResume || isUndo) && cachedSession) {
         if (isUndo && undoRollbackUuid) {
           // Undo with SDK rollback: the SDK will fork to the correct point,
           // so we only need to send the new user message.
           messagesToConvert = getLastUserMessage(allMessages)
         } else if (isResume) {
-          if (resumeFrom !== undefined && resumeFrom < allMessages.length) {
+          if (
+            resumeFrom !== undefined &&
+            resumeContentFrom !== undefined &&
+            resumeFrom < allMessages.length &&
+            Array.isArray(allMessages[resumeFrom]?.content)
+            && Array.isArray(lineageMessages[resumeFrom]?.content)
+          ) {
+            const boundaryMessage = allMessages[resumeFrom]!
+            const canonicalBoundary = lineageMessages[resumeFrom]!
+            // resumeContentFrom is measured against canonical lineage blocks.
+            // Slice that same block list so request-scoped blocks filtered by
+            // the adapter cannot shift the append-only tool-result boundary.
+            messagesToConvert = [
+              {
+                ...boundaryMessage,
+                content: canonicalBoundary.content.slice(resumeContentFrom),
+              },
+              ...allMessages.slice(resumeFrom + 1),
+            ]
+          } else if (resumeFrom !== undefined && resumeFrom < allMessages.length) {
             messagesToConvert = allMessages.slice(resumeFrom)
           } else {
             messagesToConvert = getLastUserMessage(allMessages)
           }
         } else {
-          // Undo without UUID (legacy session) — fall back to last user message
-          // to avoid the catastrophic flat text replay.
-          messagesToConvert = getLastUserMessage(allMessages)
+          // Undo without a valid SDK boundary is a fresh structured replay.
+          messagesToConvert = allMessages
         }
       } else {
         messagesToConvert = allMessages
       }
 
-      // Check if any messages contain multimodal content (images, documents, files)
-      const hasMultimodal = messagesToConvert?.some((m: any) => hasMultimodalContent(m.content))
+      if (passthroughToolCallAssistantUuid) {
+        // Rewinding to a tool-use checkpoint is valid only when the immediate
+        // delta settles that exact batch. Coalesce any subsequent queued user
+        // turns so multimodal tool results remain on the final SDK input.
+        const checkpointContinuation = coalesceCompleteToolResultContinuation(
+          messagesToConvert,
+          passthroughToolCallIds ?? []
+        )
+        if (checkpointContinuation) {
+          messagesToConvert = checkpointContinuation
+        } else {
+          // Partial, late, duplicate, or unknown results get one safe fresh
+          // replay rather than an invalid SDK resume.
+          claudeLog("passthrough.checkpoint_replay", {
+            expectedToolIds: passthroughToolCallIds?.length ?? 0,
+            reason: "incomplete_or_mismatched_results",
+          })
+          isResume = false
+          resumeSessionId = undefined
+          passthroughToolCallAssistantUuid = undefined
+          messagesToConvert = allMessages
+        }
+      }
 
-      // Build the prompt — either structured (multimodal) or text.
+      // Multimodal blocks and passthrough tool results must remain structured.
+      // In particular, a continuation resumed at an assistant tool_use expects
+      // the client's real tool_result blocks, not a flattened transcript string.
+      const hasMultimodal = messagesToConvert?.some((m: any) => hasMultimodalContent(m.content))
+      const hasPassthroughToolResults = Boolean(passthroughToolCallAssistantUuid) &&
+        messagesToConvert?.some((m: any) =>
+          m.role === "user" && Array.isArray(m.content) &&
+          m.content.some((block: any) => block?.type === "tool_result"))
+
+      const lifecycleMappingKey = durableMappingKey
+      const prepareManagedFork = async (sourceSessionId: string): Promise<void> => {
+        if (managedForkTarget) return
+        managedFreshTarget = false
+        managedForkSource = cachedSession?.currentTranscript?.sessionId === sourceSessionId
+          ? cachedSession.currentTranscript
+          : transcriptLocator(sourceSessionId)
+        managedForkTarget = transcriptLocator(randomUUID())
+        releaseManagedForkPins = pinActiveSessionGcLocators(managedForkSource, managedForkTarget)
+        // A legacy mapping may predate transcript locators. Attach the source
+        // with the exact durable generation and ID before registering it for GC; otherwise a
+        // crash before target publication could leave the still-current source
+        // unpinned and eligible for deletion.
+        const attachedGeneration = lifecycleMappingKey
+          ? await attachPinnedTranscript(
+            managedForkSource,
+            () => {
+              assertDurableWritesAllowed()
+              return attachSharedTranscriptLocator(
+                lifecycleMappingKey,
+                sourceSessionId,
+                managedForkSource!,
+                mappingExpectedGeneration ?? undefined,
+              )
+            },
+            sessionGcOptions,
+          )
+          : false
+        if (!attachedGeneration) {
+          throw new Error("Session mapping changed before managed fork preparation; retry the turn")
+        }
+        mappingExpectedGeneration = attachedGeneration
+        // Journal both ownership and the chosen target before query() can create
+        // a fork file. This closes the crash window where the SDK file exists
+        // but no emitted event or shared mapping names it yet.
+        managedForkSource = await registerLiveTranscript(managedForkSource, sessionGcOptions)
+        managedForkTarget = await prepareFork(managedForkTarget, sessionGcOptions)
+        claudeLog("session.fork_prepared", {
+          sourceSessionId: managedForkSource.sessionId,
+          targetSessionId: managedForkTarget.sessionId,
+        })
+      }
+
+      const resetManagedCreationState = (): void => {
+        managedForkTarget = undefined
+        managedForkSource = undefined
+        managedForkCommitted = false
+        managedForkPublished = false
+        managedForkAbandoned = false
+        managedForkSuperseded = false
+        managedFreshTarget = false
+        unexpectedManagedForkTarget = undefined
+        releaseManagedForkPins = undefined
+      }
+
+      const prepareFreshTarget = async (): Promise<void> => {
+        if (managedForkTarget) return
+        // Preallocate every Meridian-created transcript, not only resumed
+        // forks. Otherwise a crash after SDK creation but before the first event
+        // leaves an ownerless transcript that reconcile/GC cannot discover.
+        managedForkTarget = transcriptLocator(randomUUID())
+        managedFreshTarget = true
+        releaseManagedForkPins = pinActiveSessionGcLocators(managedForkTarget)
+        managedForkTarget = await prepareFork(managedForkTarget, sessionGcOptions)
+        claudeLog("session.fresh_prepared", { targetSessionId: managedForkTarget.sessionId })
+      }
+
+      const rotateManagedCreationTarget = async (reason: string): Promise<void> => {
+        const sourceSessionId = managedFreshTarget ? undefined : managedForkSource?.sessionId
+        await abandonManagedFork(reason)
+        resetManagedCreationState()
+        if (sourceSessionId) await prepareManagedFork(sourceSessionId)
+        else await prepareFreshTarget()
+      }
+
+      const replaceWithFreshTarget = async (reason: string): Promise<void> => {
+        await abandonManagedFork(reason)
+        resetManagedCreationState()
+        await prepareFreshTarget()
+      }
+
+      if (resumeSessionId) {
+        // Every resume writes a preallocated supported SDK fork. The mapped
+        // source stays immutable until the exact target wins publication, so a
+        // proxy crash can never leave an uncommitted in-place tail resumable.
+        await prepareManagedFork(resumeSessionId)
+      } else {
+        await prepareFreshTarget()
+      }
+
+      // Build the prompt — either structured or text.
       // Structured prompts are stored as arrays so they can be replayed on retry.
       let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
       let textPrompt: string | undefined
 
-      if (hasMultimodal) {
-        // Structured messages preserve image/document/file blocks for Claude to see.
+      if (hasMultimodal || hasPassthroughToolResults) {
+        // Structured messages preserve image/document/file and tool_result blocks.
         // On resume, only send user messages (SDK has assistant context already).
         // On first request, include everything.
         structuredMessages = []
@@ -1206,7 +2171,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             if (m.role === "user") {
               structuredMessages.push({
                 type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+                message: { role: "user" as const, content: normalizeStructuredUserContent(
+                  stripCacheControlDeep(m.content),
+                  Boolean(passthroughToolCallAssistantUuid)
+                ) },
                 parent_tool_use_id: null,
               })
             }
@@ -1217,7 +2185,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             if (m.role === "user") {
               structuredMessages.push({
                 type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+                message: { role: "user" as const, content: normalizeStructuredUserContent(
+                  stripCacheControlDeep(m.content),
+                  Boolean(passthroughToolCallAssistantUuid)
+                ) },
                 parent_tool_use_id: null,
               })
             } else {
@@ -1242,6 +2213,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         if (structuredMessages.length > 1) {
           structuredMessages = consolidateMultimodalOntoLastUser(structuredMessages)
         }
+
       } else {
         // Text prompt — convert messages to string.
         // Sanitize each text block before flattening to strip orchestration
@@ -1272,9 +2244,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Fresh (non-resume) replays get the #619 anti-self-play envelope:
         // history framed as context-only, the live user message terminal.
         // Resume deltas are tail-only and stay bare.
-        textPrompt = isResume
-          ? promptTurns.map((t: { text: string }) => t.text).filter(Boolean).join("\n\n") || ""
-          : frameReplayTurns(promptTurns)
+        const resumeDelta = promptTurns.map((t: { text: string }) => t.text).filter(Boolean).join("\n\n") || ""
+        textPrompt = isResume ? resumeDelta : frameReplayTurns(promptTurns)
       }
 
       // Create a fresh prompt value — can be called multiple times for retry
@@ -1286,19 +2257,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         return textPrompt!
       }
 
-      // --- Passthrough mode ---
-      // When enabled, ALL tool execution is forwarded to OpenCode instead of
-      // being handled internally. This enables multi-model agent delegation
-      // (e.g., oracle on GPT-5.2, explore on Gemini via oh-my-opencode).
-      // Adapter can override the global passthrough env var per-agent.
-      // Droid always uses internal mode; OpenCode defers to the env var.
-      // Instance passthrough override (#476) beats the adapter transform's
-      // default, which beats the global env var.
-      const passthrough = adapter.instancePassthrough !== undefined
-        ? adapter.instancePassthrough
-        : pipelineCtx.passthrough !== undefined
-          ? pipelineCtx.passthrough
-          : envBool("PASSTHROUGH")
       // SDK setting sources — controls CLAUDE.md and user settings loading.
       const settingSources: import("@anthropic-ai/claude-agent-sdk").SettingSource[] =
         envBool("LOAD_CONTEXT") || sdkFeatures.claudeMd === "full"
@@ -1326,13 +2284,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // model/client views diverged (#552 misattribution family).
       const droppedToolUseIds = new Set<string>()
       let sawDuplicateToolUse = false
-      // Early stop: the moment every forwarded tool call's deny is persisted
-      // (observed as a `user` tool_result in the stream), abort the query so
-      // the SDK's digest turn — a fully-billed, discarded model invocation
-      // (a whole thinking pass per tool step on always-thinking models) —
-      // never generates. Unlike the duplicate-abort above, the session history
-      // is coherent at that point (deny recorded), so the session is stored
-      // and resumed normally. Kill switch: MERIDIAN_PASSTHROUGH_EARLY_STOP=0.
+      // Stable checkpoint tracking: observe the forwarded assistant tool turn
+      // and every synthetic denial, but do NOT abort at that point. A live PTY
+      // E2E proved those iterator messages can precede the CLI's durable transcript
+      // write; aborting there left only the initial user message on disk, so
+      // resumeSessionAt failed with `missing-message`. We therefore drain the
+      // hidden digest to a canonical SDK terminal result, suppress its content,
+      // and store the earlier assistant UUID only after the drain completes.
       const earlyStopEnabled = passthrough && process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP !== "0"
       const earlyStop = createEarlyStopTracker()
       let earlyStopFired = false
@@ -1345,8 +2303,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // beheads trailing parallel calls (#552 red reads: `glob {}` aborted)
       // and re-loops the model. Fix: hold every deny response until turn-1
       // generation completes (message_delta observed), so the cancel can
-      // never land mid-generation. Timeout is a deadlock backstop in case a
-      // CLI version serializes hook-then-stream.
+      // never land mid-generation. The hold defers to guardUpstreamIdle for
+      // liveness — see DENY_HOLD_TIMEOUT_MS — so its own timer sits above that
+      // limit and is a last-ditch backstop, not the thing that decides.
       // Envelope integrity: violations of the proxy's own output contract
       // (dangling blocks, undelivered captured calls, empty required tool
       // inputs). Logged loudly + counted on /telemetry so #552-family
@@ -1359,7 +2318,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           diagnosticLog.error(`${requestMeta.requestId} ENVELOPE VIOLATION [${v.type}] ${v.detail}`, requestMeta.requestId)
         }
       }
-      const DENY_HOLD_TIMEOUT_MS = 8000
       const pendingDenyReleases: Array<() => void> = []
       // True while a model turn is actively generating (message_start seen,
       // no message_delta/message_stop yet). Hooks dispatched AFTER generation
@@ -1367,6 +2325,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // hooks can fire post-turn) must NOT hold — there is no in-flight
       // request left to protect, and holding would only add dead time.
       let turnGenerating = false
+      // Whether this request ever saw a raw turn-boundary event. Partial
+      // messages are requested for passthrough on both paths, but if they are
+      // ever absent (an older CLI, a mocked SDK) the gates below must fall back
+      // to releasing on the assistant message rather than wedge waiting for a
+      // boundary that never arrives.
+      let sawTurnBoundarySignal = false
       const releaseHeldDenies = (reason: string): void => {
         turnGenerating = false
         if (pendingDenyReleases.length === 0) return
@@ -1377,6 +2341,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         new Promise<void>((resolve) => {
           const timer = setTimeout(() => {
             claudeLog("passthrough.deny_hold_timeout", { afterMs: DENY_HOLD_TIMEOUT_MS })
+            // This is only a last-ditch deadlock backstop. The checkpoint
+            // completeness gates below must still observe the full streamed tool
+            // set and the turn boundary; otherwise the session is evicted rather
+            // than publishing a truncated resume point.
             resolve()
           }, DENY_HOLD_TIMEOUT_MS)
           pendingDenyReleases.push(() => {
@@ -1517,7 +2485,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 //      lines the model then disowned. With early stop, the
                 //      fabricated-loop turns this rule guarded against never
                 //      generate (the query stops the moment every deny is
-                //      persisted), so same-tool-new-args calls are genuine
+                //      checkpointed), so same-tool-new-args calls are genuine
                 //      parallelism and are captured. The drop remains only
                 //      when the operator disables early stop.
                 //   3. Forced single tool (tool_choice:{type:"tool"} / structured
@@ -1527,11 +2495,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // instead of draining the whole turn budget.
                 const signature = toolUseSignature(toolName, toolInput)
                 const isExactDuplicate = capturedSignatures.has(signature)
+                // Once the real tool turn's checkpoint is complete, any later
+                // call belongs to the hidden digest turn. Never add it to the
+                // client-visible set, even when it uses a different tool/args.
+                const isPostCheckpointCall = earlyStopFired
                 const isSameToolRepeat = !earlyStopEnabled && !isExactDuplicate && capturedToolNames.has(toolName)
                 const exceedsForcedSingle = forceSingleToolUse && capturedToolUses.length >= 1
-                if (isExactDuplicate) {
+                if (isExactDuplicate || isPostCheckpointCall) {
                   droppedToolUseIds.add(input.tool_use_id)
-                  claudeLog("passthrough.duplicate_tool_use_dropped", { name: toolName })
+                  claudeLog("passthrough.duplicate_tool_use_dropped", {
+                    name: toolName,
+                    reason: isPostCheckpointCall ? "hidden_digest" : "exact_duplicate",
+                  })
                 } else if (isSameToolRepeat || exceedsForcedSingle) {
                   droppedToolUseIds.add(input.tool_use_id)
                   sawDuplicateToolUse = true
@@ -1587,11 +2562,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 if (earlyStopEnabled && turnGenerating && !requestAbort.controller.signal.aborted) {
                   await holdDenyUntilTurnEnd()
                 }
-                if (isExactDuplicate) {
+                if (isExactDuplicate || isPostCheckpointCall) {
                   return {
                     decision: "block" as const,
                     reason:
-                      "This exact tool call has already been forwarded to the client — do not repeat it. " +
+                      "This tool call has already been handled by the client-facing turn — do not repeat it. " +
                       "Do not call additional tools and do not generate further text — end your turn now.",
                   }
                 }
@@ -1607,10 +2582,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
                 return {
                   decision: "block" as const,
-                  reason:
-                    "This tool call has been forwarded to the client for execution. " +
-                    "The result will be delivered in a future turn. " +
-                    "Do not retry, do not call additional tools, and do not generate further text — end your turn now.",
+                  reason: PASSTHROUGH_DENY_REASON,
                 }
               }],
             }],
@@ -1635,7 +2607,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           let structuredOutput: unknown
           const upstreamStartAt = Date.now()
           let firstChunkAt: number | undefined
-          let currentSessionId: string | undefined
+          let currentSessionId: string | undefined = managedFreshTarget
+            ? managedForkTarget?.sessionId
+            : undefined
 
           // Build SDK UUID map: start with previously stored UUIDs (if resuming),
           // then capture new ones from the response. Declared outside try so
@@ -1646,15 +2620,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // RangeError when allMessages.length was 0. Cold-start requests
           // are now also rejected at the entrypoint (#450) but the defensive
           // initializer keeps any future reentry safe.
-          const sdkUuidMap: Array<string | null> = cachedSession?.sdkMessageUuids
+          let sdkUuidMap: Array<string | null> = (isResume || sdkUndo) && cachedSession?.sdkMessageUuids
             ? [...cachedSession.sdkMessageUuids]
             : []
           // Pad to current message count (the last user message has no UUID yet)
           while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
+          let currentClientAssistantUuid: string | null = null
 
           claudeLog("upstream.start", { mode: "non_stream", model })
           let lastUsage: TokenUsage | undefined
           let lastStopReason: string | undefined
+          // Completeness oracle, the non-stream twin of the streaming path's
+          // `streamedToolUseIds`. Built from content_block_start, so it names
+          // every tool_use the turn actually produced — including calls whose
+          // assistant fragment the iterator has not surfaced yet. Without it the
+          // checkpoint can freeze on the fragments consumed so far and silently
+          // drop the rest from the client-facing set.
+          const streamedToolUseIds = new Set<string>()
+          let nextPassthroughToolCallAssistantUuid: string | undefined
+          let nextPassthroughToolCallIds: string[] | undefined
+          let sawCanonicalResult = false
+          let mappingInvalidated = false
+          const invalidateNonStreamMapping = (): boolean => {
+            if (isIndependentSession || mappingInvalidated) return true
+            const evicted = evictSession(
+              profileSessionId,
+              profileScopedCwd,
+              lineageMessages,
+              mappingExpectedGeneration,
+            )
+            if (evicted) mappingInvalidated = true
+            return evicted
+          }
 
           try {
             // Lazy-resolve executable if not already set (e.g. when using createProxyServer directly)
@@ -1685,9 +2682,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
               let tokenRefreshed = false
               let didFreshBaseRetry = false
-              let busySessionRetries = 0
+              let resumeRefusalRetries = 0
               let busySessionFork = false
+              let sawUnresumableRefusal = false
+              let managedCreationAttemptStarted = false
               while (true) {
+                if (managedForkTarget) {
+                  if (managedCreationAttemptStarted) {
+                    await rotateManagedCreationTarget("non_stream_retry")
+                    if (managedFreshTarget) currentSessionId = managedForkTarget?.sessionId
+                  }
+                  managedCreationAttemptStarted = true
+                }
                 // Track whether response content was yielded.
                 // The SDK emits metadata (session_id etc.) before the API call;
                 // only "assistant" messages represent actual response content.
@@ -1701,10 +2707,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // consumer loop, attempt error, loop exit).
                 turnGenerating = true
                 try {
-                  for await (const event of query(buildQueryOptions({
+                  if (resumeSessionId) resumedMappingMayBeAdvanced = true
+                  for await (const event of runSdkQueryAttempt(buildQueryOptions({
                     prompt: makePrompt(), model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
-                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools,
-                    resumeSessionId, isUndo, undoRollbackUuid, forkSession: busySessionFork || undefined, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                    resumeSessionId, isUndo: sdkUndo, resumeSessionAtUuid: undoRollbackUuid ?? passthroughToolCallAssistantUuid, forkSession: busySessionFork || undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                     effort, thinking, taskBudget, outputFormat, betas, settingSources,
                     codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
@@ -1716,7 +2723,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                       : undefined,
                     advisorModel,
-                  }, requestAbort.controller))) {
+                  }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "non_stream", managedSdkAttemptLocators())) {
                     // Capture Claude Max subscription quota updates emitted by
                     // the SDK as rate_limit_event. We snapshot them in this
                     // profile's slot of the (per-profile-scoped) rate limit
@@ -1743,45 +2750,70 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // Never retry after response content was yielded — response is committed
                   if (didYieldContent) throw error
 
-                  // Retry: session still registered as a running bg agent (#630).
-                  // The previous subprocess for this session (early-stop drain or
-                  // slow exit) hasn't finished dying, so the CLI refused --resume
-                  // with exit 1. Surfacing that would be a deterministic failure —
-                  // the client's identical retry hits the same window. Wait for
-                  // the stale process to exit and retry the SAME resume; if the
-                  // session stays busy, fork it (full history, fresh id).
-                  if (resumeSessionId && isBusySessionError(error, stderrLines.slice(attemptStderrStart).join("\n"))) {
-                    if (busySessionRetries < BUSY_SESSION_MAX_RETRIES) {
-                      busySessionRetries++
-                      claudeLog("session.busy_retry", { mode: "non_stream", attempt: busySessionRetries, resumeSessionId })
-                      plog(`[PROXY] ${requestMeta.requestId} session busy (bg agent), retrying resume ${busySessionRetries}/${BUSY_SESSION_MAX_RETRIES}`)
-                      await new Promise((resolve) => setTimeout(resolve, BUSY_SESSION_RETRY_DELAY_MS * busySessionRetries))
+                  // Retry: the resume was refused, not answered. Both refusals
+                  // that mean "not right now" — the session is busy, or it could
+                  // not be opened at all — are produced in the exit window of
+                  // this session's previous subprocess (early-stop drain or slow
+                  // exit), with the session itself intact. Surfacing that would
+                  // be a deterministic failure (the client's identical retry
+                  // hits the same window) and evicting would destroy a live
+                  // session, so wait for the stale process to exit and retry the
+                  // SAME resume. A busy session can then be forked (full
+                  // history, fresh id); an unresumable one offers nothing to
+                  // branch and falls through to the replay below. The busy
+                  // wording only ever arrives on stderr, and only matters where
+                  // a resume was attempted, so the capture is read there alone.
+                  const refusal = classifyResumeRefusal(error, resumeSessionId ? stderrLines.slice(attemptStderrStart).join("\n") : undefined)
+                  if (refusal === "unresumable") sawUnresumableRefusal = true
+                  if (resumeSessionId && (refusal === "busy" || refusal === "unresumable")) {
+                    if (resumeRefusalRetries < RESUME_REFUSAL_MAX_RETRIES) {
+                      resumeRefusalRetries++
+                      claudeLog("session.resume_retry", { mode: "non_stream", refusal, attempt: resumeRefusalRetries, resumeSessionId })
+                      plog(`[PROXY] ${requestMeta.requestId} resume refused (${refusal}), retrying ${resumeRefusalRetries}/${RESUME_REFUSAL_MAX_RETRIES}`)
+                      await new Promise((resolve) => setTimeout(resolve, RESUME_REFUSAL_RETRY_DELAY_MS * resumeRefusalRetries))
                       continue
                     }
-                    if (!busySessionFork) {
+                    if (refusal === "busy" && !busySessionFork) {
+                      await prepareManagedFork(resumeSessionId)
                       busySessionFork = true
                       claudeLog("session.busy_fork", { mode: "non_stream", resumeSessionId })
-                      plog(`[PROXY] ${requestMeta.requestId} session still busy after ${BUSY_SESSION_MAX_RETRIES} retries — forking session`)
+                      plog(`[PROXY] ${requestMeta.requestId} session still busy after ${RESUME_REFUSAL_MAX_RETRIES} retries — forking session`)
                       continue
                     }
                   }
 
-                  // Retry: stale undo UUID — evict session and start fresh (one-shot)
-                  if (isStaleSessionError(error)) {
-                    claudeLog("session.stale_uuid_retry", {
+                  // The session cannot serve this turn: a message it must hold
+                  // is gone, or it refused to open and has now spent every
+                  // retry. Reaching here after such a refusal means the budget
+                  // is gone whatever the last attempt was refused with, so a
+                  // wording that alternates cannot escape to the client. Evict
+                  // and replay the history as a fresh session (one-shot).
+                  if (refusal === "missing-message" || sawUnresumableRefusal) {
+                    claudeLog("session.resume_replay", {
                       mode: "non_stream",
+                      refusal,
                       rollbackUuid: undoRollbackUuid,
                       resumeSessionId,
                     })
-                    plog(`[PROXY] Stale session UUID, evicting and retrying as fresh session`)
-                    evictSession(profileSessionId, profileScopedCwd, allMessages)
+                    plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), evicting and replaying as fresh session`)
+                    managedForkSuperseded = true
+                    await abandonManagedFork("resume_replay")
+                    if (!evictSession(
+                      profileSessionId,
+                      profileScopedCwd,
+                      lineageMessages,
+                      mappingExpectedGeneration,
+                    )) throw new Error("Session mapping changed before resume fallback eviction")
+                    mappingExpectedGeneration = refreshGenerationAfterEviction()
+                    await replaceWithFreshTarget("non_stream_resume_replay")
+                    currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
-                    yield* query(buildQueryOptions({
+                    yield* runSdkQueryAttempt(buildQueryOptions({
                       prompt: buildFreshPrompt(allMessages, sanitizeOpts),
                       model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools,
-                      resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                      resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
@@ -1793,7 +2825,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
                       advisorModel,
-                    }, requestAbort.controller))
+                    }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "non_stream_fresh", managedSdkAttemptLocators())
                     return
                   }
 
@@ -1805,7 +2837,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   if (isExtraUsageRequiredError(errMsg) && hasExtendedContext(model)) {
                     const from = model
                     model = stripExtendedContext(model)
-                    recordExtendedContextUnavailable()
+                    recordExtendedContextUnavailable(profile.id)
                     claudeLog("upstream.context_fallback", {
                       mode: "non_stream",
                       from,
@@ -1824,14 +2856,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       reason: "extra_usage_required_resume",
                     })
                     plog(`[PROXY] ${requestMeta.requestId} extra usage persisted on resumed ${model}, retrying as fresh session`)
-                    evictSession(profileSessionId, profileScopedCwd, allMessages)
+                    managedForkSuperseded = true
+                    await abandonManagedFork("fresh_model_fallback")
+                    if (!evictSession(
+                      profileSessionId,
+                      profileScopedCwd,
+                      lineageMessages,
+                      mappingExpectedGeneration,
+                    )) throw new Error("Session mapping changed before model fallback eviction")
+                    mappingExpectedGeneration = refreshGenerationAfterEviction()
+                    await replaceWithFreshTarget("non_stream_model_fallback")
+                    currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
-                    yield* query(buildQueryOptions({
+                    yield* runSdkQueryAttempt(buildQueryOptions({
                       prompt: buildFreshPrompt(allMessages, sanitizeOpts),
                       model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools,
-                      resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                      resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                       memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
@@ -1843,7 +2885,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
                       advisorModel,
-                    }, requestAbort.controller))
+                    }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "non_stream_fresh", managedSdkAttemptLocators())
                     return
                   }
 
@@ -1866,6 +2908,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (hasExtendedContext(model)) {
                       const from = model
                       model = stripExtendedContext(model)
+                      // Bench [1m] for this profile until its window resets. Without
+                      // this the next request maps straight back to [1m], so one rate
+                      // limit costs TWO model switches and a cold prompt cache in both
+                      // directions — routinely more than the rate limit itself (#862).
+                      recordExtendedContextRateLimited(profile.id, priorityCooldownUntil(profile.id, Date.now()))
                       claudeLog("upstream.context_fallback", {
                         mode: "non_stream",
                         from,
@@ -1898,8 +2945,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
             for await (const message of response) {
               // Capture session ID from SDK messages
-              if ((message as any).session_id) {
-                currentSessionId = (message as any).session_id
+              const observedSessionId = (message as { session_id?: unknown }).session_id
+              if (typeof observedSessionId === "string" && observedSessionId) {
+                const returnedSessionId = observedSessionId
+                currentSessionId = managedFreshTarget && managedForkTarget && !managedForkSuperseded
+                  ? managedForkTarget.sessionId
+                  : returnedSessionId
+                validateManagedForkResult(returnedSessionId)
               }
               // Passthrough single-turn guard: once the model re-emits a call it
               // already made (detected in the PreToolUse hook between turns), it
@@ -1912,38 +2964,104 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 claudeLog("passthrough.loop_break", { mode: "non_stream", assistantMessages, captured: capturedToolUses.length })
                 break
               }
-              // Early stop: abort before the digest turn generates (see the
-              // earlyStop declaration above). The deny tool_results arrive as
-              // `user` messages; when every forwarded call's deny is persisted,
-              // the SDK-side history is coherent and turn 2 hasn't fired yet.
-              if (earlyStopEnabled) {
-                if (message.type === "assistant") {
-                  noteAssistantContent(earlyStop, (message as any).message?.content)
-                } else if (message.type === "user") {
-                  noteUserContent(earlyStop, (message as any).message?.content)
-                  if (shouldEarlyStop(earlyStop)) {
-                    earlyStopFired = true
-                    claudeLog("passthrough.early_stop", { mode: "non_stream", captured: capturedToolUses.length })
-                    requestAbort.abort("passthrough turn complete")
-                    break
+              // Checkpoint settlement: the deny tool_results identify when all
+              // visible calls have been handled. Freeze that assistant boundary,
+              // then keep draining; iterator observation alone is not durable.
+              let assistantAddedForwardedCall = false
+              if (
+                passthrough &&
+                message.type === "assistant" &&
+                !earlyStopFired
+              ) {
+                // Non-stream can expose a parallel tool turn as several
+                // assistant fragments, and a deny for call N can precede the
+                // assistant metadata for call N+1. Keep extending the candidate
+                // until the full client-visible ID set is covered; internal and
+                // duplicate calls are filtered by noteAssistantMessage.
+                const expectedBefore = earlyStop.expected.size
+                noteAssistantMessage(earlyStop, message)
+                assistantAddedForwardedCall = earlyStop.expected.size > expectedBefore
+              } else if (passthrough && message.type === "user" && !earlyStopFired) {
+                noteUserContent(earlyStop, (message as any).message?.content)
+              }
+              if (
+                passthrough &&
+                !earlyStopFired &&
+                (message.type === "assistant" || message.type === "user")
+              ) {
+                // The completeness gate the streaming path already applies:
+                // generation has ended AND the tracker has caught up with every
+                // tool_use the wire actually carried. Recheck after both sides:
+                // all denies can arrive before the last assistant fragment.
+                const turnComplete = sawTurnBoundarySignal
+                  ? !turnGenerating && trackerCoversStreamedCalls(earlyStop, streamedToolUseIds)
+                  : true // nothing to gate on — settle on the tracker alone
+                if (earlyStopEnabled && turnComplete && shouldEarlyStop(earlyStop)) {
+                  nextPassthroughToolCallAssistantUuid = settledToolCallAssistantUuid(earlyStop)
+                  nextPassthroughToolCallIds = [...earlyStop.expected]
+                  earlyStopFired = true
+                  // A digest hook can race just ahead of iterator consumption.
+                  // Retain only calls proven to belong to the visible assistant
+                  // checkpoint; later hooks see earlyStopFired and are dropped.
+                  for (let i = capturedToolUses.length - 1; i >= 0; i--) {
+                    if (!earlyStop.expected.has(capturedToolUses[i]!.id)) capturedToolUses.splice(i, 1)
                   }
+                  // The iterator boundary is not a durability acknowledgement.
+                  // Keep consuming through the hidden digest and canonical SDK
+                  // result before storing this assistant checkpoint.
+                  claudeLog("passthrough.checkpoint_ready", {
+                    mode: "non_stream",
+                    captured: capturedToolUses.length,
+                    toolCallAssistantUuid: nextPassthroughToolCallAssistantUuid,
+                  })
+                }
+              }
+              // #592/#625: the turn-generation boundary, observable here because
+              // passthrough requests partial messages on both paths. An assistant
+              // message is NOT this boundary: the CLI emits one per tool-use
+              // block, so releasing there frees the denies while later parallel
+              // blocks are still generating, and those denies cancel the
+              // in-flight request — beheading calls 2..N and freezing the
+              // checkpoint on call 1.
+              if (message.type === "stream_event") {
+                const event = message.event
+                const eventType = event?.type
+                if (eventType === "message_delta" || eventType === "message_stop") {
+                  sawTurnBoundarySignal = true
+                  releaseHeldDenies(eventType)
+                } else if (eventType === "message_start") {
+                  sawTurnBoundarySignal = true
+                  turnGenerating = true
+                } else if (passthrough && eventType === "content_block_start") {
+                  // The predicate the tracker arms `expected` with, so the two
+                  // sets are comparable by construction.
+                  const block = event.content_block
+                  if (isClientForwardedToolUse(block)) streamedToolUseIds.add(block.id)
                 }
               }
               if (message.type === "assistant") {
-                // #592: the turn's generation is complete — held denies can
-                // return without the CLI cancelling anything in flight.
-                releaseHeldDenies("assistant_message")
+                if (!sawTurnBoundarySignal) releaseHeldDenies("assistant_message")
                 assistantMessages += 1
-                // Capture SDK assistant UUID for undo rollback
-                if ((message as any).uuid) {
-                  sdkUuidMap.push((message as any).uuid)
+                // One Anthropic assistant response may combine several SDK
+                // assistant fragments (for example parallel tool calls).
+                if (!passthrough || earlyStop.expected.size === 0 || assistantAddedForwardedCall) {
+                  sdkUuidMap = withClientAssistantUuid(
+                    sdkUuidMap,
+                    allMessages.length,
+                    (message as any).uuid
+                  )
+                  currentClientAssistantUuid = sdkUuidMap[allMessages.length] ?? null
                 }
                 if (!firstChunkAt) {
                   firstChunkAt = Date.now()
+                  // Anchored on the attempt that produced this chunk, not on
+                  // the handler's start: a request that replayed or failed
+                  // over would otherwise report the abandoned attempts as TTFB.
+                  requestMeta.ttfbMs ??= firstChunkAt - (requestMeta.currentSdkStartedAt ?? firstChunkAt)
                   claudeLog("upstream.first_chunk", {
                     mode: "non_stream",
                     model,
-                    ttfbMs: firstChunkAt - upstreamStartAt
+                    ttfbMs: requestMeta.ttfbMs
                   })
                 }
 
@@ -2006,7 +3124,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // Capture token usage from the assistant message
                 const msgUsage = message.message.usage as TokenUsage | undefined
                 if (msgUsage) lastUsage = { ...lastUsage, ...msgUsage }
-                if (typeof message.message.stop_reason === "string") {
+                if (!isPassthroughTurn2 && typeof message.message.stop_reason === "string") {
+                  // Hidden digest turns are consumed only for durability; they
+                  // must not replace the client-visible tool_use stop reason.
                   lastStopReason = message.message.stop_reason
                 }
               }
@@ -2018,6 +3138,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // wrong output_tokens (typically 1) for any non-trivial response.
               // Prefer the result usage when present. See issue #449.
               if (message.type === "result") {
+                sawCanonicalResult = true
                 const resultUsage = (message as { usage?: unknown }).usage as TokenUsage | undefined
                 if (resultUsage) {
                   lastUsage = { ...lastUsage, ...resultUsage }
@@ -2050,8 +3171,35 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               plog(`[PROXY] ${requestMeta.requestId} discovered=${discoveredTools.size} (${newNames}) session_total=${allNames.length}`)
             }
           } catch (error) {
+            // Revocation blocks publication, not mandatory cleanup. A resumed
+            // non-stream turn interrupted by shutdown must not leave its source
+            // mapping available for another process to resume.
+            const failedResumedTurn = isResume && !managedForkTarget && !sawCanonicalResult
+            if (
+              (requestAbort.controller.signal.aborted || durableWritesRevoked || failedResumedTurn)
+              && !isIndependentSession
+            ) {
+              if (!invalidateNonStreamMapping()) {
+                throw new Error("Shared session mapping changed before interrupted non-stream invalidation")
+              }
+              claudeLog("session.interrupted_mapping_evicted", {
+                mode: "non_stream",
+                reason: failedResumedTurn ? "noncanonical_resume" : "request_abort",
+              })
+            }
             // #592: mirror the loop-exit release on the failure path.
             releaseHeldDenies("non_stream_error")
+            if (
+              !isIndependentSession &&
+              passthrough && capturedToolUses.length > 0 && !sawCanonicalResult
+            ) {
+              // A failed durability drain must not leave either a newly cached
+              // checkpoint or an older mapping behind for the advanced client.
+              if (!invalidateNonStreamMapping()) {
+                throw new Error("Shared session mapping changed before non-stream recovery invalidation")
+              }
+              claudeLog("passthrough.noncanonical_session_evicted", { mode: "non_stream", reason: "drain_error" })
+            }
             const stderrOutput = stderrLines.join("\n").trim()
             if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
               error.message = `${error.message}\nSubprocess stderr: ${stderrOutput}`
@@ -2065,10 +3213,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // that never triggered the loop-break (e.g. wide parallel exceeding
             // the turn budget) land here.
             const sdkTerm = extractSdkTermination(error instanceof Error ? error.message : String(error))
-            const canRecoverAsToolUse =
-              passthrough &&
-              capturedToolUses.length > 0 &&
-              (sdkTerm.reason === "max_turns" || sdkTerm.reason === "aborted")
+            const canRecoverAsToolUse = canRecoverCapturedToolUses({
+              reason: sdkTerm.reason,
+              passthrough,
+              capturedToolUses: capturedToolUses.length,
+              // No client-disconnect abort reaches this path.
+              abortIsOurs: true,
+            })
             if (canRecoverAsToolUse) {
               diagnosticLog.session(
                 `${requestMeta.requestId} sdk_termination_recovered ${formatSdkTermination(sdkTerm, {
@@ -2081,9 +3232,36 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 reason: sdkTerm.reason,
                 captured: capturedToolUses.length,
               })
+              // The success-path logUsage sits inside the try we just threw
+              // out of, so without this a capped tool turn — now the ordinary
+              // shape of a non-streaming passthrough turn — reports its spend
+              // to telemetry but never to the operator tailing the log. Safe
+              // from double-logging for exactly the same reason: the throw
+              // means the success-path call never ran.
+              if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
               // Do not rethrow — execution continues into the merge block, which
               // backfills contentBlocks from capturedToolUses and builds a clean
               // stop_reason:"tool_use" response.
+            } else if (passthrough && sdkTerm.reason === "max_turns" && contentBlocks.length > 0) {
+              // The turn hit its budget without producing a forwardable tool
+              // call, but it did produce content. Throwing here would answer a
+              // 200-able turn with a 500 — and the streaming path already does
+              // the honest thing instead, reporting the turn as truncated. Match
+              // it: `max_tokens` is the signal a client can act on (retry or
+              // continue), where a 500 is a dead end and `end_turn` would be the
+              // silent-turn lie #768 exists to prevent.
+              //
+              // Reachable before this change too (any max_turns with nothing
+              // captured), just rarer while the budget was 3. The single-turn
+              // cap makes max_turns the ordinary terminal state, so the
+              // degradation has to be honest rather than incidental.
+              lastStopReason = "max_tokens"
+              claudeLog("passthrough.capped_turn_truncated", {
+                mode: "non_stream",
+                blocks: contentBlocks.length,
+              })
+              plog(`[PROXY] ${requestMeta.requestId} capped turn produced no forwardable tool call — reporting as truncated`)
+              if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
             } else {
               claudeLog("upstream.failed", {
                 mode: "non_stream",
@@ -2195,7 +3373,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             hasToolUse
           })
 
-          const nonStreamQueueWaitMs = requestMeta.queueStartedAt - requestMeta.queueEnteredAt
+          const nonStreamQueueWaitMs = totalQueueWaitMs(requestMeta)
           checkTokenHealth(
             requestMeta.requestId,
             currentSessionId || resumeSessionId,
@@ -2225,9 +3403,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             sdkSessionId: currentSessionId || resumeSessionId,
             status: 200,
             queueWaitMs: nonStreamQueueWaitMs,
-            proxyOverheadMs: upstreamStartAt - requestStartAt - nonStreamQueueWaitMs,
-            ttfbMs: firstChunkAt ? firstChunkAt - upstreamStartAt : null,
-            upstreamDurationMs: Date.now() - upstreamStartAt,
+            sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+            sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
+            proxyOverheadMs: Math.max(0, totalDurationMs - nonStreamQueueWaitMs - requestMeta.sdkActiveDurationMs),
+            ttfbMs: requestMeta.ttfbMs ?? null,
+            upstreamDurationMs: requestMeta.sdkActiveDurationMs,
             totalDurationMs,
             contentBlocks: contentBlocks.length,
             textEvents: 0,
@@ -2253,21 +3433,100 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             ])
           }
 
+          // A managed fork must identify its preallocated target even when the
+          // SDK yielded no session-bearing event. Missing IDs fail closed.
+          validateManagedForkResult(currentSessionId)
+
           // Store session for future resume.
           // Fork/subagent requests don't write to the cache — see lookupSession
           // block above for rationale (avoids polluting the parent's key).
           // Duplicate-aborted sessions (sawDuplicateToolUse) are never offered
           // for resume: that SIGTERM lands before the dropped call's deny is
-          // persisted, so the SDK-side history holds a dangling tool_use
-          // ("Stream closed") that diverges from the client's view — resuming
-          // it hands the model memory of a call whose result never arrives
-          // (#552). A fresh session rebuilt from client history is coherent by
-          // construction. Early-stop aborts (earlyStopFired) are different:
-          // they fire only AFTER every forwarded call's deny was observed in
-          // the stream (already persisted), so the history is coherent and the
-          // session is safe to store and resume.
+          // durably persisted, so the SDK-side history can diverge from the
+          // client's view (#552). Checkpoint-ready sessions, by contrast, reach
+          // this store only after the iterator drains to its canonical terminal
+          // result, which gives the CLI time to persist the assistant boundary.
               if (currentSessionId && !isIndependentSession && !sawDuplicateToolUse) {
-                storeSession(profileSessionId, body.messages || [], currentSessionId, profileScopedCwd, sdkUuidMap, lastUsage)
+                const checkpointTurn = passthrough && contentBlocks.some((b) => b.type === "tool_use")
+                if (checkpointTurn && (!earlyStopFired || !sawCanonicalResult)) {
+                  // Iterator visibility is not durability. Never publish a
+                  // resumeSessionAt UUID unless the CLI reached its terminal
+                  // result and had a chance to commit the transcript.
+                  if (!invalidateNonStreamMapping()) {
+                    throw new Error("Shared session mapping changed before non-stream terminal invalidation")
+                  }
+                  claudeLog("passthrough.noncanonical_session_evicted", { mode: "non_stream" })
+                } else {
+                  validateManagedForkResult(currentSessionId)
+                  await commitManagedFork()
+                  let mappingStored: false | StoredSessionGeneration
+                  try {
+                    mappingStored = await publishPinnedTranscript(
+                      publicationTranscriptLocator(currentSessionId!),
+                      () => {
+                        assertDurableWritesAllowed()
+                        const stored = storeSession(
+                    profileSessionId,
+                    lineageMessages,
+                    currentSessionId!,
+                    profileScopedCwd,
+                    reconcileReturnedSessionUuids(
+                      sdkUuidMap,
+                      allMessages.length,
+                      currentClientAssistantUuid,
+                      resumeSessionId,
+                      currentSessionId,
+                    ),
+                    lastUsage,
+                    earlyStopFired ? nextPassthroughToolCallAssistantUuid : null,
+                    earlyStopFired ? nextPassthroughToolCallIds : null,
+                    publicationTranscriptLocator(currentSessionId!),
+                    managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
+                    mappingExpectedGeneration,
+                      )
+                        if (stored) {
+                          mappingExpectedGeneration = stored
+                          if (managedForkTarget?.sessionId === currentSessionId) managedForkPublished = true
+                        }
+                        return stored
+                      },
+                      sessionGcOptions,
+                    )
+                  } catch (error) {
+                    if (
+                      (requestAbort.controller.signal.aborted || durableWritesRevoked) &&
+                      managedForkPublished &&
+                      !invalidateNonStreamMapping()
+                    ) {
+                      throw new Error("Shared session mapping changed before canceled non-stream publication cleanup")
+                    }
+                    throw error
+                  }
+                  if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                    if (mappingStored && !invalidateNonStreamMapping()) {
+                      throw new Error("Shared session mapping changed after canceled non-stream publication")
+                    }
+                    throw new Error("Request canceled after non-stream publication")
+                  }
+                  if (!mappingStored) {
+                    if (profileSessionId) {
+                      throw new Error("Shared session mapping changed before publication")
+                    }
+                    // A fingerprint is a weak hint, not a client session identity.
+                    // Concurrent headerless chats may share it; let the CAS winner
+                    // own resume state without failing the other successful response.
+                    claudeLog("session.fingerprint_publication_lost", {})
+                    void sweepSessionGc()
+                  } else {
+                    mappingExpectedGeneration = mappingStored
+                    if (managedForkTarget?.sessionId === currentSessionId) {
+                      managedForkPublished = true
+                      releaseManagedPins()
+                      void sweepSessionGc()
+                    }
+                    commitSessionTurn()
+                  }
+                }
               }
 
               const responseSessionId = currentSessionId || resumeSessionId || `session_${Date.now()}`
@@ -2296,23 +3555,33 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
 
         const encoder = new TextEncoder()
+        let resolveStreamCompletion = () => {}
+        const streamCompletion = new Promise<void>((resolve) => {
+          resolveStreamCompletion = resolve
+        })
+        let clientAssistantContentExposed = false
         const readable = new ReadableStream({
-          async start(controller) {
+          start(controller) {
+            return (async () => {
             const upstreamStartAt = Date.now()
             let firstChunkAt: number | undefined
             let heartbeatCount = 0
             let streamEventsSeen = 0
             let eventsForwarded = 0
             let textEventsForwarded = 0
+            // Characters of forwarded text — the announce classification is a
+            // length test (see turnOutcome.ts).
+            let textCharsForwarded = 0
             let bytesSent = 0
             let streamClosed = false
-            // Early-stop drain: after the client stream closes at turn-1's
+            // Canonical drain: after the client stream closes at turn 1's
             // stop_reason:"tool_use", keep consuming SDK messages (nothing is
-            // forwarded — safeEnqueue no-ops once streamClosed) until every
-            // forwarded call's deny is persisted, then abort the query so the
-            // digest turn never generates. Without this the subprocess keeps
-            // running in the background and turn 2 is fully billed, invisibly.
+            // forwarded once streamClosed) through the hidden digest and final
+            // result. SDK iterator visibility is not a persistence barrier;
+            // only the canonical result made the assistant UUID durable in a
+            // live PTY E2E.
             let awaitingEarlyStopDrain = false
+            let exitedBeforeCanonicalTerminal = false
 
             claudeLog("upstream.start", { mode: "stream", model })
 
@@ -2320,6 +3589,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               if (streamClosed) return false
               try {
                 controller.enqueue(payload)
+                if (source.includes("content_block") || source.includes("tool_block") || source.includes("tool_input")) {
+                  clientAssistantContentExposed = true
+                }
                 bytesSent += payload.byteLength
                 return true
               } catch (error) {
@@ -2341,19 +3613,58 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // Defensive: start empty so allMessages.length === 0 doesn't crash the
             // ReadableStream's start() with `RangeError: Invalid array length`.
             // Cold-start requests with no messages are also rejected upstream now (#450).
-            const sdkUuidMap: Array<string | null> = cachedSession?.sdkMessageUuids
+            let sdkUuidMap: Array<string | null> = (isResume || sdkUndo) && cachedSession?.sdkMessageUuids
               ? [...cachedSession.sdkMessageUuids]
               : []
             while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
+            let currentClientAssistantUuid: string | null = null
 
             let messageStartEmitted = false
             let lastUsage: TokenUsage | undefined
             let hasStructuredOutput = false
             let structuredOutput: unknown
+            let nextPassthroughToolCallAssistantUuid: string | undefined
+            let nextPassthroughToolCallIds: string[] | undefined
+            let sawCanonicalResult = false
+            // Silent-turn recovery state (see turnOutcome.ts). Kill switch:
+            // MERIDIAN_SILENT_TURN_RECOVERY=0 leaves the detection and the
+            // telemetry in place and skips only the extra model turn — so an
+            // operator who does not want the spend still keeps the visibility.
+            const silentTurnRecoveryEnabled = env("SILENT_TURN_RECOVERY") !== "0"
+            let silentTurnRecoveryAttempted = false
+            let silentTurnRecovered = false
             // Hoisted out of the inner streaming loop so the outer catch can
             // dedupe captured tool_uses against what was already forwarded
             // when recovering gracefully from max_turns (see catch below).
             const streamedToolUseIds = new Set<string>()
+            // The turn's terminal message_delta, withheld rather than forwarded
+            // inline. `message_delta` is the frame stock Anthropic clients
+            // finalize a message on, so anything appended after it — recovered
+            // text, late tool_use blocks — is discarded by a correct client.
+            // Observed on the wire: a recovered answer arrived at index 9, two
+            // frames behind the end_turn delta at index 8, and was dropped.
+            //
+            // `message_stop` was already deferred to the end of the turn for
+            // the same reason; this makes the pair consistent. Exactly one
+            // terminal delta leaves the proxy, and it leaves last, once the
+            // turn's real stop_reason is known.
+            let pendingTerminalDelta: Uint8Array | null = null
+            let pendingStructuredFrames: Array<{ payload: Uint8Array; source: string }> = []
+            let pendingStructuredTextLength = 0
+            let terminalDeltaSent = false
+            const sendTerminalDelta = (stopReasonOverride?: string): void => {
+              if (terminalDeltaSent) return
+              const payload = stopReasonOverride
+                ? encoder.encode(`event: message_delta\ndata: ${JSON.stringify({
+                    type: "message_delta",
+                    delta: { stop_reason: stopReasonOverride, stop_sequence: null },
+                    usage: { output_tokens: lastUsage?.output_tokens ?? 0 },
+                  })}\n\n`)
+                : pendingTerminalDelta
+              if (!payload) return
+              terminalDeltaSent = true
+              if (safeEnqueue(payload, "terminal_message_delta")) eventsForwarded += 1
+            }
             // Client block indices whose content_block_start was forwarded but
             // whose content_block_stop hasn't been yet. The single-step abort
             // (#575) can SIGTERM the subprocess mid-block, leaving the client
@@ -2361,13 +3672,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // argument-less aborted call (#552 "red reads") — the recovery
             // path closes these explicitly before its final frames.
             const openClientBlocks = new Set<number>()
-
-            // Announce this request's eventual storeSession to follow-ups: the
-            // drain design ends the client response before the store lands, so
-            // a fast follow-up must await it (see pendingSessionStores).
-            const resolvePendingStore = passthrough && earlyStopEnabled && !isIndependentSession && profileSessionId
-              ? registerPendingStore(profileSessionId)
-              : () => {}
 
             // Envelope integrity: every path that ends the client stream must
             // first terminate any content block whose start was forwarded but
@@ -2377,50 +3681,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // extends the guarantee to ALL close paths (early stop, turn-2
             // suppression, drain-close). With the deny-hold in place blocks
             // normally complete before any close — this is the backstop.
-            // #742: the early stop fires on deny-settlement alone. When the SDK
-            // surfaces a wide parallel set as separate assistant turns, every
-            // deny the tracker KNOWS about can settle while a LATER tool_use
-            // block is still mid-input_json_delta. Closing then produced a
-            // well-formed envelope around TRUNCATED input JSON — the client
-            // rejects the call and the turn wedges. The envelope audit only
-            // measures framing, which is why this read as healthy (#675 triaged
-            // the same race as "client impact: none" on exactly that basis).
-            //
-            // So the stop is deferred while any forwarded block is open, and
-            // fired from the content_block_stop handler once the set empties.
-            let pendingEarlyStop = false
-            let pendingEarlyStopAt = 0
-
-            /** Emit the early-stop close. `reason` is recorded so the deferred
-             *  path is distinguishable from the immediate one in telemetry. */
-            const fireEarlyStop = (reason: "immediate" | "blocks_closed" | "deadline"): void => {
-              earlyStopFired = true
-              claudeLog("passthrough.early_stop", {
-                mode: "stream",
-                captured: capturedToolUses.length,
-                drained: awaitingEarlyStopDrain,
-                reason,
-                deferredMs: pendingEarlyStopAt ? Date.now() - pendingEarlyStopAt : 0,
-              })
-              pendingEarlyStop = false
-              // Still called: on the "deadline" path a block may genuinely be
-              // stuck open, and an unterminated block renders as an aborted
-              // ("red") tool call (#552). The backstop stays — it just no
-              // longer fires on the common ordering.
-              flushOpenClientBlocks("early_stop")
-              safeEnqueue(encoder.encode(
-                `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: lastUsage?.output_tokens ?? 0 } })}\n\n`
-              ), "early_stop")
-              safeEnqueue(encoder.encode(
-                `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
-              ), "early_stop")
-              requestAbort.abort("passthrough turn complete")
-              awaitingEarlyStopDrain = false
-              if (!streamClosed) {
-                streamClosed = true
-                try { controller.close() } catch {}
-              }
-            }
+            // #742: never close a client turn merely because deny messages
+            // settled while a later parallel block is still streaming. The
+            // client closes only on the canonical turn-1 tool_use delta below,
+            // after its blocks are complete; the SDK then drains invisibly.
 
             const flushOpenClientBlocks = (source: string): void => {
               if (openClientBlocks.size === 0) return
@@ -2437,8 +3701,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               openClientBlocks.clear()
             }
 
+            // Hoisted out of the try so the client-abort branch of the catch
+            // below can settle this session (see clientAbortDisposition).
+            let currentSessionId: string | undefined = managedFreshTarget
+              ? managedForkTarget?.sessionId
+              : undefined
+            let nextClientBlockIndex = 0
             try {
-              let currentSessionId: string | undefined
               // Same transparent retry wrapper as the non-streaming path.
               // Rate-limit retry strategy:
               //   1. Strip [1m] context (immediate, different model tier)
@@ -2456,10 +3725,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
                 let tokenRefreshed = false
                 let didFreshBaseRetry = false
-                let busySessionRetries = 0
+                let resumeRefusalRetries = 0
                 let busySessionFork = false
+                let sawUnresumableRefusal = false
+                let managedCreationAttemptStarted = false
 
                 while (true) {
+                  if (managedForkTarget) {
+                    if (managedCreationAttemptStarted) {
+                      await rotateManagedCreationTarget("stream_retry")
+                      if (managedFreshTarget) currentSessionId = managedForkTarget?.sessionId
+                    }
+                    managedCreationAttemptStarted = true
+                  }
                   // Track whether client-visible SSE events were yielded.
                   // The SDK emits metadata events (session_id, internal routing)
                   // before the API call — those are NOT client-visible and must
@@ -2469,10 +3747,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // must not re-match a previous attempt's refusal text.
                   const attemptStderrStart = stderrLines.length
                   try {
-                    for await (const event of query(buildQueryOptions({
+                    if (resumeSessionId) resumedMappingMayBeAdvanced = true
+                    for await (const event of runSdkQueryAttempt(buildQueryOptions({
                       prompt: makePrompt(), model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools,
-                      resumeSessionId, isUndo, undoRollbackUuid, forkSession: busySessionFork || undefined, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                      resumeSessionId, isUndo: sdkUndo, resumeSessionAtUuid: undoRollbackUuid ?? passthroughToolCallAssistantUuid, forkSession: busySessionFork || undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
@@ -2484,7 +3763,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
                       advisorModel,
-                    }, requestAbort.controller))) {
+                    }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
                       // Same SDK rate-limit capture as the non-stream path.
                       if ((event as any).type === "rate_limit_event") {
                         rateLimitStore.record(profile.id, (event as any).rate_limit_info)
@@ -2501,40 +3780,59 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // Never retry after client-visible SSE events — response is committed
                     if (didYieldClientEvent) throw error
 
-                    // Retry: session still registered as a running bg agent (#630)
-                    // — see the non-stream branch above for the full rationale.
-                    if (resumeSessionId && isBusySessionError(error, stderrLines.slice(attemptStderrStart).join("\n"))) {
-                      if (busySessionRetries < BUSY_SESSION_MAX_RETRIES) {
-                        busySessionRetries++
-                        claudeLog("session.busy_retry", { mode: "stream", attempt: busySessionRetries, resumeSessionId })
-                        plog(`[PROXY] ${requestMeta.requestId} session busy (bg agent), retrying resume ${busySessionRetries}/${BUSY_SESSION_MAX_RETRIES}`)
-                        await new Promise((resolve) => setTimeout(resolve, BUSY_SESSION_RETRY_DELAY_MS * busySessionRetries))
+                    // Retry: the resume was refused, not answered — see the
+                    // non-stream branch above for the full rationale. The busy
+                    // wording only ever arrives on stderr, and only matters
+                    // where a resume was attempted, so the capture is read there
+                    // alone.
+                    const refusal = classifyResumeRefusal(error, resumeSessionId ? stderrLines.slice(attemptStderrStart).join("\n") : undefined)
+                    if (refusal === "unresumable") sawUnresumableRefusal = true
+                    if (resumeSessionId && (refusal === "busy" || refusal === "unresumable")) {
+                      if (resumeRefusalRetries < RESUME_REFUSAL_MAX_RETRIES) {
+                        resumeRefusalRetries++
+                        claudeLog("session.resume_retry", { mode: "stream", refusal, attempt: resumeRefusalRetries, resumeSessionId })
+                        plog(`[PROXY] ${requestMeta.requestId} resume refused (${refusal}), retrying ${resumeRefusalRetries}/${RESUME_REFUSAL_MAX_RETRIES}`)
+                        await new Promise((resolve) => setTimeout(resolve, RESUME_REFUSAL_RETRY_DELAY_MS * resumeRefusalRetries))
                         continue
                       }
-                      if (!busySessionFork) {
+                      if (refusal === "busy" && !busySessionFork) {
+                        await prepareManagedFork(resumeSessionId)
                         busySessionFork = true
                         claudeLog("session.busy_fork", { mode: "stream", resumeSessionId })
-                        plog(`[PROXY] ${requestMeta.requestId} session still busy after ${BUSY_SESSION_MAX_RETRIES} retries — forking session`)
+                        plog(`[PROXY] ${requestMeta.requestId} session still busy after ${RESUME_REFUSAL_MAX_RETRIES} retries — forking session`)
                         continue
                       }
                     }
 
-                    // Retry: stale undo UUID — evict and start fresh (one-shot)
-                    if (isStaleSessionError(error)) {
-                      claudeLog("session.stale_uuid_retry", {
+                    // The session cannot serve this turn — evict and replay
+                    // the history as a fresh session (one-shot). See the
+                    // non-stream branch above for the full rationale.
+                    if (refusal === "missing-message" || sawUnresumableRefusal) {
+                      claudeLog("session.resume_replay", {
                         mode: "stream",
+                        refusal,
                         rollbackUuid: undoRollbackUuid,
                         resumeSessionId,
                       })
-                      plog(`[PROXY] Stale session UUID, evicting and retrying as fresh session`)
-                      evictSession(profileSessionId, profileScopedCwd, allMessages)
+                      plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), evicting and replaying as fresh session`)
+                      managedForkSuperseded = true
+                      await abandonManagedFork("resume_replay")
+                      if (!evictSession(
+                        profileSessionId,
+                        profileScopedCwd,
+                        lineageMessages,
+                        mappingExpectedGeneration,
+                      )) throw new Error("Session mapping changed before resume fallback eviction")
+                      mappingExpectedGeneration = refreshGenerationAfterEviction()
+                      await replaceWithFreshTarget("stream_resume_replay")
+                      currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
-                      yield* query(buildQueryOptions({
+                      yield* runSdkQueryAttempt(buildQueryOptions({
                         prompt: buildFreshPrompt(allMessages, sanitizeOpts),
                         model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
-                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools,
-                        resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                        resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
@@ -2546,7 +3844,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, requestAbort.controller))
+                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -2554,7 +3852,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (isExtraUsageRequiredError(errMsg) && hasExtendedContext(model)) {
                       const from = model
                       model = stripExtendedContext(model)
-                      recordExtendedContextUnavailable()
+                      recordExtendedContextUnavailable(profile.id)
                       claudeLog("upstream.context_fallback", {
                         mode: "stream",
                         from,
@@ -2573,14 +3871,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         reason: "extra_usage_required_resume",
                       })
                       plog(`[PROXY] ${requestMeta.requestId} extra usage persisted on resumed ${model}, retrying as fresh session`)
-                      evictSession(profileSessionId, profileScopedCwd, allMessages)
+                      managedForkSuperseded = true
+                      await abandonManagedFork("fresh_model_fallback")
+                      if (!evictSession(
+                        profileSessionId,
+                        profileScopedCwd,
+                        lineageMessages,
+                        mappingExpectedGeneration,
+                      )) throw new Error("Session mapping changed before model fallback eviction")
+                      mappingExpectedGeneration = refreshGenerationAfterEviction()
+                      await replaceWithFreshTarget("stream_model_fallback")
+                      currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
-                      yield* query(buildQueryOptions({
+                      yield* runSdkQueryAttempt(buildQueryOptions({
                         prompt: buildFreshPrompt(allMessages, sanitizeOpts),
                         model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
-                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools,
-                        resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                        resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                         memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
@@ -2592,7 +3900,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, requestAbort.controller))
+                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -2615,6 +3923,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       if (hasExtendedContext(model)) {
                         const from = model
                         model = stripExtendedContext(model)
+                        // Bench [1m] for this profile until its window resets. Without
+                        // this the next request maps straight back to [1m], so one rate
+                        // limit costs TWO model switches and a cold prompt cache in both
+                        // directions — routinely more than the rate limit itself (#862).
+                        recordExtendedContextRateLimited(profile.id, priorityCooldownUntil(profile.id, Date.now()))
                         claudeLog("upstream.context_fallback", {
                           mode: "stream",
                           from,
@@ -2676,7 +3989,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // Block index remapping: the SDK resets indices on each turn, but
               // we skip intermediate message_start/stop so the client sees one
               // message. Without remapping, turn 2's index=0 collides with turn 1's.
-              let nextClientBlockIndex = 0
+              nextClientBlockIndex = 0
               const sdkToClientIndex = new Map<number, number>()
 
               const guardedResponse = guardUpstreamIdle(response, UPSTREAM_IDLE_MS, (sinceLastMs) =>
@@ -2691,56 +4004,67 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               try {
                 for await (const message of guardedResponse) {
                   if (streamClosed && !awaitingEarlyStopDrain) {
+                    exitedBeforeCanonicalTerminal = true
                     break
                   }
 
-                  // Capture session ID and assistant UUID from any SDK message
-                  if ((message as any).session_id) {
-                    currentSessionId = (message as any).session_id
+                  // Capture session ID and only client-visible assistant
+                  // UUIDs. Hidden digest assistants share the same client slot
+                  // and must not replace its stable tool checkpoint.
+                  const observedSessionId = (message as { session_id?: unknown }).session_id
+                  if (typeof observedSessionId === "string" && observedSessionId) {
+                    const returnedSessionId = observedSessionId
+                    currentSessionId = managedFreshTarget && managedForkTarget && !managedForkSuperseded
+                      ? managedForkTarget.sessionId
+                      : returnedSessionId
+                    validateManagedForkResult(returnedSessionId)
                   }
-                  if (message.type === "assistant" && (message as any).uuid) {
-                    sdkUuidMap.push((message as any).uuid)
+                  let assistantAddedForwardedCall = false
+                  if (earlyStopEnabled && message.type === "assistant" && !earlyStopFired) {
+                    const expectedBefore = earlyStop.expected.size
+                    noteAssistantMessage(earlyStop, message)
+                    assistantAddedForwardedCall = earlyStop.expected.size > expectedBefore
+                  } else if (earlyStopEnabled && message.type === "user" && !earlyStopFired) {
+                    noteUserContent(earlyStop, (message as any).message?.content)
                   }
-                  // Early stop: abort before the digest turn generates (see the
-                  // earlyStop declaration above). By deny time the client has
-                  // already received all turn-1 blocks and the stop_reason
-                  // message_delta, so mirror the turn-2 suppression path's
-                  // clean close (message_delta + message_stop) and abort.
-                  if (earlyStopEnabled) {
-                    if (message.type === "assistant") {
-                      noteAssistantContent(earlyStop, (message as any).message?.content)
-                    } else if (message.type === "user") {
-                      noteUserContent(earlyStop, (message as any).message?.content)
-                      // streamedToolUseIds ≥ 1 guarantees the client actually
-                      // received a tool_use block before we stop the query.
-                      // Normally the client stream is already closed by the
-                      // stop_reason:"tool_use" close above (drain mode) — the
-                      // emissions below only fire in the unusual case where the
-                      // denies arrive first (safeEnqueue no-ops when closed).
-                      if (shouldEarlyStop(earlyStop) && streamedToolUseIds.size > 0) {
-                        if (openClientBlocks.size > 0) {
-                          // A forwarded block is still streaming its input.
-                          // Defer rather than truncate it (#742); the deny that
-                          // completed the tracker belongs to a block that has
-                          // already closed, so the open one's stop is close
-                          // behind. Deliberately no `break` — the remaining
-                          // deltas must keep flowing to the client.
-                          if (!pendingEarlyStop) {
-                            pendingEarlyStop = true
-                            pendingEarlyStopAt = Date.now()
-                            claudeLog("passthrough.early_stop_deferred", {
-                              openBlocks: openClientBlocks.size,
-                              captured: capturedToolUses.length,
-                            })
-                          }
-                        } else {
-                          fireEarlyStop("immediate")
-                          break
-                        }
+                  if (earlyStopEnabled && !earlyStopFired) {
+                    // A deny may precede the last per-block assistant metadata.
+                    // The client-visible stream is the completeness oracle: wait
+                    // until generation ended, every block closed, and metadata
+                    // names exactly the full forwarded ID set. Recheck on both
+                    // assistant and user messages so either ordering can settle.
+                    if (
+                      !turnGenerating &&
+                      openClientBlocks.size === 0 &&
+                      trackerCoversStreamedCalls(earlyStop, streamedToolUseIds) &&
+                      shouldEarlyStop(earlyStop)
+                    ) {
+                      nextPassthroughToolCallAssistantUuid = settledToolCallAssistantUuid(earlyStop)
+                      nextPassthroughToolCallIds = [...earlyStop.expected]
+                      earlyStopFired = true
+                      for (let i = capturedToolUses.length - 1; i >= 0; i--) {
+                        if (!earlyStop.expected.has(capturedToolUses[i]!.id)) capturedToolUses.splice(i, 1)
                       }
+                      claudeLog("passthrough.checkpoint_ready", {
+                        mode: "stream",
+                        captured: capturedToolUses.length,
+                        toolCallAssistantUuid: nextPassthroughToolCallAssistantUuid,
+                      })
                     }
                   }
+                  if (
+                    message.type === "assistant" &&
+                    (!passthrough || earlyStop.expected.size === 0 || assistantAddedForwardedCall)
+                  ) {
+                    sdkUuidMap = withClientAssistantUuid(
+                      sdkUuidMap,
+                      allMessages.length,
+                      (message as any).uuid
+                    )
+                    currentClientAssistantUuid = sdkUuidMap[allMessages.length] ?? null
+                  }
                   if (message.type === "result") {
+                    sawCanonicalResult = true
                     const resultUsage = (message as { usage?: unknown }).usage as TokenUsage | undefined
                     if (resultUsage) lastUsage = { ...lastUsage, ...resultUsage }
                     if (outputFormat && "structured_output" in message) {
@@ -2750,13 +4074,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   }
 
                   if (message.type === "stream_event") {
+                    // Once turn 1 is closed to the client, all later wire events
+                    // belong to the hidden digest. Ignore them wholesale so a
+                    // closed-controller enqueue cannot break the durability
+                    // drain before the canonical result arrives.
+                    if (awaitingEarlyStopDrain) continue
                     streamEventsSeen += 1
                     if (!firstChunkAt) {
                       firstChunkAt = Date.now()
+                      // See the non-stream site: TTFB belongs to the attempt
+                      // that actually delivered, not to the first one tried.
+                      requestMeta.ttfbMs ??= firstChunkAt - (requestMeta.currentSdkStartedAt ?? firstChunkAt)
                       claudeLog("upstream.first_chunk", {
                         mode: "stream",
                         model,
-                        ttfbMs: firstChunkAt - upstreamStartAt
+                        ttfbMs: requestMeta.ttfbMs
                       })
                     }
 
@@ -2808,17 +4140,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       // client sees stop_reason:"tool_use" and executes the tool itself.
                       if (messageStartEmitted) {
                         if (passthrough && streamedToolUseIds.size > 0) {
-                          flushOpenClientBlocks("turn2_suppression")
-                          safeEnqueue(encoder.encode(
-                            `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: lastUsage?.output_tokens ?? 0 } })}\n\n`
-                          ), "passthrough_turn2_stop")
-                          safeEnqueue(encoder.encode(
-                            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
-                          ), "passthrough_turn2_stop")
-                          claudeLog("passthrough.turn2_suppressed", { mode: "stream", toolUses: streamedToolUseIds.size })
-                          streamClosed = true
-                          controller.close()
-                          break
+                          if (!streamClosed) {
+                            flushOpenClientBlocks("turn2_suppression")
+                            if (earlyStopEnabled) {
+                              // Alternate SDK ordering: turn 2 can start before
+                              // the tool-use message_delta arms the ordinary
+                              // drain path. Suppress it, but do not grant the
+                              // client a terminal checkpoint until publication.
+                              awaitingEarlyStopDrain = true
+                              claudeLog("passthrough.turn2_suppressed", { mode: "stream", toolUses: streamedToolUseIds.size })
+                              continue
+                            }
+                            // Kill-switch compatibility interrupts the SDK
+                            // tail, but still withholds the terminal wire pair
+                            // until the old mapping is durably evicted below.
+                            exitedBeforeCanonicalTerminal = true
+                            break
+                          }
+                          continue
                         }
                         continue
                       }
@@ -2963,15 +4302,40 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       }
                     }
 
+                    // Debug fault injection: swallow this turn's text so the
+                    // silent-turn guard can be exercised on demand instead of
+                    // waiting for a ~3-in-500 live occurrence (see
+                    // shouldInjectSilentTurn). Drops only text deltas — the
+                    // block start and stop still go out, which is precisely the
+                    // production shape: an empty text block.
+                    if (
+                      eventType === "content_block_delta" &&
+                      (event as any).delta?.type === "text_delta" &&
+                      shouldInjectSilentTurn({
+                        raw: env("DEBUG_FORCE_SILENT_TURN"),
+                        sessionId: agentSessionId,
+                      })
+                    ) {
+                      claudeLog("debug.silent_turn_injected", { sessionId: agentSessionId })
+                      continue
+                    }
+
                     // Forward all other events (text, non-MCP tool_use like Task, message events).
                     // Strip SDK-only fields (context_management on message_delta) that stock
                     // Anthropic clients crash on — the real API never returns them (#525).
                     stripNonStandardStreamFields(event)
                     const payload = encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`)
-                    if (!safeEnqueue(payload, `stream_event:${eventType}`)) {
-                      break
+                    if (eventType === "message_delta") {
+                      // Withheld, not dropped — see sendTerminalDelta. Every
+                      // path that ends the turn flushes it, so the client still
+                      // gets exactly one, after any recovered content.
+                      pendingTerminalDelta = payload
+                    } else {
+                      if (!safeEnqueue(payload, `stream_event:${eventType}`)) {
+                        break
+                      }
+                      eventsForwarded += 1
                     }
-                    eventsForwarded += 1
 
                     // Track envelope integrity: which forwarded blocks are open.
                     if (eventType === "content_block_start") {
@@ -2980,12 +4344,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     } else if (eventType === "content_block_stop") {
                       const idx = (event as any).index
                       if (typeof idx === "number") openClientBlocks.delete(idx)
-                      // The block that was mid-stream when the denies settled
-                      // has now been forwarded intact — safe to close (#742).
-                      if (pendingEarlyStop && openClientBlocks.size === 0) {
-                        fireEarlyStop("blocks_closed")
-                        break
-                      }
                     }
 
                     // NOTE: agent-specific (passthrough mode) — close the client stream
@@ -2995,11 +4353,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // back to the model, and the model produces an incorrect fallback
                     // response which gets forwarded.
                     //
-                    // With early stop enabled, don't break — keep DRAINING the SDK
-                    // stream (nothing forwards after close) until every deny is
-                    // persisted, then abort so the digest turn never generates.
-                    // Without early stop (kill switch), break as before: the
-                    // subprocess finishes turn 2 in the background (billed).
+                    // With checkpoint draining enabled, don't break — keep
+                    // consuming invisibly through every deny, the digest, and the
+                    // canonical result that makes the assistant UUID durable.
+                    // Without it (kill switch), preserve the old wire
+                    // behavior by breaking here, then evict the noncanonical
+                    // session mapping because closing the query interrupts its tail.
                     if (
                       passthrough &&
                       eventType === "message_delta" &&
@@ -3007,16 +4366,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       streamedToolUseIds.size > 0
                     ) {
                       flushOpenClientBlocks("drain_close")
-                      safeEnqueue(
-                        encoder.encode(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`),
-                        "passthrough_tool_stream_stop"
-                      )
-                      streamClosed = true
-                      controller.close()
                       if (earlyStopEnabled) {
+                        // The tool blocks may be visible, but the terminal pair
+                        // is the client's permission to act on them. Withhold it
+                        // until the fork target wins durable publication below.
+                        // A crash before then leaves an incomplete SSE message,
+                        // so retry starts from the still-immutable source.
                         awaitingEarlyStopDrain = true
                         continue
                       }
+                      // Kill-switch compatibility interrupts the SDK tail,
+                      // but does not emit a successful terminal checkpoint
+                      // until the old mapping is durably evicted below.
+                      exitedBeforeCanonicalTerminal = true
                       break
                     }
 
@@ -3024,6 +4386,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       const delta = (event as any).delta
                       if (delta?.type === "text_delta") {
                         textEventsForwarded += 1
+                        if (typeof delta.text === "string") textCharsForwarded += delta.text.length
                       }
                     }
                   }
@@ -3041,48 +4404,60 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
                 const text = structuredOutputText(structuredOutput)
                 const messageId = `msg_${Date.now()}`
-                safeEnqueue(encoder.encode(
-                  `event: message_start\ndata: ${JSON.stringify({
-                    type: "message_start",
-                    message: {
-                      id: messageId,
-                      type: "message",
-                      role: "assistant",
-                      content: [],
-                      model: body.model,
-                      stop_reason: null,
-                      stop_sequence: null,
-                      usage: { input_tokens: lastUsage?.input_tokens ?? 0, output_tokens: 0 },
-                    },
-                  })}\n\n`
-                ), "structured_message_start")
-                safeEnqueue(encoder.encode(
-                  `event: content_block_start\ndata: ${JSON.stringify({
-                    type: "content_block_start",
-                    index: 0,
-                    content_block: { type: "text", text: "" },
-                  })}\n\n`
-                ), "structured_block_start")
-                safeEnqueue(encoder.encode(
-                  `event: content_block_delta\ndata: ${JSON.stringify({
-                    type: "content_block_delta",
-                    index: 0,
-                    delta: { type: "text_delta", text },
-                  })}\n\n`
-                ), "structured_text_delta")
-                safeEnqueue(encoder.encode(
-                  `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`
-                ), "structured_block_stop")
-                safeEnqueue(encoder.encode(
+                pendingStructuredFrames = [
+                  {
+                    payload: encoder.encode(
+                      `event: message_start\ndata: ${JSON.stringify({
+                        type: "message_start",
+                        message: {
+                          id: messageId,
+                          type: "message",
+                          role: "assistant",
+                          content: [],
+                          model: body.model,
+                          stop_reason: null,
+                          stop_sequence: null,
+                          usage: { input_tokens: lastUsage?.input_tokens ?? 0, output_tokens: 0 },
+                        },
+                      })}\n\n`,
+                    ),
+                    source: "structured_message_start",
+                  },
+                  {
+                    payload: encoder.encode(
+                      `event: content_block_start\ndata: ${JSON.stringify({
+                        type: "content_block_start",
+                        index: 0,
+                        content_block: { type: "text", text: "" },
+                      })}\n\n`,
+                    ),
+                    source: "structured_block_start",
+                  },
+                  {
+                    payload: encoder.encode(
+                      `event: content_block_delta\ndata: ${JSON.stringify({
+                        type: "content_block_delta",
+                        index: 0,
+                        delta: { type: "text_delta", text },
+                      })}\n\n`,
+                    ),
+                    source: "structured_text_delta",
+                  },
+                  {
+                    payload: encoder.encode(
+                      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+                    ),
+                    source: "structured_block_stop",
+                  },
+                ]
+                pendingTerminalDelta = encoder.encode(
                   `event: message_delta\ndata: ${JSON.stringify({
                     type: "message_delta",
                     delta: { stop_reason: "end_turn", stop_sequence: null },
                     usage: { output_tokens: lastUsage?.output_tokens ?? 0 },
-                  })}\n\n`
-                ), "structured_message_delta")
-                messageStartEmitted = true
-                eventsForwarded += 5
-                textEventsForwarded += 1
+                  })}\n\n`,
+                )
+                pendingStructuredTextLength = text.length
               }
 
               if (passthrough) {
@@ -3107,17 +4482,490 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 plog(`[PROXY] ${requestMeta.requestId} discovered=${discoveredTools.size} (${newNames}) session_total=${allNames.length}`)
               }
 
-              // Store session for future resume.
-              // Fork/subagent requests don't write to the cache (see lookupSession
-              // block for rationale). Duplicate-aborted sessions are never
-              // offered for resume — their history holds a dangling dropped
-              // call that diverges from the client's view (#552). Early-stop
-              // aborts are safe to store: every deny was persisted before the
-              // abort. See the non-stream store above.
+              // A managed fork must identify its preallocated target even when
+              // the SDK yielded no session-bearing event. Missing IDs fail closed.
+              validateManagedForkResult(currentSessionId)
+
+              // Store only canonical, durable checkpoint turns. Fork/subagent
+              // requests and duplicate-aborted sessions never write the cache.
+              // A live PTY E2E proved assistant/deny iterator messages may be
+              // yielded before their durable transcript records are committed, so a tool turn
+              // also requires both a valid assistant checkpoint and SDK result.
               if (currentSessionId && !isIndependentSession && !sawDuplicateToolUse) {
-                storeSession(profileSessionId, body.messages || [], currentSessionId, profileScopedCwd, sdkUuidMap, lastUsage)
+                const checkpointTurn = passthrough && streamedToolUseIds.size > 0
+                if (
+                  exitedBeforeCanonicalTerminal ||
+                  (checkpointTurn && (!earlyStopFired || !sawCanonicalResult))
+                ) {
+                  const evicted = evictSession(
+                    profileSessionId,
+                    profileScopedCwd,
+                    lineageMessages,
+                    mappingExpectedGeneration,
+                  )
+                  if (!evicted) {
+                    throw new Error("Shared session mapping changed before terminal invalidation")
+                  }
+                  claudeLog("passthrough.noncanonical_session_evicted", { mode: "stream" })
+                } else {
+                  validateManagedForkResult(currentSessionId)
+                  await commitManagedFork()
+                  const mappingStored = await publishPinnedTranscript(
+                    publicationTranscriptLocator(currentSessionId!),
+                    () => {
+                      assertDurableWritesAllowed()
+                      const stored = storeSession(
+                    profileSessionId,
+                    lineageMessages,
+                    currentSessionId!,
+                    profileScopedCwd,
+                    reconcileReturnedSessionUuids(
+                      sdkUuidMap,
+                      allMessages.length,
+                      currentClientAssistantUuid,
+                      resumeSessionId,
+                      currentSessionId,
+                    ),
+                    lastUsage,
+                    earlyStopFired ? nextPassthroughToolCallAssistantUuid : null,
+                    earlyStopFired ? nextPassthroughToolCallIds : null,
+                    publicationTranscriptLocator(currentSessionId!),
+                    managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
+                    mappingExpectedGeneration,
+                      )
+                      if (stored) {
+                        mappingExpectedGeneration = stored
+                        if (managedForkTarget?.sessionId === currentSessionId) managedForkPublished = true
+                      }
+                      return stored
+                    },
+                    sessionGcOptions,
+                  )
+                  if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                    if (
+                      mappingStored && !isIndependentSession &&
+                      !evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration)
+                    ) {
+                      throw new Error("Shared session mapping changed after canceled stream publication")
+                    }
+                    throw new Error("Request canceled after stream publication")
+                  }
+                  if (!mappingStored) {
+                    if (profileSessionId) {
+                      throw new Error("Shared session mapping changed before publication")
+                    }
+                    // A fingerprint is a weak hint, not a client session identity.
+                    // Concurrent headerless chats may share it; let the CAS winner
+                    // own resume state without failing the other successful response.
+                    claudeLog("session.fingerprint_publication_lost", {})
+                    void sweepSessionGc()
+                  } else {
+                    mappingExpectedGeneration = mappingStored
+                    if (managedForkTarget?.sessionId === currentSessionId) {
+                      managedForkPublished = true
+                      releaseManagedPins()
+                      void sweepSessionGc()
+                    }
+                    commitSessionTurn()
+                  }
+                }
               }
-              resolvePendingStore()
+
+              // Structured output is synthetic, so buffer its complete envelope
+              // until the same durable publication barrier as ordinary output.
+              // In particular, message_delta is client permission to finalize.
+              if (pendingStructuredFrames.length > 0) {
+                clientAssistantContentExposed = true
+                for (const frame of pendingStructuredFrames) {
+                  safeEnqueue(frame.payload, frame.source)
+                }
+                eventsForwarded += pendingStructuredFrames.length
+                pendingStructuredFrames = []
+                messageStartEmitted = true
+                textEventsForwarded += 1
+                textCharsForwarded += pendingStructuredTextLength
+                pendingStructuredTextLength = 0
+              }
+
+              // Last chance to save a silent turn. The three known causes are
+              // fixed; this catches the class — including causes not yet found —
+              // one turn before the client is told the request succeeded.
+              //
+              // Runs only where recovery is still possible: the stream is open,
+              // so the recovered answer can actually be forwarded. A turn that
+              // already closed for a passthrough tool turn carries tool
+              // calls by construction and is never silent.
+              //
+              // One classification, read twice: here, to decide whether a
+              // recovery spend is warranted, and again for the final envelope's
+              // telemetry. The counters mutate in between — a closure, not a
+              // snapshot.
+              const classifyNow = () => classifyTurnOutcome({
+                textEvents: textEventsForwarded,
+                toolUses: streamedToolUseIds.size,
+                blocksForwarded: eventsForwarded,
+              })
+              const preRecoveryOutcome = classifyNow()
+              //
+              // `messageStartEmitted` is a hard precondition, not a heuristic:
+              // recovery works by appending a text block to the message already
+              // open on the wire. With no message_start there is nothing to
+              // append to, and emitting blocks would be malformed SSE. That case
+              // — the SDK yielding nothing client-visible at all — is already
+              // covered by the retry wrapper's didYieldClientEvent check.
+              if (
+                !streamClosed &&
+                messageStartEmitted &&
+                shouldAttemptRecovery({
+                  outcome: preRecoveryOutcome,
+                  alreadyAttempted: silentTurnRecoveryAttempted,
+                  clientGone: streamClosed,
+                  sessionId: currentSessionId || resumeSessionId,
+                  enabled: silentTurnRecoveryEnabled,
+                })
+              ) {
+                silentTurnRecoveryAttempted = true
+                const capturedBeforeRecovery = capturedToolUses.length
+                claudeLog("response.silent_turn_recovery", {
+                  mode: "stream",
+                  kind: preRecoveryOutcome.kind,
+                  reason: preRecoveryOutcome.kind === "silent" ? preRecoveryOutcome.reason : undefined,
+                  sdkSessionId: currentSessionId || resumeSessionId,
+                })
+                const recoveryLifter = createRecoveryLifter(() => nextClientBlockIndex++)
+                // Recovery output is provisional until its exact fork wins the
+                // durable mapping CAS. Buffer it so a losing or failed
+                // publication cannot expose an answer that no later turn can
+                // resume.
+                const recoveryLiftedFrames: Array<NonNullable<ReturnType<typeof recoveryLifter.lift>>> = []
+                // The fork's identity. Without capturing it the recovered answer
+                // lives only in a session nothing points at: storeSession has
+                // already run against the pre-fork id, whose tail is the silent
+                // turn, so the next continuation resumes the silence and a tool
+                // call made here comes back as a tool_result for a tool_use the
+                // resumable session never saw.
+                let recoverySessionId: string | undefined
+                let recoveryToolCallAssistantUuid: string | undefined
+                let recoveryTextObserved = false
+                let recoverySawCanonicalResult = false
+                const recoveryEarlyStop = createEarlyStopTracker()
+                const recoveryStreamedToolUseIds = new Set<string>()
+                const recoverySourceId = currentSessionId || resumeSessionId
+                let recoveryForkSource: TranscriptLocator | undefined
+                let recoveryForkTarget: TranscriptLocator | undefined
+                let recoveryForkPublished = false
+                let recoveryCompleted = false
+                let releaseRecoveryForkPins: (() => void) | undefined
+                let unexpectedRecoveryFork: TranscriptLocator | undefined
+                try {
+                  if (!recoverySourceId || !lifecycleMappingKey) {
+                    throw new Error("Silent recovery has no durable source mapping")
+                  }
+                  recoveryForkSource = lookupSharedSession(lifecycleMappingKey)?.currentTranscript
+                    ?? transcriptLocator(recoverySourceId)
+                  const recoveryAttachedGeneration = recoveryForkSource.sessionId === recoverySourceId
+                    ? await attachPinnedTranscript(
+                      recoveryForkSource,
+                      () => {
+                        assertDurableWritesAllowed()
+                        return attachSharedTranscriptLocator(
+                          lifecycleMappingKey,
+                          recoverySourceId,
+                          recoveryForkSource!,
+                          mappingExpectedGeneration ?? undefined,
+                        )
+                      },
+                      sessionGcOptions,
+                    )
+                    : false
+                  if (!recoveryAttachedGeneration) {
+                    throw new Error("Session mapping changed before silent recovery fork preparation")
+                  }
+                  mappingExpectedGeneration = recoveryAttachedGeneration
+                  recoveryForkTarget = transcriptLocator(randomUUID())
+                  releaseRecoveryForkPins = pinActiveSessionGcLocators(recoveryForkSource, recoveryForkTarget)
+                  recoveryForkSource = await registerLiveTranscript(recoveryForkSource, sessionGcOptions)
+                  recoveryForkTarget = await prepareFork(recoveryForkTarget, sessionGcOptions)
+                  try {
+                  // Protect recovery parallel calls with the same deny hold as
+                  // the main stream. Producer hooks can run before the first
+                  // stream event reaches this consumer.
+                  turnGenerating = true
+                  resumedMappingMayBeAdvanced = true
+                  // Bounded by the same idle limit as the main stream. Iterating
+                  // the recovery query directly left a stalled recovery holding
+                  // an open SSE response and its concurrency slot with nothing
+                  // to time it out — the client waits forever on a request that
+                  // had already produced a deliverable turn.
+                  for await (const event of runSdkQueryAttempt(buildQueryOptions({
+                    prompt: SILENT_TURN_NUDGE,
+                    model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
+                    // The nudge asks for prose, but a tool call is an equally
+                    // valid answer — so the tool surface has to stay identical.
+                    passthrough, stream: true, sdkAgents, passthroughMcp,
+                    cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                    resumeSessionId: currentSessionId || resumeSessionId,
+                    isUndo: false,
+                    // Fork rather than extend: the silent turn is now this
+                    // session's tail, and appending to it is what compounds an
+                    // empty turn into an empty session (#768 client-abort).
+                    resumeSessionAtUuid: nextPassthroughToolCallAssistantUuid,
+                    forkSession: true,
+                    forkSessionId: recoveryForkTarget.sessionId,
+                    sdkHooks, blockedTools: pipelineCtx.blockedTools,
+                    incompatibleTools: pipelineCtx.incompatibleTools,
+                    mcpServerName: adapter.getMcpServerName(),
+                    allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
+                    effort, thinking, taskBudget, outputFormat, betas, settingSources,
+                    codeSystemPrompt: sdkFeatures.codeSystemPrompt,
+                    clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
+                    memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming,
+                    sharedMemory: sdkFeatures.sharedMemory,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    claudeAiConnectors: sdkFeatures.claudeAiConnectors,
+                    maxBudgetUsd: sdkFeatures.maxBudgetUsd,
+                    fallbackModel: sdkFeatures.fallbackModel,
+                    sdkDebug: sdkFeatures.sdkDebug,
+                    additionalDirectories: sdkFeatures.additionalDirectories
+                      ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
+                      : undefined,
+                    advisorModel,
+                  }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "silent_recovery", [
+                    recoveryForkSource,
+                    recoveryForkTarget,
+                  ])) {
+                    const recoveryMessage = event as any
+                    if (recoveryMessage.session_id) {
+                      if (recoveryMessage.session_id !== recoveryForkTarget.sessionId) {
+                        if (recoveryMessage.session_id !== recoveryForkSource?.sessionId) {
+                          unexpectedRecoveryFork = transcriptLocator(recoveryMessage.session_id)
+                        }
+                        throw new Error(
+                          `Managed silent recovery fork returned ${recoveryMessage.session_id}; expected ${recoveryForkTarget.sessionId}`,
+                        )
+                      }
+                      recoverySessionId = recoveryMessage.session_id
+                    }
+                    if (recoveryMessage.type === "assistant") {
+                      noteAssistantMessage(recoveryEarlyStop, recoveryMessage)
+                    } else if (recoveryMessage.type === "user") {
+                      noteUserContent(recoveryEarlyStop, recoveryMessage.message?.content)
+                    }
+                    if (recoveryMessage.type === "result") recoverySawCanonicalResult = true
+                    if (recoveryMessage.type !== "stream_event") continue
+                    const recoveryEvent = recoveryMessage.event as {
+                      type?: string
+                      content_block?: unknown
+                    }
+                    if (
+                      recoveryEvent.type === "message_delta"
+                      || recoveryEvent.type === "message_stop"
+                    ) releaseHeldDenies(`silent_recovery_${recoveryEvent.type}`)
+                    if (recoveryEvent.type === "message_start") turnGenerating = true
+                    if (
+                      recoveryEvent.type === "content_block_start"
+                      && isClientForwardedToolUse(recoveryEvent.content_block)
+                    ) {
+                      recoveryStreamedToolUseIds.add(
+                        (recoveryEvent.content_block as { id: string }).id,
+                      )
+                    }
+                    // Only text is lifted into the already-open message; the
+                    // re-indexing handshake lives in createRecoveryLifter. A
+                    // tool call arriving here still counts as a productive
+                    // recovery, through the shared PreToolUse capture below.
+                    const lifted = recoveryLifter.lift((event as any).event)
+                    if (!lifted) continue
+                    recoveryLiftedFrames.push(lifted)
+                    if (lifted.kind === "text_delta") recoveryTextObserved = true
+                  }
+                  recoveryCompleted = true
+                  releaseHeldDenies("silent_recovery_complete")
+                } catch (recoveryError) {
+                  releaseHeldDenies("silent_recovery_failed")
+                  // A failed recovery must never turn a delivered turn into a
+                  // failed request: the client still gets the original envelope,
+                  // and the attempt is recorded for the operator.
+                  claudeLog("response.silent_turn_recovery_failed", {
+                    mode: "stream",
+                    error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+                  })
+                  if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                    throw recoveryError
+                  }
+                }
+                // A recovery tool batch is deliverable only after natural
+                // iterator exhaustion, an exact settled assistant checkpoint,
+                // and a verified managed target. Otherwise remove every recovery
+                // capture so the client cannot receive calls from an abandoned
+                // or non-durable fork.
+                const recoveryCapturedToolUses = capturedToolUses.slice(capturedBeforeRecovery)
+                const recoveryCompletenessIds = recoveryStreamedToolUseIds.size > 0
+                  ? recoveryStreamedToolUseIds
+                  : new Set(recoveryCapturedToolUses.map((tool) => tool.id))
+                const recoveryToolBatchComplete = recoveryCapturedToolUses.length === 0 || (
+                  recoveryCompleted
+                  && trackerCoversStreamedCalls(recoveryEarlyStop, recoveryCompletenessIds)
+                  && shouldEarlyStop(recoveryEarlyStop)
+                  && Boolean(settledToolCallAssistantUuid(recoveryEarlyStop))
+                )
+                const recoveryDurable = recoveryCompleted
+                  && recoverySawCanonicalResult
+                  && recoverySessionId === recoveryForkTarget?.sessionId
+                  && recoveryToolBatchComplete
+                if (recoveryDurable && recoveryCapturedToolUses.length > 0) {
+                  recoveryToolCallAssistantUuid = settledToolCallAssistantUuid(recoveryEarlyStop)
+                }
+                silentTurnRecovered = recoveryDurable && (
+                  recoveryTextObserved || recoveryCapturedToolUses.length > 0
+                )
+                if (!silentTurnRecovered && recoveryCapturedToolUses.length > 0) {
+                  capturedToolUses.splice(capturedBeforeRecovery)
+                }
+                // Point the client's session at the fork, so the turn that
+                // actually answered is the one the next request resumes. The
+                // uuid map is reset rather than carried: those uuids belong to
+                // the pre-fork session and would not resolve against the fork,
+                // so undo falls back to a full replay — correct, just less
+                // efficient, where keeping them would be neither.
+                if (
+                  recoveryCompleted && silentTurnRecovered && recoverySessionId &&
+                  !isIndependentSession && !sawDuplicateToolUse
+                ) {
+                  const recoverySdkUuidMap = allMessages.map(() => null)
+                  await commitFork(recoveryForkTarget, sessionGcOptions)
+                  const recoveryMappingStored = await publishPinnedTranscript(
+                    recoveryForkTarget,
+                    () => {
+                      assertDurableWritesAllowed()
+                      const stored = storeSession(
+                    profileSessionId,
+                    lineageMessages,
+                    recoverySessionId!,
+                    profileScopedCwd,
+                    recoverySdkUuidMap,
+                    lastUsage,
+                    recoveryToolCallAssistantUuid ?? null,
+                    recoveryToolCallAssistantUuid ? [...recoveryEarlyStop.expected] : null,
+                    recoveryForkTarget,
+                    recoveryForkSource,
+                    mappingExpectedGeneration,
+                      )
+                      if (stored) {
+                        mappingExpectedGeneration = stored
+                        recoveryForkPublished = true
+                      }
+                      return stored
+                    },
+                    sessionGcOptions,
+                  )
+                  if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                    if (
+                      recoveryMappingStored && !isIndependentSession &&
+                      !evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration)
+                    ) {
+                      throw new Error("Shared session mapping changed after canceled silent-recovery publication")
+                    }
+                    throw new Error("Request canceled after silent-recovery publication")
+                  }
+                  if (!recoveryMappingStored) {
+                    // Recovery tool calls are withheld until their exact fork is
+                    // durably addressable. A fingerprint CAS loser must not emit
+                    // calls from the fork that cleanup is about to retire.
+                    silentTurnRecovered = false
+                    recoveryToolCallAssistantUuid = undefined
+                    capturedToolUses.splice(capturedBeforeRecovery)
+                    if (profileSessionId) {
+                      throw new Error("Shared session mapping changed before silent recovery publication")
+                    }
+                    claudeLog("session.fingerprint_publication_lost", { mode: "silent_recovery" })
+                    void sweepSessionGc()
+                  } else {
+                    currentSessionId = recoverySessionId
+                    nextPassthroughToolCallAssistantUuid = recoveryToolCallAssistantUuid
+                    nextPassthroughToolCallIds = recoveryToolCallAssistantUuid
+                      ? [...recoveryEarlyStop.expected]
+                      : undefined
+                    sdkUuidMap.length = 0
+                    sdkUuidMap.push(...recoverySdkUuidMap)
+                    mappingExpectedGeneration = recoveryMappingStored
+                    recoveryForkPublished = true
+                    void sweepSessionGc()
+                    commitSessionTurn()
+                  }
+                }
+                if (!recoveryForkPublished) {
+                  silentTurnRecovered = false
+                  recoveryToolCallAssistantUuid = undefined
+                  capturedToolUses.splice(capturedBeforeRecovery)
+                } else if (silentTurnRecovered) {
+                  for (const lifted of recoveryLiftedFrames) {
+                    safeEnqueue(encoder.encode(
+                      `event: ${lifted.frame.type}\ndata: ${JSON.stringify(lifted.frame)}\n\n`,
+                    ), `silent_recovery_${lifted.kind}`)
+                    if (lifted.kind === "block_start") {
+                      eventsForwarded += 1
+                    } else if (lifted.kind === "text_delta") {
+                      textEventsForwarded += 1
+                      textCharsForwarded += lifted.textChars
+                    }
+                  }
+                }
+                claudeLog("response.silent_turn_recovery_result", {
+                  mode: "stream",
+                  recovered: silentTurnRecovered,
+                  textEvents: textEventsForwarded,
+                  forkedSession: recoverySessionId ?? null,
+                })
+                // A repaired turn ends the request looking productive, so the
+                // end-of-turn classification below says nothing about it — the
+                // one event meaning "the loop nearly lost a turn" would leave
+                // no trace at session level. Report the PRE-recovery verdict,
+                // which is the truth about what upstream actually produced.
+                if (silentTurnRecovered && preRecoveryOutcome.kind === "silent") {
+                  diagnosticLog.session(
+                    `${requestMeta.requestId} silent_turn reason=${preRecoveryOutcome.reason} ` +
+                    `blocks=${eventsForwarded} out=${lastUsage?.output_tokens ?? 0} ` +
+                    `recovery=succeeded`,
+                    requestMeta.requestId,
+                  )
+                }
+                } catch (recoveryError) {
+                  claudeLog("response.silent_turn_recovery_failed", {
+                    mode: "stream_lifecycle",
+                    error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+                  })
+                  if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                    throw recoveryError
+                  }
+                } finally {
+                  if (unexpectedRecoveryFork) {
+                    await registerLiveTranscript(unexpectedRecoveryFork, sessionGcOptions)
+                      .then((exact) => abandonFork(exact, sessionGcOptions))
+                      .catch((error) => {
+                        claudeLog("session.unexpected_fork_track_failed", {
+                          mode: "silent_recovery",
+                          sessionId: unexpectedRecoveryFork?.sessionId,
+                          error: error instanceof Error ? error.message : String(error),
+                        })
+                      })
+                  }
+                  if (recoveryForkTarget && !recoveryForkPublished) {
+                    await abandonFork(recoveryForkTarget, sessionGcOptions).catch((error) => {
+                      claudeLog("session.fork_abandon_failed", {
+                        mode: "silent_recovery",
+                        error: error instanceof Error ? error.message : String(error),
+                      })
+                    })
+                    void sweepSessionGc()
+                  }
+                  releaseRecoveryForkPins?.()
+                }
+              }
+
+              if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                throw new Error("Request canceled before final stream envelope")
+              }
 
               if (!streamClosed) {
                 // In passthrough mode, emit captured tool_use blocks as stream events
@@ -3126,7 +4974,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 if (passthrough && unseenToolUses.length > 0 && messageStartEmitted) {
                   for (let i = 0; i < unseenToolUses.length; i++) {
                     const tu = unseenToolUses[i]!
-                    const blockIndex = eventsForwarded + i
+                    const blockIndex = nextClientBlockIndex++
                     streamedToolUseIds.add(tu.id)
 
                     // content_block_start
@@ -3156,14 +5004,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     ), "passthrough_tool_block_stop")
                   }
 
-                  // Emit message_delta with stop_reason: "tool_use"
-                  safeEnqueue(encoder.encode(
-                    `event: message_delta\ndata: ${JSON.stringify({
-                      type: "message_delta",
-                      delta: { stop_reason: "tool_use", stop_sequence: null },
-                      usage: { output_tokens: 0 }
-                    })}\n\n`
-                  ), "passthrough_message_delta")
+                  // Keep the terminal delta withheld until every append-only
+                  // block below is complete. Clients may finalize as soon as
+                  // they receive message_delta, so no content can follow it.
                 }
 
                 // Passthrough mode: scan body.messages for file changes on end_turn
@@ -3204,8 +5047,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   }
                 }
 
-                // Emit the final message_stop (we skipped all intermediate ones)
+                // Emit the terminal pair (both were withheld through the turn
+                // so recovered content lands ahead of them, where clients can
+                // still see it).
                 if (messageStartEmitted) {
+                  sendTerminalDelta(streamedToolUseIds.size > 0 ? "tool_use" : undefined)
                   safeEnqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`), "final_message_stop")
                 }
 
@@ -3237,7 +5083,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   textEventsForwarded
                 })
 
-                const streamQueueWaitMs = requestMeta.queueStartedAt - requestMeta.queueEnteredAt
+                const streamQueueWaitMs = totalQueueWaitMs(requestMeta)
                 checkTokenHealth(
                   requestMeta.requestId,
                   currentSessionId || resumeSessionId,
@@ -3267,9 +5113,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   sdkSessionId: currentSessionId || resumeSessionId,
                   status: 200,
                   queueWaitMs: streamQueueWaitMs,
-                  proxyOverheadMs: upstreamStartAt - requestStartAt - streamQueueWaitMs,
-                  ttfbMs: firstChunkAt ? firstChunkAt - upstreamStartAt : null,
-                  upstreamDurationMs: Date.now() - upstreamStartAt,
+                  sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+                  sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
+                  proxyOverheadMs: Math.max(0, streamTotalDurationMs - streamQueueWaitMs - requestMeta.sdkActiveDurationMs),
+                  ttfbMs: requestMeta.ttfbMs ?? null,
+                  upstreamDurationMs: requestMeta.sdkActiveDurationMs,
                   totalDurationMs: streamTotalDurationMs,
                   contentBlocks: eventsForwarded,
                   textEvents: textEventsForwarded,
@@ -3282,16 +5130,57 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   ...(envelopeViolations.length > 0 ? { envelopeViolations: [...envelopeViolations] } : {}),
                 })
 
-                if (textEventsForwarded === 0) {
-                  claudeLog("response.empty_stream", {
+                // The silent-turn invariant (see turnOutcome.ts): a terminal
+                // envelope must carry text or a tool call. The old check only
+                // logged missing text, which said nothing about whether the
+                // client got anything actionable — a tool-only turn tripped it
+                // while being perfectly healthy, and a thinking-only turn
+                // looked identical to one.
+                const turnOutcome = classifyNow()
+                if (turnOutcome.kind === "silent") {
+                  claudeLog("response.silent_turn", {
                     model,
+                    reason: turnOutcome.reason,
                     streamEventsSeen,
                     eventsForwarded,
-                    reason: "no_text_deltas_forwarded"
+                    outputTokens: lastUsage?.output_tokens,
+                    recovered: silentTurnRecovered,
+                    recoveryAttempted: silentTurnRecoveryAttempted,
                   })
+                  // Named at session level too: an autonomous run has nobody to
+                  // notice a quiet telemetry row, and this is the one event that
+                  // means "the loop just lost a turn".
+                  diagnosticLog.session(
+                    `${requestMeta.requestId} silent_turn reason=${turnOutcome.reason} ` +
+                    `blocks=${eventsForwarded} out=${lastUsage?.output_tokens ?? 0} ` +
+                    `recovery=${silentTurnRecoveryAttempted ? (silentTurnRecovered ? "succeeded" : "failed") : "off"}`,
+                    requestMeta.requestId,
+                  )
                 }
               }
             } catch (error) {
+              // Forced shutdown revokes publication, but cleanup must remain
+              // destructive: a client-visible interrupted turn cannot leave its
+              // previously published source mapping resumable.
+              const failedResumedTurn = isResume && !managedForkTarget && !sawCanonicalResult
+              const interruptedMappingMayBeAdvanced =
+                !managedForkTarget || managedForkPublished || clientAssistantContentExposed
+              if (
+                (requestAbort.controller.signal.aborted || durableWritesRevoked || failedResumedTurn)
+                && interruptedMappingMayBeAdvanced
+                && !isIndependentSession
+              ) {
+                evictSession(
+                  profileSessionId,
+                  profileScopedCwd,
+                  lineageMessages,
+                  mappingExpectedGeneration,
+                )
+                claudeLog("session.interrupted_mapping_evicted", {
+                  mode: "stream",
+                  reason: failedResumedTurn ? "noncanonical_resume" : "request_abort",
+                })
+              }
               if (isClosedControllerError(error)) {
                 streamClosed = true
                 claudeLog("stream.client_closed", {
@@ -3301,10 +5190,37 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   textEventsForwarded,
                   durationMs: Date.now() - requestStartAt
                 })
+                // This was the only terminal path that returned without
+                // settling the session: the mapping stayed pointed at the
+                // interrupted tail (every following turn then came back empty)
+                // and follow-ups waited on a promise nobody resolved. Both
+                // obligations are met before returning.
+                const disposition = clientAbortDisposition({
+                  isIndependentSession,
+                  profileSessionId,
+                  currentSessionId,
+                  sawDuplicateToolUse,
+                  toolCallAssistantUuid: nextPassthroughToolCallAssistantUuid,
+                  passthrough,
+                })
+                const mayEvictInterruptedMapping =
+                  !managedForkTarget || managedForkPublished || clientAssistantContentExposed
+                if (disposition.action === "evict" && mayEvictInterruptedMapping) {
+                  evictSession(
+                    profileSessionId,
+                    profileScopedCwd,
+                    lineageMessages,
+                    mappingExpectedGeneration,
+                  )
+                }
+                claudeLog("passthrough.client_abort_settled", {
+                  action: disposition.action === "evict" && !mayEvictInterruptedMapping
+                    ? "preserve_managed_source"
+                    : disposition.action,
+                })
                 return
               }
 
-              resolvePendingStore()
               const stderrOutput = stderrLines.join("\n").trim()
               if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
                 error.message = `${error.message}\nSubprocess stderr: ${stderrOutput}`
@@ -3341,16 +5257,78 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // tools and drives the next turn (the same outcome as a normal
               // tool-use cycle). Without this, the client sees a 500 even
               // though we already streamed everything it needs.
-              // "aborted" is accepted only for the proxy's own aborts — the
-              // single-step duplicate abort (sawDuplicateToolUse) or the
-              // early stop (earlyStopFired) — a client-disconnect abort must
-              // not be recorded as a recovered success.
-              const canRecoverAsToolUse =
-                (sdkTerm.reason === "max_turns" ||
-                  (sdkTerm.reason === "aborted" && (sawDuplicateToolUse || earlyStopFired))) &&
-                passthrough &&
-                capturedToolUses.length > 0 &&
-                messageStartEmitted
+              // "aborted" is accepted only for the proxy's own remaining
+              // single-step duplicate abort. Checkpoint settlement no longer
+              // aborts, and a client-disconnect abort must not be recovered.
+              // "upstream_idle" joins them for the same reason (#770): the guard
+              // killed a stalled stream, but the tool calls were already
+              // captured and are exactly what the client needs to make progress.
+              // Discarding them turns a recoverable stall into a turn the model
+              // later reports having "forgotten", because the next resume shows
+              // its promise to act with no matching call.
+              const canRecoverAsToolUse = canRecoverCapturedToolUses({
+                reason: sdkTerm.reason,
+                passthrough,
+                capturedToolUses: capturedToolUses.length,
+                abortIsOurs: sawDuplicateToolUse,
+              }) && messageStartEmitted
+
+              // A turn-cap stop is the one drain failure whose checkpoint is
+              // safe to keep, and the reason is specific: the SDK can only
+              // report `max_turns` from a `result` message it has already
+              // enqueued, and it awaits its transcript flush on `result`
+              // (Query.readMessages in the bundled agent SDK builds the error
+              // text from lastErrorResultText, which only a delivered result
+              // populates). So the transcript is committed by the time we see
+              // this — categorically unlike the abort-shaped failure that
+              // motivated the eviction, where a SIGTERM'd subprocess emits no
+              // result at all. That is the invariant passthroughEarlyStop.ts
+              // requires before a resumeSessionAt UUID may be published.
+              //
+              // Which also means `sawCanonicalResult` is already true here, so
+              // the eviction below would not have fired on this path anyway;
+              // naming the case in the guard is belt-and-braces, and the
+              // load-bearing half is the storeSession further down.
+              //
+              // Keeping it lets the next request rewind to the tool-use
+              // boundary and append the client's real tool_result, instead of
+              // replaying the conversation against a cold cache. Other drain
+              // failures remain unsafe and are evicted.
+              const recoverableCheckpoint =
+                canRecoverAsToolUse &&
+                sdkTerm.reason === "max_turns" &&
+                Boolean(currentSessionId) &&
+                Boolean(nextPassthroughToolCallAssistantUuid) &&
+                Boolean(nextPassthroughToolCallIds?.length) &&
+                earlyStopFired &&
+                !isIndependentSession &&
+                !sawDuplicateToolUse
+
+              const mustEvictBeforeRecoveredTerminal =
+                !isIndependentSession && canRecoverAsToolUse && !recoverableCheckpoint
+              if (
+                mustEvictBeforeRecoveredTerminal ||
+                (
+                  !isIndependentSession &&
+                  passthrough &&
+                  streamedToolUseIds.size > 0 &&
+                  !sawCanonicalResult &&
+                  !recoverableCheckpoint
+                )
+              ) {
+                // Do not grant a terminal tool checkpoint while the durable
+                // mapping still names an ancestry that lacks those calls.
+                const evicted = evictSession(
+                  profileSessionId,
+                  profileScopedCwd,
+                  lineageMessages,
+                  mappingExpectedGeneration,
+                )
+                if (mustEvictBeforeRecoveredTerminal && !evicted) {
+                  throw new Error("Shared session mapping changed before recovery invalidation")
+                }
+                claudeLog("passthrough.noncanonical_session_evicted", { mode: "stream", reason: "drain_error" })
+              }
 
               if (canRecoverAsToolUse) {
                 // Log the recovery at session level (not error) — it's a
@@ -3379,7 +5357,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 const unseenToolUses = capturedToolUses.filter(tu => !streamedToolUseIds.has(tu.id))
                 for (let i = 0; i < unseenToolUses.length; i++) {
                   const tu = unseenToolUses[i]!
-                  const blockIndex = eventsForwarded + i
+                  const blockIndex = nextClientBlockIndex++
                   streamedToolUseIds.add(tu.id)
                   safeEnqueue(encoder.encode(
                     `event: content_block_start\ndata: ${JSON.stringify({
@@ -3402,6 +5380,75 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     })}\n\n`
                   ), "recover_tool_block_stop")
                 }
+                if (recoverableCheckpoint) {
+                  validateManagedForkResult(currentSessionId)
+                  await commitManagedFork()
+                  const mappingStored = await publishPinnedTranscript(
+                    publicationTranscriptLocator(currentSessionId!),
+                    () => {
+                      assertDurableWritesAllowed()
+                      const stored = storeSession(
+                    profileSessionId,
+                    lineageMessages,
+                    currentSessionId!,
+                    profileScopedCwd,
+                    reconcileReturnedSessionUuids(
+                      sdkUuidMap,
+                      allMessages.length,
+                      currentClientAssistantUuid,
+                      resumeSessionId,
+                      currentSessionId,
+                    ),
+                    lastUsage,
+                    nextPassthroughToolCallAssistantUuid!,
+                    nextPassthroughToolCallIds!,
+                    publicationTranscriptLocator(currentSessionId!),
+                    managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
+                    mappingExpectedGeneration,
+                      )
+                      if (stored) {
+                        mappingExpectedGeneration = stored
+                        if (managedForkTarget?.sessionId === currentSessionId) managedForkPublished = true
+                      }
+                      return stored
+                    },
+                    sessionGcOptions,
+                  )
+                  if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+                    if (
+                      mappingStored && !isIndependentSession &&
+                      !evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration)
+                    ) {
+                      throw new Error("Shared session mapping changed after canceled recovery publication")
+                    }
+                    throw new Error("Request canceled after recovery publication")
+                  }
+                  if (!mappingStored) {
+                    // Recovered tool calls remain incomplete on the wire unless
+                    // their exact fork wins publication. A fingerprint CAS loss
+                    // is not authority to expose a terminal checkpoint either.
+                    throw new Error("Shared session mapping changed before recovery publication")
+                  } else {
+                    mappingExpectedGeneration = mappingStored
+                    if (managedForkTarget?.sessionId === currentSessionId) {
+                      managedForkPublished = true
+                      releaseManagedPins()
+                      void sweepSessionGc()
+                    }
+                    commitSessionTurn()
+                  }
+                  if (mappingStored) {
+                    claudeLog("passthrough.checkpoint_persisted", {
+                      mode: "stream",
+                      reason: "single_turn_boundary",
+                      toolCalls: nextPassthroughToolCallIds!.length,
+                    })
+                  }
+                }
+
+                // Publication or exact source invalidation is now durable. Only
+                // now may the terminal pair authorize the client to submit the
+                // recovered tool results.
                 safeEnqueue(encoder.encode(
                   `event: message_delta\ndata: ${JSON.stringify({
                     type: "message_delta",
@@ -3412,11 +5459,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 safeEnqueue(encoder.encode(
                   `event: message_stop\ndata: {"type":"message_stop"}\n\n`
                 ), "recover_message_stop")
-
                 recordEnvelopeViolations(checkUndeliveredToolUses(capturedToolUses, streamedToolUseIds))
+
                 // Record as success — the client got a usable response.
+                if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
                 const recoverTotalMs = Date.now() - requestStartAt
-                const recoverQueueWaitMs = requestMeta.queueStartedAt - requestMeta.queueEnteredAt
+                const recoverQueueWaitMs = totalQueueWaitMs(requestMeta)
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
                   timestamp: Date.now(),
@@ -3436,13 +5484,29 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   sdkSessionId: resumeSessionId,
                   status: 200,
                   queueWaitMs: recoverQueueWaitMs,
-                  proxyOverheadMs: upstreamStartAt - requestStartAt - recoverQueueWaitMs,
-                  ttfbMs: firstChunkAt ? firstChunkAt - upstreamStartAt : null,
-                  upstreamDurationMs: Date.now() - upstreamStartAt,
+                  sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+                  sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
+                  proxyOverheadMs: Math.max(0, recoverTotalMs - recoverQueueWaitMs - requestMeta.sdkActiveDurationMs),
+                  ttfbMs: requestMeta.ttfbMs ?? null,
+                  upstreamDurationMs: requestMeta.sdkActiveDurationMs,
                   totalDurationMs: recoverTotalMs,
                   contentBlocks: eventsForwarded + unseenToolUses.length,
                   textEvents: textEventsForwarded,
                   error: null,
+                  // The capped tool handoff makes this the ordinary path for a
+                  // passthrough tool turn, not a rare failure. Omitting tokens
+                  // here would leave the highest-volume turn in the system
+                  // reporting nothing, and would understate passthrough spend
+                  // in exactly the dashboards used to watch it. The SDK's
+                  // terminal result carries the authoritative usage even when
+                  // it reports max_turns, so lastUsage is populated by now.
+                  // The operator-facing line comes from the same source; see
+                  // the logUsage call above this record.
+                  inputTokens: lastUsage?.input_tokens,
+                  outputTokens: lastUsage?.output_tokens,
+                  cacheReadInputTokens: lastUsage?.cache_read_input_tokens,
+                  cacheCreationInputTokens: lastUsage?.cache_creation_input_tokens,
+                  cacheHitRate: computeCacheHitRate(lastUsage),
                   ...(envelopeViolations.length > 0 ? { envelopeViolations: [...envelopeViolations] } : {}),
                 })
 
@@ -3468,7 +5532,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // streaming errors would not appear in /telemetry/requests at all
               // (the success path's record call never runs when this catch fires).
               const streamErrTotalMs = Date.now() - requestStartAt
-              const streamErrQueueWaitMs = requestMeta.queueStartedAt - requestMeta.queueEnteredAt
+              const streamErrQueueWaitMs = totalQueueWaitMs(requestMeta)
               telemetryStore.record({
                 requestId: requestMeta.requestId,
                 timestamp: Date.now(),
@@ -3488,9 +5552,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 sdkSessionId: resumeSessionId,
                 status: streamErr.status,
                 queueWaitMs: streamErrQueueWaitMs,
-                proxyOverheadMs: upstreamStartAt - requestStartAt - streamErrQueueWaitMs,
-                ttfbMs: firstChunkAt ? firstChunkAt - upstreamStartAt : null,
-                upstreamDurationMs: Date.now() - upstreamStartAt,
+                sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+                sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
+                proxyOverheadMs: Math.max(0, streamErrTotalMs - streamErrQueueWaitMs - requestMeta.sdkActiveDurationMs),
+                ttfbMs: requestMeta.ttfbMs ?? null,
+                upstreamDurationMs: requestMeta.sdkActiveDurationMs,
                 totalDurationMs: streamErrTotalMs,
                 contentBlocks: eventsForwarded,
                 textEvents: textEventsForwarded,
@@ -3499,47 +5565,117 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
               // If we already emitted message_start, close the message cleanly so
               // clients that access usage.input_tokens don't crash on the incomplete response.
+              //
+              // The stop_reason here is load-bearing. This path runs when the
+              // turn FAILED, and it used to send "end_turn" — the wire's word
+              // for "the model finished and had nothing more to say". A client
+              // cannot distinguish that from success, so it does not retry, and
+              // an autonomous loop treats a crashed turn as a completed one.
+              // The error event that follows arrives AFTER message_stop, which
+              // most clients have already stopped reading.
+              //
+              // A turn cut off mid-generation is exactly what "max_tokens"
+              // describes on the wire — truncated, not finished — and every
+              // Anthropic-compatible client already handles it.
+              //
+              // Unconditional, including when text was already forwarded (#770).
+              // The earlier carve-out reserved "end_turn" for "the model really
+              // did produce a complete answer before the failure", but nothing
+              // here can know that: reaching this branch means the turn raised
+              // instead of completing, and a partial answer followed by a crash
+              // is still a truncation. Emitting "end_turn" there was the one
+              // value that actively lies, and it lies in the direction that
+              // makes an autonomous loop stop.
               if (messageStartEmitted) {
+                // An upstream failure can cut a block between its start and
+                // stop. Close every forwarded block before any terminal or
+                // error frame so the client never commits a dangling envelope.
+                flushOpenClientBlocks("error")
+                const errorStopReason = "max_tokens"
+                claudeLog("response.error_envelope", {
+                  mode: "stream",
+                  stopReason: errorStopReason,
+                  textEvents: textEventsForwarded,
+                  classified: streamErr.type,
+                })
                 safeEnqueue(encoder.encode(
                   `event: message_delta\ndata: ${JSON.stringify({
                     type: "message_delta",
-                    delta: { stop_reason: "end_turn", stop_sequence: null },
+                    delta: { stop_reason: errorStopReason, stop_sequence: null },
                     usage: { output_tokens: 0 }
                   })}\n\n`
                 ), "error_message_delta")
+                // The error goes out BEFORE message_stop, not after.
+                //
+                // message_stop is the wire's end-of-message marker: clients stop
+                // reading the body at it, so an error event queued afterwards was
+                // written into a stream nobody was still consuming. That is how a
+                // failed turn arrived looking like a successful one — the
+                // incompleteness existed in the SSE, one frame too late to be
+                // seen. Ordering it first is what makes the failure reach the
+                // client at all.
+                safeEnqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({
+                  type: "error",
+                  error: { type: streamErr.type, message: streamErr.message }
+                })}\n\n`), "error_event_before_stop")
                 safeEnqueue(encoder.encode(
                   `event: message_stop\ndata: {"type":"message_stop"}\n\n`
                 ), "error_message_stop")
+              } else {
+                // No message_start was ever emitted, so there is no message to
+                // close — the error event is the whole response.
+                safeEnqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({
+                  type: "error",
+                  error: { type: streamErr.type, message: streamErr.message }
+                })}\n\n`), "error_event")
               }
-
-              safeEnqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({
-                type: "error",
-                error: { type: streamErr.type, message: streamErr.message }
-              })}\n\n`), "error_event")
               if (!streamClosed) {
                 try { controller.close() } catch {}
                 streamClosed = true
               }
             } finally {
+              await abandonManagedFork("stream_complete_without_commit")
               requestAbort.detach()
             }
+            })().finally(() => {
+              resolveStreamCompletion()
+            })
           },
           cancel(reason) {
             requestAbort.abort(reason)
             requestAbort.detach()
+            if (!isIndependentSession && (
+              !managedForkTarget || managedForkPublished || clientAssistantContentExposed
+            )) {
+              // A direct resume or already-published target may have advanced.
+              // An unpublished managed fork writes only its isolated target, so
+              // preserve the still-authoritative source mapping and abandon it.
+              evictSession(
+                    profileSessionId,
+                    profileScopedCwd,
+                    lineageMessages,
+                    mappingExpectedGeneration,
+                  )
+              claudeLog("passthrough.client_abort_settled", { action: "evict", source: "stream_cancel" })
+            }
           },
         })
 
-        const streamSessionId = resumeSessionId || `session_${Date.now()}`
+        // Streaming retries and silent recovery can replace the physical SDK
+        // transcript after the HTTP headers have already been sent. Advertising
+        // a speculative ID here would let clients persist an abandoned target.
+        // The canonical session ID remains available in non-stream responses
+        // and in the durable session mapping used for every continuation.
         streamOwnsAbortLink = true
-        return new Response(readable, {
+        const streamResponse = new Response(readable, {
           headers: {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
-            "X-Claude-Session-ID": streamSessionId
           }
         })
+        responseCompletions.set(streamResponse, streamCompletion)
+        return streamResponse
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error)
         claudeLog("error.unhandled", {
@@ -3548,7 +5684,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         })
 
         // Detect specific error types and return helpful messages
-        const classified = classifyError(errMsg)
+        const classified = requestAbort.controller.signal.aborted
+          ? { status: 499, type: "request_cancelled", message: "The request was cancelled" }
+          : classifyError(errMsg)
 
         claudeLog("proxy.error", { error: errMsg, classified: classified.type })
 
@@ -3563,7 +5701,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           requestMeta.requestId,
         )
 
-        const errorQueueWaitMs = requestMeta.queueStartedAt - requestMeta.queueEnteredAt
+        const errorQueueWaitMs = totalQueueWaitMs(requestMeta)
+        const errorTotalMs = Date.now() - requestStartAt
         telemetryStore.record({
           requestId: requestMeta.requestId,
           timestamp: Date.now(),
@@ -3581,10 +5720,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           sdkSessionId: undefined,
           status: classified.status,
           queueWaitMs: errorQueueWaitMs,
-          proxyOverheadMs: Date.now() - requestStartAt - errorQueueWaitMs,
+          sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
+          sdkQueueWaitMs: requestMeta.sdkQueueWaitMs,
+          proxyOverheadMs: Math.max(0, errorTotalMs - errorQueueWaitMs - requestMeta.sdkActiveDurationMs),
           ttfbMs: null,
-          upstreamDurationMs: Date.now() - requestStartAt,
-          totalDurationMs: Date.now() - requestStartAt,
+          upstreamDurationMs: requestMeta.sdkActiveDurationMs,
+          totalDurationMs: errorTotalMs,
           contentBlocks: 0,
           textEvents: 0,
           error: classified.type,
@@ -3595,21 +5736,210 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           { status: classified.status, headers: { "Content-Type": "application/json" } }
         )
       } finally {
-        if (!streamOwnsAbortLink) requestAbort.detach()
+        if (!streamOwnsAbortLink) {
+          await abandonManagedFork("request_complete_without_commit")
+          requestAbort.detach()
+        }
       }
     })
   }
 
   const handleWithQueue = async (c: Context, endpoint: string) => {
+    // An internal hop carries a request the public route already admitted;
+    // re-checking the gate here would refuse work that is legitimately in
+    // flight. Everything arriving from the wire is gated normally.
+    if (draining && c.req.header("x-meridian-internal-hop") !== internalHopToken) {
+      return drainingResponse()
+    }
     const requestId = c.req.header("x-request-id") || randomUUID()
     const queueEnteredAt = Date.now()
     claudeLog("request.enter", { requestId, endpoint })
-    await acquireSession()
-    const queueStartedAt = Date.now()
+    let sessionTurnLease: SessionTurnLease | undefined
+    let crossProcessTurnLease: CrossProcessTurnLease | undefined
+    const turnWatchdogAbort = new AbortController()
+    activeRequestAborts.add(turnWatchdogAbort)
+    let finished = false
+    let leaseReleased = false
+    let retainSessionTurnFence = false
+    let leaseWatchdog: ReturnType<typeof setTimeout> | undefined
+    inFlightRequests++
+    // Releasing the lease is deliberately separate from finishing the request:
+    // the watchdog must be able to unblock the session without also corrupting
+    // the in-flight count that the shutdown drain reads.
+    const releaseSessionTurn = (forced: boolean) => {
+      if (leaseReleased || (!sessionTurnLease && !crossProcessTurnLease)) return
+      leaseReleased = true
+      if (leaseWatchdog) clearTimeout(leaseWatchdog)
+      if (forced) {
+        claudeLog("session.turn_lease_forced", { requestId, heldMs: SESSION_TURN_MAX_HOLD_MS })
+        plog(`[PROXY] ${requestId} session turn lease force-released after ${SESSION_TURN_MAX_HOLD_MS}ms`)
+      }
+      sessionTurnLease?.release()
+      if (crossProcessTurnLease) {
+        void crossProcessTurnLease.release().catch((error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          claudeLog("session.cross_process_release_failed", { requestId, error: message })
+          plog(`[PROXY] ${requestId} cross-process session lease release failed: ${message}`)
+        })
+      }
+    }
+    const finishRequest = () => {
+      if (finished) return
+      finished = true
+      if (retainSessionTurnFence && (sessionTurnLease || crossProcessTurnLease)) {
+        leaseReleased = true
+        if (leaseWatchdog) clearTimeout(leaseWatchdog)
+        claudeLog("session.turn_fenced_after_cleanup_failure", { requestId })
+        plog(`[PROXY] ${requestId} retaining session turn fence after mandatory durable cleanup failed`)
+      } else {
+        releaseSessionTurn(false)
+      }
+      activeRequestAborts.delete(turnWatchdogAbort)
+      inFlightRequests--
+    }
+
+    let body: any
+    let sharedSessionRevisionsAtArrival: Record<string, string | null> | undefined
     try {
-      return await handleMessages(c, { requestId, endpoint, queueEnteredAt, queueStartedAt })
-    } finally {
-      releaseSession()
+      try {
+        body = await c.req.json()
+      } catch (error) {
+        if (c.req.raw.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+          finishRequest()
+          return new Response(JSON.stringify({
+            type: "error",
+            error: { type: "request_cancelled", message: "The request was cancelled" },
+          }), { status: 499, headers: { "Content-Type": "application/json" } })
+        }
+        finishRequest()
+        return new Response(JSON.stringify({
+          type: "error",
+          error: { type: "invalid_request_error", message: "Request body must be valid JSON" },
+        }), { status: 400, headers: { "Content-Type": "application/json" } })
+      }
+
+      // Fingerprints are intentionally excluded here: they only hash the first
+      // user message + cwd and cannot distinguish independent headerless chats.
+      // Strict serialization is safe only when the adapter supplies a reliable
+      // client-session identity.
+      if (Array.isArray(body?.messages)) {
+        const adapter = detectAdapter(c)
+        const agentSessionId = adapter.getSessionId(c, body)
+        if (agentSessionId) {
+          const arrivalProfileIds = new Set(
+            getEffectiveProfiles(finalConfig.profiles).map((profile) => profile.id),
+          )
+          const explicitlyRequestedProfile = c.req.header("x-meridian-profile")?.trim()
+          if (explicitlyRequestedProfile) arrivalProfileIds.add(explicitlyRequestedProfile)
+          sharedSessionRevisionsAtArrival = readSessionStoreGenerationSnapshot(
+            agentSessionId,
+            [...arrivalProfileIds],
+          )
+          try {
+            const turnKey = `session:${agentSessionId}`
+            // Bound both lock acquisition and SDK ownership with the same
+            // shutdown/hold signal. Starting this only after acquisition leaves
+            // local waiters impossible to drain.
+            leaseWatchdog = setTimeout(() => {
+              claudeLog("session.turn_watchdog_abort", { requestId, heldMs: SESSION_TURN_MAX_HOLD_MS })
+              plog(`[PROXY] ${requestId} session turn exceeded ${SESSION_TURN_MAX_HOLD_MS}ms — aborting without releasing its fencing lease`)
+              turnWatchdogAbort.abort(new Error("Session turn exceeded its maximum hold time"))
+            }, SESSION_TURN_MAX_HOLD_MS)
+            leaseWatchdog.unref?.()
+            const acquireSignal = AbortSignal.any([c.req.raw.signal, turnWatchdogAbort.signal])
+            sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
+            crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+          } catch (error) {
+            if (
+              c.req.raw.signal.aborted
+              || turnWatchdogAbort.signal.aborted
+              || (error instanceof Error && error.name === "AbortError")
+            ) {
+              // This return happens before RequestMeta exists, so no other
+              // telemetry path can see it — without a row here, every request
+              // cancelled while queued behind another turn is invisible, and
+              // "clients give up waiting on the session lock" is exactly the
+              // symptom this whole feature can cause.
+              const cancelledWaitMs = Date.now() - queueEnteredAt
+              telemetryStore.record({
+                requestId,
+                timestamp: Date.now(),
+                adapter: adapter.name,
+                model: "unknown",
+                requestModel: undefined,
+                mode: "non-stream",
+                isResume: false,
+                isPassthrough: envBool("PASSTHROUGH"),
+                hasDeferredTools: undefined,
+                deferredToolCount: undefined,
+                toolCount: undefined,
+                lineageType: undefined,
+                messageCount: Array.isArray(body?.messages) ? body.messages.length : undefined,
+                sdkSessionId: undefined,
+                status: 499,
+                queueWaitMs: cancelledWaitMs,
+                sessionQueueWaitMs: cancelledWaitMs,
+                sdkQueueWaitMs: 0,
+                proxyOverheadMs: 0,
+                ttfbMs: null,
+                upstreamDurationMs: 0,
+                totalDurationMs: cancelledWaitMs,
+                contentBlocks: 0,
+                textEvents: 0,
+                error: "request_cancelled",
+              })
+              finishRequest()
+              return new Response(JSON.stringify({
+                type: "error",
+                error: { type: "request_cancelled", message: "The request was cancelled" },
+              }), { status: 499, headers: { "Content-Type": "application/json" } })
+            }
+            // The local lease may already be held when the cross-process
+            // acquisition fails. Never leave it wedged until the watchdog.
+            releaseSessionTurn(false)
+            if (error instanceof CrossProcessTurnAcquireTimeoutError) {
+              finishRequest()
+              return new Response(JSON.stringify({
+                type: "error",
+                error: {
+                  type: "overloaded_error",
+                  message: "Timed out waiting for another process to finish this session turn",
+                },
+              }), { status: 529, headers: { "Content-Type": "application/json" } })
+            }
+            throw error
+          }
+        }
+      }
+
+      const requestMeta: RequestMeta = {
+        requestId,
+        endpoint,
+        queueEnteredAt,
+        sessionQueueWaitMs: (sessionTurnLease?.waitedMs ?? 0) + (crossProcessTurnLease?.waitedMs ?? 0),
+        sdkQueueWaitMs: 0,
+        sdkActiveDurationMs: 0,
+        sessionTurnLease,
+        sharedSessionRevisionsAtArrival,
+        retainSessionTurnFence: () => { retainSessionTurnFence = true },
+      }
+      const response = await handleMessages(c, requestMeta, {
+        body,
+        turnWatchdogSignal: turnWatchdogAbort.signal,
+      })
+      const completion = responseCompletions.get(response)
+      if (completion) {
+        // .finally() re-throws whatever it settled with, so the catch is what
+        // keeps a future rejecting completion from surfacing as an unhandled
+        // rejection. It runs after finishRequest, which fires either way.
+        void completion.finally(finishRequest).catch(() => {})
+      } else {
+        finishRequest()
+      }
+      return response
+    } catch (error) {
+      finishRequest()
+      throw error
     }
   }
 
@@ -3724,6 +6054,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   // Health check endpoint — verifies auth status
   app.get("/health", async (c) => {
+    // Checked first and unconditionally: a fleet manager routing on this
+    // endpoint (e.g. a gateway's account-pool scheduler) needs to learn
+    // "stop sending here" as fast as possible during shutdown, without
+    // waiting on an auth-status round trip.
+    if (draining) {
+      return c.json({
+        status: "draining",
+        version: serverVersion,
+        message: "Meridian is shutting down; route new requests to another instance.",
+      }, 503)
+    }
     try {
       // Use active profile's auth context for health check
       const healthProfile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)
@@ -3736,6 +6077,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         return c.json({
           status: "degraded",
           version: serverVersion,
+          build: currentBuild(),
           error: "Could not verify auth status",
           mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
         })
@@ -3744,6 +6086,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         return c.json({
           status: "unhealthy",
           version: serverVersion,
+          build: currentBuild(),
           error: "Not logged in. Run: claude login",
           auth: { loggedIn: false }
         }, 503)
@@ -3772,6 +6115,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       return c.json({
         status: "healthy",
         version: serverVersion,
+        build: currentBuild(),
         auth: {
           loggedIn: true,
           email: auth.email,
@@ -3786,6 +6130,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       return c.json({
         status: "degraded",
         version: serverVersion,
+        build: currentBuild(),
         error: "Could not verify auth status",
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
       })
@@ -3948,8 +6293,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // No network roundtrip — Hono resolves the route in-process.
   // See src/proxy/openai.ts for the translation logic and design rationale.
   app.post("/v1/chat/completions", async (c) => {
+    if (draining) return drainingResponse()
     const rawBody = await c.req.json() as Record<string, unknown>
-    const anthropicBody = translateOpenAiToAnthropic(rawBody)
+    const userAgent = c.req.header("user-agent") ?? ""
+    const jcodeSessionId = userAgent.startsWith("jcode/")
+      ? normalizeJcodeSessionId(c.req.header("x-jcode-session"))
+      : undefined
+    const isJcode = jcodeSessionId !== undefined
+    const adapterName = isJcode ? "jcode" : "openai"
+    const anthropicBody = translateOpenAiToAnthropic(rawBody, {
+      preserveConversationHistory: isJcode,
+    })
 
     if (!anthropicBody) {
       return c.json(
@@ -3962,44 +6316,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // Hono resolves the path in-process; the URL scheme/host are ignored.
     // Forward the caller's auth headers so requireAuth on /v1/messages accepts
     // the inner hop when MERIDIAN_API_KEY is set (issue #415).
-    // Tag the inner hop as the generic OpenAI endpoint. Without this the
-    // header-less internal request falls through detectAdapter to the default
-    // `opencode` adapter, whose claude_code preset defaults ON — hijacking the
-    // client's own system prompt with the Claude Code persona (#526). The
-    // `openai` adapter mirrors opencode but defaults the preset OFF.
+    // Tag the inner hop as generic OpenAI unless a verified Jcode request
+    // supplied its durable local session ID. Both adapters keep the Claude Code
+    // preset off, while Jcode additionally preserves append-only history.
     const internalHeaders: Record<string, string> = {
       "Content-Type": "application/json",
-      "x-meridian-agent": "openai",
+      "x-meridian-agent": adapterName,
     }
+    if (jcodeSessionId) internalHeaders["x-jcode-session"] = jcodeSessionId
+    const requestedProfile = c.req.header("x-meridian-profile")
+    if (requestedProfile) internalHeaders["x-meridian-profile"] = requestedProfile
     const xApiKey = c.req.header("x-api-key")
     if (xApiKey) internalHeaders["x-api-key"] = xApiKey
     const authz = c.req.header("authorization")
     if (authz) internalHeaders["authorization"] = authz
+    internalHeaders["x-meridian-internal-hop"] = internalHopToken
     const internalReq = new Request("http://internal/v1/messages", {
       method: "POST",
       headers: internalHeaders,
       body: JSON.stringify(anthropicBody),
+      signal: c.req.raw.signal,
     })
     const internalRes = await app.fetch(internalReq)
 
-    if (!internalRes.ok) {
-      const errBody = await internalRes.text()
-      return c.json(
-        { type: "error", error: { type: "upstream_error", message: errBody } },
-        internalRes.status as 400 | 401 | 429 | 500
-      )
-    }
+    if (!internalRes.ok) return relayInnerError(internalRes, "anthropic")
 
     const completionId = `chatcmpl-${randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
     const model = (typeof rawBody.model === "string" && rawBody.model) ? rawBody.model : CANONICAL_SONNET_MODEL
 
-    // Resolve SDK features for this request (thinking passthrough setting).
-    // The OpenAI endpoint is unambiguously the `openai` adapter — matching the
-    // x-meridian-agent tag set on the internal hop above — so resolve directly
-    // rather than re-detecting from the (generic) client User-Agent.
+    // Resolve SDK features for the same adapter selected on the internal hop.
     const { getFeaturesForAdapter } = require("./sdkFeatures") as typeof import("./sdkFeatures")
-    const sdkFeatures = getFeaturesForAdapter("openai")
+    const sdkFeatures = getFeaturesForAdapter(adapterName)
 
     if (!anthropicBody.stream) {
       const anthropicRes = await internalRes.json() as Record<string, unknown>
@@ -4010,10 +6358,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
     // Streaming: translate Anthropic SSE events to OpenAI SSE chunks
     const encoder = new TextEncoder()
+    let internalReader: { cancel(reason?: unknown): Promise<void> } | undefined
     const readable = new ReadableStream({
       async start(controller) {
         const reader = internalRes.body?.getReader()
         if (!reader) { controller.close(); return }
+        internalReader = reader
 
         const decoder = new TextDecoder()
         let buffer = ""
@@ -4034,6 +6384,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             buffer = lines.pop() ?? ""
 
             for (const line of lines) {
+              if (line.startsWith(":")) {
+                controller.enqueue(encoder.encode(`${line}\n\n`))
+                continue
+              }
               if (!line.startsWith("data: ")) continue
               const dataStr = line.slice(6).trim()
               if (!dataStr) continue
@@ -4060,6 +6414,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           controller.close()
         }
       },
+      cancel(reason) {
+        return internalReader?.cancel(reason)
+      },
     })
 
     return new Response(readable, {
@@ -4080,6 +6437,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // the codex adapter is selected (forces passthrough; preset OFF).
   // See src/proxy/openaiResponses.ts for the translation logic.
   app.post("/v1/responses", async (c) => {
+    if (draining) return drainingResponse("openai")
     const rawBody = await c.req.json() as ResponsesRequest
     const anthropicBody = translateResponsesToAnthropic(rawBody)
 
@@ -4116,20 +6474,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const xProfile = c.req.header("x-meridian-profile")
     if (xProfile) internalHeaders["x-meridian-profile"] = xProfile
 
+    internalHeaders["x-meridian-internal-hop"] = internalHopToken
     const internalReq = new Request("http://internal/v1/messages", {
       method: "POST",
       headers: internalHeaders,
       body: JSON.stringify(anthropicBody),
+      signal: c.req.raw.signal,
     })
     const internalRes = await app.fetch(internalReq)
 
-    if (!internalRes.ok) {
-      const errBody = await internalRes.text()
-      return c.json(
-        { error: { type: "upstream_error", message: errBody, code: null } },
-        internalRes.status as 400 | 401 | 429 | 500
-      )
-    }
+    if (!internalRes.ok) return relayInnerError(internalRes, "openai")
 
     const responseId = `resp_${randomUUID().replace(/-/g, "")}`
     const created = Math.floor(Date.now() / 1000)
@@ -4143,10 +6497,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
     // Streaming: translate Anthropic SSE → Responses SSE.
     const encoder = new TextEncoder()
+    let internalReader: { cancel(reason?: unknown): Promise<void> } | undefined
     const readable = new ReadableStream({
       async start(controller) {
         const reader = internalRes.body?.getReader()
         if (!reader) { controller.close(); return }
+        internalReader = reader
 
         const decoder = new TextDecoder()
         let buffer = ""
@@ -4160,6 +6516,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             const lines = buffer.split("\n")
             buffer = lines.pop() ?? ""
             for (const line of lines) {
+              if (line.startsWith(":")) {
+                controller.enqueue(encoder.encode(`${line}\n\n`))
+                continue
+              }
               if (!line.startsWith("data: ")) continue
               const dataStr = line.slice(6).trim()
               if (!dataStr) continue
@@ -4182,6 +6542,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           controller.close()
         }
       },
+      cancel(reason) {
+        return internalReader?.cancel(reason)
+      },
     })
 
     return new Response(readable, {
@@ -4195,11 +6558,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   // --- Model Discovery ---
   // Returns available Claude models in OpenAI-compatible format.
-  // Context window reflects the subscription tier (Max = 1M, others = 200k).
+  // Context window reflects the subscription tier: Max/Team/Enterprise get 1M
+  // on the Opus/Fable tiers, everything else 200k. The tier check is shared
+  // with models.ts (subscriptionIncludesExtendedContext) — an "=== max"
+  // comparison here used to advertise 200k to Team accounts that Meridian was
+  // already routing to opus[1m] (#826).
   app.get("/v1/models", async (c) => {
-    const authStatus = await getClaudeAuthStatusAsync()
-    const isMax = authStatus?.subscriptionType === "max"
-    return c.json({ object: "list", data: buildModelList(isMax) })
+    const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)
+    const profileEnvOverrides = Object.keys(profile.env).length > 0 ? profile.env : undefined
+    const authStatus = await getClaudeAuthStatusAsync(
+      profile.id !== "default" ? profile.id : undefined,
+      profileEnvOverrides,
+    )
+    const extendedContext = subscriptionIncludesExtendedContext(authStatus?.subscriptionType)
+    return c.json({ object: "list", data: buildModelList(extendedContext) })
   })
 
   // --- Subscription Quota ---
@@ -4330,15 +6702,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // (which returns only the active profile's data).
   //
   // Each profile entry includes the same shape as `/v1/usage/quota`'s top
-  // level (windows + extraUsage), or `error: "no_token" | "upstream_error"`
-  // when the fetch failed for that profile.
+  // level (windows + extraUsage), or an `error` when the fetch failed for that
+  // profile: `"no_token" | "upstream_error" | "not_oauth" | "rate_limited"`.
+  //
+  // Only `no_token` asks anything of the operator (`claude login`). The other
+  // two are transient and want waiting, not action: `rate_limited` is a 429
+  // with no last-good snapshot left to serve, and `upstream_error` covers 5xx
+  // and a refusal to refresh (which a read-only instance does BY DESIGN, so
+  // reporting it as a missing login would be actively wrong).
+  //
+  // The reason is threaded out of the fetch rather than inferred here — a null
+  // snapshot alone can't tell these apart, which is exactly how every failure
+  // came to be labelled `no_token`. Older consumers that only switch on
+  // `no_token` fall through to their default branch, which is why these are new
+  // values rather than reuses.
   app.get("/v1/usage/quota/all", async (c) => {
     const profilesList = getEffectiveProfiles(finalConfig.profiles)
     const activeId = getActiveProfileId() || finalConfig.defaultProfile || profilesList[0]?.id || null
 
     if (profilesList.length === 0) {
       // Single-account mode — just return the default OAuth account's data.
-      const oauth = await fetchOAuthUsage({})
+      const { snapshot: oauth, error } = await fetchOAuthUsageResult({})
       return c.json({
         profiles: [{
           id: "default",
@@ -4346,7 +6730,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           windows: oauth?.windows ?? [],
           extraUsage: oauth?.extraUsage ?? null,
           fetchedAt: oauth?.fetchedAt ?? null,
-          error: oauth ? null : "no_token",
+          error,
         }],
         activeProfile: "default",
         asOf: Date.now(),
@@ -4367,7 +6751,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           error: "not_oauth" as const,
         }
       }
-      const oauth = await fetchOAuthUsage({
+      const { snapshot: oauth, error } = await fetchOAuthUsageResult({
         profileId: p.id,
         claudeConfigDir: p.claudeConfigDir,
       })
@@ -4378,7 +6762,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         windows: oauth?.windows ?? [],
         extraUsage: oauth?.extraUsage ?? null,
         fetchedAt: oauth?.fetchedAt ?? null,
-        error: oauth ? null : "no_token",
+        error,
       }
     }))
 
@@ -4554,7 +6938,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
   }
 
-  return { app, config: finalConfig, initPlugins: initPluginsAsync }
+  return {
+    app,
+    config: finalConfig,
+    initPlugins: initPluginsAsync,
+    beginDrain: () => { draining = true },
+    forceAbortInFlight: () => {
+      durableWritesRevoked = true
+      for (const controller of activeRequestAborts) {
+        controller.abort(new Error("Proxy shutdown grace period elapsed"))
+      }
+    },
+    getInFlightCount: () => inFlightRequests,
+    sweepSessionGc,
+  }
 }
 
 /**
@@ -4583,8 +6980,43 @@ export function installProxyProcessErrorHandlers(): void {
 
 export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promise<ProxyInstance> {
   claudeExecutable = await resolveClaudeExecutableAsync()
-  const { app, config: finalConfig, initPlugins } = createProxyServer(config)
+  const {
+    app,
+    config: finalConfig,
+    initPlugins,
+    beginDrain,
+    forceAbortInFlight,
+    getInFlightCount,
+    sweepSessionGc,
+  } = createProxyServer(config)
   if (initPlugins) await initPlugins()
+
+  // Only the owned HTTP-server lifecycle starts a periodic sweep. Embedders
+  // using createProxyServer().app still sweep opportunistically after managed
+  // commits without accumulating hidden timers they cannot close.
+  const sessionGcIntervalMs = Math.max(0, envInt("SESSION_GC_INTERVAL_MS", 60_000))
+  const sessionGcInterval = sweepSessionGc && sessionGcIntervalMs > 0
+    ? setInterval(() => { void sweepSessionGc() }, sessionGcIntervalMs)
+    : undefined
+  sessionGcInterval?.unref?.()
+  if (sweepSessionGc) void sweepSessionGc()
+
+  // Cached, once a day, never on the request path. Opt out with
+  // MERIDIAN_NO_UPDATE_CHECK=1. The banner below reports build-source drift
+  // synchronously; this callback reports version drift whenever it resolves.
+  startUpdateCheck({
+    onResolved: (latest) => {
+      if (finalConfig.silent) return
+      const build = getBuildInfo({
+        version: finalConfig.version ?? "unknown",
+        modulePath: import.meta.url,
+        latest,
+      })
+      if (build.source !== "npm" || !build.updateAvailable) return
+      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
+      console.log(`  npm install -g @rynfar/meridian@latest`)
+    },
+  })
 
   if (finalConfig.installProcessErrorHandlers) {
     installProxyProcessErrorHandlers()
@@ -4609,6 +7041,15 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       if (claudeInfo) {
         console.log(`Claude executable: ${claudeInfo.path} (resolved via ${claudeInfo.source})`)
       }
+      // A build that did not come from npm reports the tree's last released
+      // version, which is indistinguishable from the real thing. Say so once,
+      // at startup, rather than letting the version string imply otherwise.
+      const buildDrift = describeBuildDrift(getBuildInfo({
+        version: finalConfig.version ?? "unknown",
+        modulePath: import.meta.url,
+        latest: getLatestVersion(),
+      }))
+      if (buildDrift) console.log(`Build: ${buildDrift}`)
       console.log(`\nPoint any Anthropic-compatible tool at this endpoint:`)
       console.log(`  ANTHROPIC_API_KEY=x ANTHROPIC_BASE_URL=http://${finalConfig.host}:${info.port}`)
     }
@@ -4617,6 +7058,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   const idleMs = finalConfig.idleTimeoutSeconds * 1000
   server.keepAliveTimeout = idleMs
   server.headersTimeout = idleMs + 1000
+  const connectionTracker = trackServerConnections(server)
 
   server.on("error", (error: NodeJS.ErrnoException) => {
     if (error.code === "EADDRINUSE" && !finalConfig.silent) {
@@ -4668,16 +7110,55 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     if (authKeepaliveInterval.unref) authKeepaliveInterval.unref()
   }
 
+  let closePromise: Promise<void> | undefined
   return {
     server,
     config: finalConfig,
-    async close() {
-      clearInterval(profileTokenRefreshInterval)
-      if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
-      stopBackgroundRefresh()
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()))
-      })
+    close() {
+      closePromise ??= (async () => {
+        clearInterval(profileTokenRefreshInterval)
+        if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
+        if (sessionGcInterval) clearInterval(sessionGcInterval)
+        // Refuse new work before potentially waiting for a deletion child.
+        beginDrain?.()
+        stopBackgroundRefresh()
+        stopUpdateCheck()
+
+        // Stop admitting new requests, then give whatever is already in flight
+        // up to SHUTDOWN_GRACE_MS to finish naturally before pulling the plug.
+        // This makes existing "call close() on SIGTERM" plugin code (see the
+        // Stable API Contract) graceful for free, with no signature change.
+        try {
+          await closeServerWithGracePeriod(server, {
+            graceMs: SHUTDOWN_GRACE_MS,
+            getInFlightCount: () => getInFlightCount?.() ?? 0,
+            warn: finalConfig.silent ? undefined : (message) => console.warn(message),
+            forceCloseConnections: () => {
+              forceAbortInFlight?.()
+              connectionTracker.forceCloseAll()
+            },
+          })
+        } finally {
+          connectionTracker.dispose()
+        }
+        // Give aborted SDK iterators one short bounded window to observe the
+        // revocation and release their fencing leases. Durable callbacks also
+        // check the revocation synchronously, so a late task cannot republish.
+        const settleDeadline = Date.now() + 2_000
+        while ((getInFlightCount?.() ?? 0) > 0 && Date.now() < settleDeadline) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 25)
+            timer.unref?.()
+          })
+        }
+        // Never delete while an unjoined request may still own an SDK child.
+        if ((getInFlightCount?.() ?? 0) === 0) {
+          if (sweepSessionGc) await sweepSessionGc()
+        } else if (!finalConfig.silent) {
+          console.warn("[PROXY] Skipping final session GC because revoked requests have not settled.")
+        }
+      })()
+      return closePromise
     },
   }
 }

@@ -23,15 +23,19 @@ import {
   parseSSE,
   toolUseBlockStart,
   inputJsonDelta,
+  resolveMockSdkSessionId,
 } from "./helpers"
 
 let mockMessages: unknown[] = []
 let capturedPromptMessages: unknown[] = []
 let capturedOptions: Record<string, unknown> | null = null
+let capturedOptionHistory: Array<Record<string, unknown>> = []
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   query: ({ prompt, options }: { prompt: string | AsyncIterable<unknown>; options?: Record<string, unknown> }) => {
     capturedOptions = options ?? null
+    capturedOptionHistory.push(options ?? {})
+    const sessionId = resolveMockSdkSessionId(options)
     return (async function* () {
       capturedPromptMessages = []
       if (typeof prompt === "string") {
@@ -41,7 +45,13 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           capturedPromptMessages.push(msg)
         }
       }
-      for (const msg of mockMessages) yield msg
+      for (const msg of mockMessages) {
+        if (typeof sessionId === "string" && msg !== null && typeof msg === "object") {
+          yield { ...msg, session_id: sessionId }
+        } else {
+          yield msg
+        }
+      }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
@@ -64,10 +74,14 @@ function createTestApp() {
   return app
 }
 
-async function postChatCompletion(app: ReturnType<typeof createTestApp>, body: Record<string, unknown>) {
+async function postChatCompletion(
+  app: ReturnType<typeof createTestApp>,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+) {
   return app.fetch(new Request("http://localhost/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   }))
 }
@@ -241,6 +255,93 @@ describe("POST /v1/chat/completions — non-streaming", () => {
   })
 })
 
+describe("POST /v1/chat/completions — Jcode session continuity", () => {
+  const firstTurn = {
+    stream: false,
+    messages: [
+      { role: "system", content: "stable system" },
+      { role: "user", content: "Turn 1" },
+    ],
+  }
+  const secondTurn = {
+    stream: false,
+    messages: [
+      { role: "system", content: "stable system" },
+      { role: "user", content: "Turn 1" },
+      { role: "assistant", content: "Answer 1" },
+      { role: "user", content: "Turn 2" },
+    ],
+  }
+
+  beforeEach(() => {
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    capturedPromptMessages = []
+    capturedOptions = null
+    capturedOptionHistory = []
+    clearSessionCache()
+  })
+
+  it("resumes the same SDK session for two turns with one verified Jcode key", async () => {
+    const app = createTestApp()
+    const headers = {
+      "User-Agent": "jcode/0.1.0",
+      "x-jcode-session": "session-a",
+    }
+
+    expect((await postChatCompletion(app, firstTurn, headers)).status).toBe(200)
+    expect((await postChatCompletion(app, secondTurn, headers)).status).toBe(200)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[0]?.resume).toBeUndefined()
+    expect(capturedOptionHistory[0]?.sessionId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(capturedOptionHistory[1]?.resume).toBe(capturedOptionHistory[0]?.sessionId)
+    expect(capturedOptionHistory[1]?.systemPrompt).toBe("stable system")
+  })
+
+  it("keeps distinct Jcode session keys isolated", async () => {
+    const app = createTestApp()
+
+    await postChatCompletion(app, firstTurn, {
+      "User-Agent": "jcode/0.1.0",
+      "x-jcode-session": "session-a",
+    })
+    await postChatCompletion(app, secondTurn, {
+      "User-Agent": "jcode/0.1.0",
+      "x-jcode-session": "session-b",
+    })
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+  })
+
+  it("falls back to generic history packing when Jcode omits its session header", async () => {
+    const app = createTestApp()
+    const headers = { "User-Agent": "jcode/0.1.0" }
+
+    await postChatCompletion(app, firstTurn, headers)
+    await postChatCompletion(app, secondTurn, headers)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+    expect(capturedOptionHistory[1]?.systemPrompt).toContain("<conversation_history>")
+  })
+
+  it("ignores x-jcode-session from a non-Jcode client", async () => {
+    const app = createTestApp()
+    const headers = {
+      "User-Agent": "curl/8.0.0",
+      "x-jcode-session": "session-a",
+    }
+
+    await postChatCompletion(app, firstTurn, headers)
+    await postChatCompletion(app, secondTurn, headers)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+    expect(capturedOptionHistory[1]?.systemPrompt).toContain("<conversation_history>")
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
@@ -398,6 +499,50 @@ describe("POST /v1/chat/completions — streaming", () => {
     const uniqueIds = new Set(ids)
     expect(uniqueIds.size).toBe(1)
     expect([...uniqueIds][0]).toMatch(/^chatcmpl-/)
+  })
+
+  it("forwards internal SSE keepalive comments to the client", async () => {
+    const app = createTestApp()
+    const originalFetch = app.fetch.bind(app)
+    const internalFrames = [
+      `data: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-sonnet-5", stop_reason: null, usage: { input_tokens: 10, output_tokens: 0 } } })}`,
+      ": ping",
+      `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } })}`,
+      ": ping",
+      `data: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
+      `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } })}`,
+      `data: ${JSON.stringify({ type: "message_stop" })}`,
+    ]
+    app.fetch = (req, env, executionCtx) => {
+      if (req.url === "http://internal/v1/messages") {
+        return Promise.resolve(new Response(`${internalFrames.join("\n\n")}\n\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }))
+      }
+      return originalFetch(req, env, executionCtx)
+    }
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    const text = await readStream(res)
+    const pingLines = text.split("\n").filter(l => l === ": ping")
+    expect(pingLines).toHaveLength(2)
+
+    const contentChunks = text.split("\n")
+      .filter(l => l.startsWith("data: ") && l !== "data: [DONE]")
+      .map(l => JSON.parse(l.slice(6)) as Record<string, unknown>)
+      .map(c => {
+        const choices = c.choices as Array<Record<string, unknown>>
+        return (choices[0]!.delta as Record<string, unknown>).content
+      })
+      .filter((content): content is string => typeof content === "string" && content.length > 0)
+    expect(contentChunks.join("")).toBe("Hello")
+    expect(text).toContain("data: [DONE]")
   })
 
   // --- tool_call_counter increment behavior ---

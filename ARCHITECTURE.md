@@ -37,6 +37,8 @@ Agent (OpenCode) ◄── SSE Response ◄────────────�
 src/
 ├── proxy/
 │   ├── server.ts              ← HTTP layer: routes, SSE streaming, concurrency, request orchestration
+│   ├── concurrency.ts         ← Abortable SDK query semaphore and concurrency config parsing
+│   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
@@ -44,6 +46,8 @@ src/
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
+│   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
+│   ├── updateCheck.ts         ← Cached npm registry lookup for the newest published version
 │   ├── tools.ts               ← Tool blocking lists, MCP server name, allowed tools
 │   ├── messages.ts            ← Content normalization, message parsing
 │   ├── types.ts               ← ProxyConfig, ProxyInstance, ProxyServer types
@@ -51,7 +55,8 @@ src/
 │   │   ├── index.ts           ← Barrel export
 │   │   ├── lineage.ts         ← Pure functions: hashing, lineage verification
 │   │   ├── fingerprint.ts     ← Conversation fingerprinting, client CWD extraction
-│   │   └── cache.ts           ← LRU session caches, lookup/store operations
+│   │   ├── cache.ts           ← LRU session caches, lookup/store operations
+│   │   └── turnCoordinator.ts ← Process-wide strict serialization for reliable session IDs
 │   ├── sessionStore.ts        ← Shared file store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
@@ -112,7 +117,7 @@ server.ts (HTTP layer)
 
 2. **`session/cache.ts` owns all mutable session state.** No other module should create or manage LRU caches for sessions.
 
-3. **`errors.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`.
+3. **`errors.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts` is additionally pure — every export is a function of its arguments plus `process.env`, so the registry I/O lives in `updateCheck.ts` instead.
 
 4. **`server.ts` is the only module that imports from Hono** or touches HTTP concerns.
 
@@ -142,6 +147,7 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 | Method | What It Does |
 |--------|-------------|
 | `getSessionId(c)` | Extract session ID from request headers |
+| `getAgentMode(c, body)` | Normalize an adapter-specific primary/subagent declaration |
 | `extractWorkingDirectory(body)` | Parse working directory from request body |
 | `normalizeContent(content)` | Normalize message content for hashing |
 | `getBlockedBuiltinTools()` | SDK tools replaced by agent's MCP equivalents |
@@ -153,7 +159,7 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 
 | Logic | Location | Status |
 |-------|----------|--------|
-| `buildAgentDefinitions` | `agentDefs.ts` | Parses OpenCode Task tool format. To be adapter method. |
+| `buildAgentDefinitions` | `agentDefs.ts`, `transforms/opencode.ts` | Pure OpenCode Task parser invoked by the adapter transform. |
 | Passthrough mode | `passthroughTools.ts` | Agent-agnostic but OpenCode-motivated. Keep as-is. |
 | `ALLOWED_MCP_TOOLS` usage in `server.ts` | Line ~176 | Used for `buildAgentDefinitions`. Move when adapter handles agent defs. |
 
@@ -163,6 +169,16 @@ Sessions map an agent's conversation ID to a Claude SDK session ID. Two caches w
 
 - **Session cache**: keyed by agent header (`x-opencode-session`)
 - **Fingerprint cache**: keyed by hash of first user message + working directory (fallback when no header)
+
+**A client's session header is not always a conversation identity.** OpenCode
+runs its internal one-shot agents (`title`, `summary`, `compaction`) under the
+*user's* session id, so `x-opencode-session` alone named two unrelated
+conversations at once — the title prompt and the user's chat. They shared one
+lineage and one turn lease, which cost the user's first turn either a 400
+`session_turn_conflict` or a cold-cache full replay. `openCodeAdapter.getSessionId`
+therefore appends the agent name for non-primary agents (`ses_x#title`), leaving
+the primary agent's key byte-identical to the header. An adapter whose client
+multiplexes agents over one session id needs the same treatment.
 
 Both are LRU with coordinated eviction — evicting from one removes the corresponding entry in the other.
 

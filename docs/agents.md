@@ -6,19 +6,24 @@ Per-agent configuration for every tested client. All agents share the same basic
 
 ### OpenCode
 
+### OpenCode V1
+
 **Step 1: Run `meridian setup` (required, one time)**
 
 ```bash
 meridian setup
 ```
 
-This adds the Meridian plugin to your OpenCode global config (`~/.config/opencode/opencode.json`). The plugin enables:
+When V1 and V2 are both installed, the default command keeps V1 selected. You can
+also select it explicitly:
 
-- **Session tracking** — reliable conversation continuity across requests
-- **Safe model defaults** — Opus uses 1M context (included with Max subscription); Sonnet uses 200k to avoid Extra Usage charges ([details](configuration.md#configuration))
-- **Subagent model selection** — subagents automatically use `sonnet`/`opus` (200k), preserving rate-limit budget
+```bash
+meridian setup --v1
+```
 
-If the plugin is missing, Meridian warns at startup and reports `"plugin": "not-configured"` in the health endpoint.
+Setup adds the V1 Meridian plugin to the OpenCode global config
+(`~/.config/opencode/opencode.json`). It preserves unrelated plugin entries and
+all other settings.
 
 **Step 2: Start**
 
@@ -26,14 +31,82 @@ If the plugin is missing, Meridian warns at startup and reports `"plugin": "not-
 ANTHROPIC_API_KEY=x ANTHROPIC_BASE_URL=http://127.0.0.1:3456 opencode
 ```
 
-Or set these in your shell profile so they're always active:
+Or set these in your shell profile so they are always active:
 
 ```bash
 export ANTHROPIC_API_KEY=x
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
 ```
 
+### OpenCode V2 beta
+
+Meridian currently supports the exact public beta used by its V2 plugin:
+`@opencode-ai/cli@0.0.0-beta-18314`. V2 plugin APIs are still changing, so setup
+fails closed for another V2 version instead of installing a plugin with an
+unknown contract.
+
+Install the pinned beta and select its executable:
+
+```bash
+npm install -g --prefix ~/.local @opencode-ai/cli@0.0.0-beta-18314
+meridian setup --v2 --opencode-bin ~/.local/bin/opencode2
+```
+
+If your binary is elsewhere, pass that path to `--opencode-bin`. V2 can
+self-update to a newer beta, so keep it pinned and launch it with automatic
+updates disabled while this compatibility target is current:
+
+```bash
+export OPENCODE_DISABLE_AUTOUPDATE=1
+```
+
+Configure V2's Anthropic provider to use Meridian. Keep the existing settings in
+`~/.config/opencode/opencode.json`; the important provider fields are:
+
+```json
+{
+  "model": "anthropic/claude-opus-4-6",
+  "small_model": "anthropic/claude-haiku-4-5",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "apiKey": "x",
+        "baseURL": "http://127.0.0.1:3456"
+      },
+      "models": {
+        "claude-opus-4-6": { "name": "Claude Opus 4.6" },
+        "claude-haiku-4-5": { "name": "Claude Haiku 4.5" }
+      }
+    }
+  }
+}
+```
+
+Then start the pinned client:
+
+```bash
+OPENCODE_DISABLE_AUTOUPDATE=1 ~/.local/bin/opencode2
+```
+
+The V2 plugin uses the native `model.request` and `http.request` hooks. It keeps
+primary and compaction requests attached to the correct OpenCode session,
+detaches concurrent hidden title/summary requests, and gives each visible
+subagent its own trusted identity. Request bodies and model input are unchanged.
+
+For either generation, the plugin enables:
+
+- **Session tracking** — reliable conversation continuity across requests
+- **Safe hidden-agent concurrency** — title and summary work cannot advance the primary lineage
+- **Safe model defaults** — Opus uses 1M context; Sonnet uses 200k to avoid Extra Usage charges ([details](configuration.md#configuration))
+- **Subagent model selection** — subagents use the 200k tier, preserving rate-limit budget
+
+If the plugin is missing, Meridian warns at request time. Restart OpenCode after
+running setup so it loads the selected plugin.
+
 #### oh-my-opencagent (OMO)
+
+> **OpenCode V1:** The integration below is validated on V1. Do not assume that
+> its plugin schema is compatible with the pinned V2 beta.
 
 [oh-my-opencagent](https://github.com/nicobailey/oh-my-opencagent) adds multi-agent orchestration on top of OpenCode. It works transparently through Meridian with no extra configuration — OMO uses the same OpenCode headers and tool format, so Meridian detects it automatically.
 
@@ -249,6 +322,156 @@ Pi uses the `@mariozechner/pi-ai` library which supports a configurable `baseUrl
 Pi mimics Claude Code's User-Agent, so automatic detection isn't possible. The `x-meridian-agent: pi` header in the config above tells Meridian to use the Pi adapter. Alternatively, if Pi is your only agent, you can set `MERIDIAN_DEFAULT_AGENT=pi` as an env var instead.
 
 Pi runs in passthrough mode by default — it executes its own tools and Meridian just forwards the `tool_use` blocks. Opt out with `MERIDIAN_PASSTHROUGH=0`.
+
+### Prime Agent
+
+[Prime Agent](https://www.npmjs.com/package/prime-agent) is a fork of Pi with a
+different prompt and tool surface, so it uses its own `prime` adapter rather
+than Pi's. Its only tool by default is `ipython`, a persistent kernel in the
+client — passthrough is effectively required, and internal mode
+(`MERIDIAN_PASSTHROUGH=0`) drops that tool entirely.
+
+Connect it with an extension. Save as `.prime/agent/extensions/meridian.ts` in
+a project, or `~/.prime/agent/extensions/meridian.ts` globally:
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+
+const MERIDIAN_PROVIDER = "meridian"
+
+export default function (pi: ExtensionAPI) {
+  pi.registerProvider(MERIDIAN_PROVIDER, {
+    name: "Meridian (Claude Max)",
+    baseUrl: "http://127.0.0.1:3456",
+    apiKey: "MERIDIAN_API_KEY",       // env var name, or any literal if auth is off
+    api: "anthropic-messages",
+    headers: { "x-meridian-agent": "prime" },
+    models: [
+      {
+        id: "claude-opus-5",
+        name: "Claude Opus 5 (Meridian)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1000000,
+        maxTokens: 64000,
+      },
+    ],
+  })
+
+  // Required, not an optimisation — see below.
+  pi.on("before_provider_request", (event: any, ctx: any) => {
+    if (ctx?.model?.provider !== MERIDIAN_PROVIDER) return undefined
+    const sessionId = ctx?.sessionManager?.getSessionId?.()
+    if (typeof sessionId !== "string" || !sessionId) return undefined
+    return {
+      ...(event.payload as Record<string, unknown>),
+      metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+    }
+  })
+}
+```
+
+Then pick a model with `/model` or `--provider meridian --model claude-opus-5`.
+
+**`contextWindow` must say `1000000`.** Provider models registered this way are
+static — Prime Agent never calls `GET /v1/models` for them — so this literal is
+the *only* thing driving the TUI footer and auto-compaction
+(`contextTokens > contextWindow - reserveTokens`). Meridian routes every primary
+`opus` request to the SDK's `opus[1m]` alias, so a `200000` here compacts the
+conversation at a fifth of the window you are actually paying for. Restart Prime
+Agent after editing: providers are registered once per process.
+
+Set it back to `200000` if you opt out of extended context on the proxy side —
+`MERIDIAN_1M_CONTEXT_SUPPORT=0`, `MERIDIAN_OPUS_MODEL=opus`, or a plan that
+doesn't include Opus 1M (Meridian then falls back to plain `opus` after one
+Extra-Usage rejection). Leaving `1000000` in that case surfaces as upstream
+errors on long conversations instead of local compaction.
+
+`maxTokens: 64000` is a conservative output cap; Opus 5 supports up to 128000
+and Meridian does not clamp it.
+
+Registering a **new** provider rather than overriding `anthropic` means
+installing this changes nothing until you select one of its models, so an
+already-running agent is unaffected.
+
+**The `before_provider_request` hook is required.** Prime Agent sends no session
+identity of its own, and under passthrough every tool round ends in a
+`tool_result` — which Meridian treats as a self-contained request needing no
+session resume. Each round then replays the whole conversation into a fresh
+session, and since that replay strips the assistant's `tool_use` blocks by
+design, the model loses track of what it has already run. Stamping
+`metadata.user_id` makes each round a continuation instead, so the SDK keeps the
+real tool calls in its own session state. `getSessionId()` is distinct per
+agent, so RLM children get their own keys rather than colliding with the parent.
+
+Detection is by the `x-meridian-agent: prime` header above, or
+`MERIDIAN_DEFAULT_AGENT=prime`. There is deliberately no User-Agent rule: in
+API-key mode Prime Agent sends the generic `Anthropic/JS <version>` that every
+Anthropic SDK client sends, so matching on it would misroute unrelated traffic.
+
+**Known limitation — file-change tracking.** Meridian reads file changes out of
+`ipython` cells for `%%bash` bodies, `!` shell escapes, and `await edit(path=…)`
+calls. It does **not** parse arbitrary Python writes (`open(p, "w").write(…)`,
+`Path.write_text`, library calls), which would need real dataflow analysis. Those
+edits still happen; they just don't appear in Meridian's file-change summary.
+
+#### What was verified, and what wasn't
+
+Measured on 2026-08-13/14 against Prime Agent 0.7.2:
+
+| Verified | How |
+|---|---|
+| Adapter selection, live turns | Real `prime-agent` binary through Meridian |
+| Tool-round session continuity | 45/45 rounds resumed as continuations across 12 sessions |
+| RLM children get distinct keys | Parent and depth-1 child carried different `metadata.user_id` on the wire |
+| Works with `codeSystemPrompt` off | 6 multi-round loops per arm; preset on vs off scored identically |
+| Survives long idle gaps | 7-minute silence, then `lineage=continuation` and the model recalled a codeword set before the gap |
+| Not metered as a third-party app | Negative control → full 18KB prompt → control again, all passing with the preset off |
+
+**Not verified: cron/scheduled tick delivery.** Two attempts, neither
+conclusive. Against a shared supervisor the scheduler fired (`runs=3`) but no
+request reached Meridian. Against an isolated supervisor, `schedule add` itself
+hung and never persisted the job. Session continuity across a worker restart is
+likewise untested.
+
+Four constraints make this awkward to exercise, all learned the hard way:
+
+- Only *resident* workers can be scheduled against. `print`, `rpc` and `json`
+  create **client-owned** workers, which Prime Agent deliberately omits from
+  schedules — so every headless mode is structurally ineligible. A resident
+  worker needs an interactive session, which needs a TTY (a pty works).
+- The `--daemon-socket` flag must come **before** the subcommand:
+  `prime-agent --daemon-socket <path> schedule list`. Placed after, it is
+  rejected as an unknown option, which reads misleadingly like the subcommand
+  cannot target a custom socket.
+- `PRIME_AGENT_CODING_AGENT_DIR` does **not** isolate a session from a shared
+  supervisor. The supervisor writes sessions into whichever agent directory
+  *it* was started with, so a test run against an already-running daemon lands
+  its sessions in that daemon's store. The supervisor socket is likewise global
+  per UID (`$TMPDIR/prime-agent-<uid>/daemon.sock`), so real isolation needs
+  `--daemon-socket` *and* a matching `PRIME_AGENT_CODING_AGENT_DIR`.
+- A dangling `~/.cache/meridian` makes Meridian return
+  `500 ENOENT … mkdir '~/.cache/meridian'` on affected requests. The client
+  retries and appears to hang, which is easy to misread as the agent stalling.
+  Check that path resolves before diagnosing anything else.
+
+A resident worker configured this way *does* reach Meridian — verified — so the
+remaining gap is specifically the scheduler, not the transport.
+
+The long-idle result above covers the part Meridian owns — a turn arriving on a
+session after a quiet gap resumes rather than replaying.
+
+Also not verified: the real client driving its own IPython kernel through a full
+tool loop. Kernel provisioning stalled in the isolated test environment; the
+tool-round evidence above comes from replaying Prime Agent's exact prompt and
+tool schema rather than from its kernel.
+
+**The metering result is a dated snapshot, not a property of the prompt.** It
+means "not flagged on this account at this moment" — the same classifier was
+observed changing its answer within a single day during the OpenClaw work. If
+you hit `400 You're out of extra usage` on Prime Agent traffic, re-measure
+before assuming the prompt is fine.
 
 ### Claude Code
 

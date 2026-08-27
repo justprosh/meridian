@@ -5,11 +5,12 @@
  * between the streaming and non-streaming paths in server.ts.
  */
 
-import { join } from "node:path"
+import { homedir } from "node:os"
+import { isAbsolute, join, resolve } from "node:path"
 import type { Options, OutputFormat, SdkBeta, SettingSource } from "@anthropic-ai/claude-agent-sdk"
 import { createOpencodeMcpServer } from "../mcpTools"
 import { createPassthroughMcpServer, PASSTHROUGH_MCP_NAME } from "./passthroughTools"
-import { envInt } from "../env"
+import { env, envInt } from "../env"
 import type { Effort } from "./effort"
 
 /**
@@ -55,6 +56,26 @@ function stripConfigDir(env: Record<string, string | undefined>): Record<string,
   return out
 }
 
+/** Resolve the exact config root the child SDK process will use. Lifecycle GC
+ * stores this absolute locator at creation time so later profile changes cannot
+ * redirect deletion at a different root. */
+export function resolveQueryConfigDir(
+  cleanEnv: Record<string, string | undefined>,
+  sharedMemory: boolean | undefined,
+  workingDirectory: string = process.cwd(),
+): string {
+  const effectiveEnv = sharedMemory ? stripConfigDir(cleanEnv) : cleanEnv
+  const absoluteWorkingDirectory = resolve(workingDirectory)
+  const configured = effectiveEnv.CLAUDE_CONFIG_DIR
+  if (configured) return isAbsolute(configured)
+    ? resolve(configured)
+    : resolve(absoluteWorkingDirectory, configured)
+  const home = effectiveEnv.HOME || homedir()
+  return isAbsolute(home)
+    ? resolve(home, ".claude")
+    : resolve(absoluteWorkingDirectory, home, ".claude")
+}
+
 export interface QueryContext {
   /** The prompt to send (text or async iterable for multimodal) */
   prompt: string | AsyncIterable<any>
@@ -87,16 +108,30 @@ export interface QueryContext {
   envOverrides?: Record<string, string | undefined>
   /** Whether any passthrough tools use deferred loading */
   hasDeferredTools: boolean
+  /**
+   * Whether passthrough early stop is active (MERIDIAN_PASSTHROUGH_EARLY_STOP
+   * != "0"). Gates the single-turn maxTurns cap: the cap is only safe when the
+   * checkpoint machinery is running to capture and store the tool boundary.
+   * Defaults to on — omitting it must not silently reintroduce the billed
+   * digest turn.
+   */
+  earlyStop?: boolean
   /** SDK session ID for resume (if continuing a session) */
   resumeSessionId?: string
   /** Whether this is an undo operation */
   isUndo: boolean
-  /** UUID to rollback to for undo operations */
-  undoRollbackUuid?: string
+  /** Resume at this SDK assistant-message UUID (undo rollback point or
+   *  passthrough tool-use boundary). Maps to resumeSessionAt, which accepts
+   *  SDKAssistantMessage UUIDs only; forkSession separately chooses a new ID. */
+  resumeSessionAtUuid?: string
   /** Fork the resumed session instead of attaching to it (#630 busy-session
    *  fallback — the original stays registered as a bg agent; the fork gets a
    *  fresh id with the full history). */
   forkSession?: boolean
+  /** Preallocated SDK session ID for any Meridian-created transcript. Persisting
+   *  this ID before spawn lets lifecycle recovery identify a fresh session or
+   *  fork even if the proxy crashes before the SDK emits its first event. */
+  forkSessionId?: string
   /** SDK hooks (PreToolUse etc.) */
   sdkHooks?: any
   /** Blocked SDK built-in tools (from pipeline) */
@@ -160,27 +195,51 @@ export interface BuildQueryResult {
 /**
  * NOTE: agent-specific (passthrough mode).
  *
- * Compute maxTurns based on which SDK features are active. Each phase the SDK
- * walks before returning control to the host costs a turn:
- *   - Base (3): turn 1 generates content (extended thinking + tool_use blocks
- *     captured by PreToolUse hook); turn 2 receives the deny and may emit a
- *     follow-up (text or further tool_use); turn 3 wraps the stream cleanly.
- *     Was 2 historically — bumped after telemetry showed opus[1m] requests with
- *     thinking + tool_use exhausting the 2-turn budget mid-handoff and returning
- *     500s on fresh (non-resume) requests. See errors.ts sdk_termination
- *     diagnostic + telemetry.
- *   - Deferred tools (+1): a ToolSearch discovery is a real model round-trip
- *     that consumes a turn before the model can emit the real tool_use. The
- *     old model wrongly assumed a lone deferred set fit in base 3, so the
- *     discovery ate into the tool-call budget — deferred sessions hit max_turns
- *     prematurely, forcing cold-cache retries and churn (#547).
- *   - Resume (+0): rehydration completes inline within turn 1, so it adds no
- *     turn — a resumed deferred session is 4, same as a fresh deferred one.
+ * Compute maxTurns based on which SDK features are active.
+ *
+ * The default is 1, and that is the whole point. In passthrough the CLIENT
+ * executes tools, so a turn that emits tool_use is already complete as far as
+ * the client is concerned. Anything the SDK generates after it — the "digest"
+ * turn where the model reacts to the PreToolUse denial — is discarded by the
+ * proxy and still billed by Anthropic. Capping at 1 makes the SDK stop at the
+ * tool-use boundary instead of generating that turn.
+ *
+ * A capped stop surfaces as `error_max_turns`, which is safe here precisely
+ * because the SDK can only report it from a `result` message it has already
+ * enqueued, and it awaits its transcript flush on `result`. So the session is
+ * durably committed at the tool boundary; server.ts stores that checkpoint and
+ * the next request resumes from it with the client's real tool_result. A turn
+ * that ends without wanting to continue (plain text, no tools) never trips the
+ * cap at all — it returns a normal success result.
+ *
+ * Measured against the live SDK (sonnet, one tool call), cap vs. the old base
+ * of 3: 66 vs 159 output tokens and 0 vs ~127k cache-read tokens, because the
+ * digest turn drags the CLI's full context along with it.
+ *
+ * The bumps below are the cases that genuinely need the SDK to keep going, and
+ * each one turns the cap off rather than adding to it:
+ *   - Deferred tools (4): a ToolSearch discovery is a real model round-trip
+ *     that consumes a turn before the model can emit the real tool_use. Capping
+ *     here would stop the query on the discovery turn and never reach the tool
+ *     call (#547).
  *   - Advisor (+3): server-side advisor executes call + result + final answer.
+ *   - Structured output: the SDK runs its internal StructuredOutput tool and
+ *     needs turns to submit the result; capping strands it (HTTP 500).
+ *   - Early-stop kill switch off: MERIDIAN_PASSTHROUGH_EARLY_STOP=0 restores
+ *     the pre-cap wire behavior wholesale, so the budget must come back too.
+ *
+ * Base for those uncapped cases stays 3: turn 1 generates content (extended
+ * thinking + tool_use blocks captured by PreToolUse hook); turn 2 receives the
+ * deny and may emit a follow-up; turn 3 wraps the stream cleanly. Was 2
+ * historically — bumped after telemetry showed opus[1m] requests with thinking
+ * + tool_use exhausting the 2-turn budget mid-handoff and returning 500s on
+ * fresh (non-resume) requests. Resume adds nothing: rehydration completes
+ * inline within turn 1.
  */
 function computePassthroughMaxTurns(
   hasDeferredTools: boolean,
   advisorModel: string | undefined,
+  singleTurnHandoff: boolean,
 ): number {
   const deferredBump = hasDeferredTools ? 1 : 0
   const defaultBase = 3 + deferredBump
@@ -193,8 +252,12 @@ function computePassthroughMaxTurns(
   // raise (or lower) the base (incl. the deferred bump); the advisor bump
   // below is added on top and is unaffected by the override.
   const configured = envInt("PASSTHROUGH_MAX_TURNS", defaultBase)
-  const base = configured > 0 ? configured : defaultBase
+  // An operator who pinned a budget gets it verbatim — the cap must not
+  // silently override a value someone set to work around a client quirk.
+  const operatorPinned = env("PASSTHROUGH_MAX_TURNS") !== undefined && configured > 0
   const advisorBump = advisorModel ? 3 : 0
+  if (singleTurnHandoff && !operatorPinned) return 1
+  const base = configured > 0 ? configured : defaultBase
   return base + advisorBump
 }
 
@@ -298,7 +361,7 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
   const {
     prompt, model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
     passthrough, stream, sdkAgents, passthroughMcp, cleanEnv, hasDeferredTools,
-    resumeSessionId, isUndo, undoRollbackUuid, forkSession, sdkHooks, blockedTools, incompatibleTools,
+    resumeSessionId, isUndo, resumeSessionAtUuid, forkSession, forkSessionId, sdkHooks, blockedTools, incompatibleTools,
     mcpServerName, allowedMcpTools, onStderr,
     effort, thinking, taskBudget, outputFormat, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
     memory, dreaming, sharedMemory, maxBudgetUsd, fallbackModel, sdkDebug, additionalDirectories,
@@ -316,13 +379,25 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       // is not in PATH — causing subprocess spawns to fail.
       executable: "node" as const,
       maxTurns: passthrough
-        ? computePassthroughMaxTurns(hasDeferredTools, ctx.advisorModel)
+        ? computePassthroughMaxTurns(
+            hasDeferredTools,
+            ctx.advisorModel,
+            // Every condition here is one that needs the SDK to keep going
+            // past the tool boundary; see computePassthroughMaxTurns.
+            ctx.earlyStop !== false && !hasDeferredTools && !ctx.advisorModel && !outputFormat,
+          )
         : 200,
       cwd: workingDirectory,
       model,
       pathToClaudeCodeExecutable: claudeExecutable,
       ...(abortController ? { abortController } : {}),
-      ...(stream ? { includePartialMessages: true } : {}),
+      // Passthrough needs them on BOTH paths, not just streaming: the deny-hold
+      // and the early-stop checkpoint both key off the turn-generation boundary,
+      // and `message_start`/`message_delta` are the only place it is observable.
+      // Without them non-stream releases its holds on the first assistant
+      // message and freezes the checkpoint there, so a parallel turn hands the
+      // client the first call and silently drops the rest (measured 1 of 3).
+      ...(stream || passthrough ? { includePartialMessages: true } : {}),
       permissionMode: "bypassPermissions" as const,
       allowDangerouslySkipPermissions: true,
       ...resolveSystemPrompt(systemContext, passthrough, settingSources, codeSystemPrompt, clientSystemPrompt, cwdNote),
@@ -427,8 +502,18 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       },
       ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
       ...(resumeSessionId ? { resume: resumeSessionId } : {}),
-      ...(isUndo || forkSession ? { forkSession: true } : {}),
-      ...(isUndo && undoRollbackUuid ? { resumeSessionAt: undoRollbackUuid } : {}),
+      // A passthrough checkpoint sits immediately before a persisted
+      // PreToolUse denial. resumeSessionAt rewinds that tail for one query but
+      // does not replace it in the source transcript; forking makes the rewind
+      // durable so the client's real tool_result becomes the new ancestry.
+      ...(isUndo || forkSession || (resumeSessionId && forkSessionId) || (passthrough && resumeSessionAtUuid)
+        ? { forkSession: true }
+        : {}),
+      // Every Meridian-created transcript is preallocated and journaled before
+      // spawn. For resumes this identifies the fork; for fresh turns it closes
+      // the same crash-created-orphan window without enabling forkSession.
+      ...(forkSessionId ? { sessionId: forkSessionId } : {}),
+      ...(resumeSessionAtUuid ? { resumeSessionAt: resumeSessionAtUuid } : {}),
       ...(sdkHooks ? { hooks: sdkHooks } : {}),
       ...(effort ? { effort } : {}),
       ...(thinking ? { thinking } : {}),

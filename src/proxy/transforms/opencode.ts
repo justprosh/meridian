@@ -1,7 +1,7 @@
 import type { Transform, RequestContext } from "../transform"
 import { extractFileChangesFromBash, type FileChange } from "../fileChanges"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, ALLOWED_MCP_TOOLS } from "../tools"
-import { buildAgentDefinitionsFromTool } from "../agentDefs"
+import { buildAgentDefinitionsFromTool, mapModelTier } from "../agentDefs"
 import { fuzzyMatchAgentName } from "../agentMatch"
 import { resolvePassthrough } from "../../env"
 
@@ -13,7 +13,7 @@ export const openCodeTransforms: Transform[] = [
     // transform is skipped and clients get built-in tools unblocked +
     // passthrough off (#546). Codex additionally FORCES passthrough on via a
     // follow-on transform (#475).
-    adapters: ["opencode", "openai", "codex"],
+    adapters: ["opencode", "openai", "jcode", "codex"],
 
     onRequest(ctx: RequestContext): RequestContext {
       const body = ctx.body
@@ -32,7 +32,7 @@ export const openCodeTransforms: Transform[] = [
       if (Array.isArray(body.tools)) {
         const taskTool = body.tools.find((t: any) => t.name === "task" || t.name === "Task")
         if (taskTool) {
-          sdkAgents = buildAgentDefinitionsFromTool(taskTool, [...allowedMcpTools])
+          sdkAgents = buildAgentDefinitionsFromTool(taskTool, [...allowedMcpTools], mapModelTier(body.model))
         }
       }
 

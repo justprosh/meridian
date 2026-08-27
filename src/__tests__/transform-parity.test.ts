@@ -65,6 +65,20 @@ describe("OpenCode transform parity", () => {
     expect(ctx.sdkAgents).toEqual(openCodeAdapter.buildSdkAgents!(body, openCodeAdapter.getAllowedMcpTools()))
   })
 
+  it("matches base-tier SDK agents for an Opus Task request", () => {
+    const body = {
+      model: "claude-opus-5",
+      tools: [{
+        name: "Task",
+        description: "Available agent types:\n- reviewer: Reviews code",
+        input_schema: { type: "object", properties: {} },
+      }],
+    }
+    const ctx = runTransformHook(openCodeTransforms, "onRequest", makeCtx("opencode", body), "opencode")
+    expect(ctx.sdkAgents).toEqual(openCodeAdapter.buildSdkAgents!(body, openCodeAdapter.getAllowedMcpTools()))
+    for (const def of Object.values(ctx.sdkAgents)) expect(def.model).toBe("opus")
+  })
+
   it("matches buildSystemContextAddendum with no agents", () => {
     const body = { tools: [] }
     const ctx = runTransformHook(
@@ -96,7 +110,7 @@ describe("OpenCode transform parity", () => {
 // "openai" is listed there the opencode-core transform is silently skipped —
 // leaving built-in tools UNBLOCKED and passthrough OFF for OpenAI clients (a
 // full Claude Code agent under bypassPermissions, the opposite of intent).
-describe("OpenAI adapter reuses the OpenCode pipeline (#546)", () => {
+describe("OpenAI-compatible adapters reuse the OpenCode pipeline (#546)", () => {
   it("blocks built-in tools for adapterName 'openai' (same as opencode)", () => {
     const ctx = runTransformHook(openCodeTransforms, "onRequest", makeCtx("openai"), "openai")
     expect([...ctx.blockedTools]).toEqual([...openCodeAdapter.getBlockedBuiltinTools()])
@@ -106,6 +120,16 @@ describe("OpenAI adapter reuses the OpenCode pipeline (#546)", () => {
   it("applies the same incompatibleTools and allowedMcpTools as opencode", () => {
     const ctx = runTransformHook(openCodeTransforms, "onRequest", makeCtx("openai"), "openai")
     expect([...ctx.incompatibleTools]).toEqual([...openCodeAdapter.getAgentIncompatibleTools()])
+    expect([...ctx.allowedMcpTools]).toEqual([...openCodeAdapter.getAllowedMcpTools()])
+  })
+
+  it("registers the jcode adapter against the OpenCode pipeline", () => {
+    expect(getAdapterTransforms("jcode")).toBe(openCodeTransforms)
+  })
+
+  it("applies the same core transforms to Jcode", () => {
+    const ctx = runTransformHook(getAdapterTransforms("jcode"), "onRequest", makeCtx("jcode"), "jcode")
+    expect([...ctx.blockedTools]).toEqual([...openCodeAdapter.getBlockedBuiltinTools()])
     expect([...ctx.allowedMcpTools]).toEqual([...openCodeAdapter.getAllowedMcpTools()])
   })
 })

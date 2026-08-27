@@ -24,6 +24,12 @@ export interface AgentIdentity {
   getSessionId(c: Context, body?: unknown): string | undefined
 
   /**
+   * Optional client-declared agent mode. Adapters own their header/protocol
+   * details; the proxy uses the normalized value for model-tier selection.
+   */
+  getAgentMode?(c: Context, body?: unknown): string | undefined
+
+  /**
    * Extract the SDK subprocess working directory from the request body.
    *
    * This path must exist on the proxy host because it becomes the SDK
@@ -61,6 +67,16 @@ export interface AgentIdentity {
    * for hashing. Agents may send content in different formats.
    */
   normalizeContent(content: any): string
+
+  /**
+   * Remove request-scoped client metadata before lineage hashing while keeping
+   * the original request body untouched for model execution. Implementations
+   * must preserve message count and order because SDK UUIDs and resume indexes
+   * are aligned by message position.
+   */
+  canonicalizeMessagesForLineage?(
+    messages: Array<{ role: string; content: unknown }>,
+  ): Array<{ role: string; content: unknown }>
 
   /**
    * The MCP server name used by this agent.
