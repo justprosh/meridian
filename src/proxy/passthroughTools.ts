@@ -302,6 +302,41 @@ function stableStringify(value: unknown): string {
   return `{${parts.join(",")}}`
 }
 
+/** Longest list of tool names one delta line prints before it counts the rest. */
+const TOOL_DELTA_MAX_NAMES = 12
+
+function formatToolNames(names: readonly string[]): string {
+  const shown = names.slice(0, TOOL_DELTA_MAX_NAMES)
+  const rest = names.length - shown.length
+  return `[${shown.join(",")}${rest > 0 ? `,+${rest}` : ""}]`
+}
+
+/**
+ * What changed between two tool sets, in one journal-sized line.
+ *
+ * NOTE: fork-only (justprosh) — operator diagnostics, deliberately not
+ * upstreamed. A tool set change rebuilds the cached MCP server and re-primes
+ * the whole prompt cache, which is the single most expensive thing a live
+ * conversation can do quietly. The bare `tools_changed` line says it happened
+ * and names neither side, so the cause can only be guessed at; the names are
+ * what makes a re-prime attributable to the client that caused it.
+ *
+ * Names alone are not enough either: a client that silently reissues one tool
+ * with an edited schema keeps every name and still invalidates the cache, so
+ * that case is reported as `schema-only` rather than as no change at all.
+ */
+export function describeToolSetDelta(before: readonly string[], after: readonly string[]): string {
+  const beforeNames = new Set(before)
+  const afterNames = new Set(after)
+  const added = after.filter(name => !beforeNames.has(name))
+  const removed = before.filter(name => !afterNames.has(name))
+  const parts = [`count=${before.length}->${after.length}`]
+  if (added.length > 0) parts.push(`added=${formatToolNames(added)}`)
+  if (removed.length > 0) parts.push(`removed=${formatToolNames(removed)}`)
+  if (added.length === 0 && removed.length === 0) parts.push("schema-only")
+  return parts.join(" ")
+}
+
 /**
  * Stable semantic signature for a forwarded tool_use: tool name + a
  * key-order-independent serialization of its input. Two tool calls with the
