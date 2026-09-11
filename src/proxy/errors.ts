@@ -374,6 +374,22 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
     }
   }
 
+  // The proxy's own session-bookkeeping locks and limits. These arrive with
+  // "timed out" in the text, so the generic timeout branch below would call
+  // them a request timeout and send the operator to shrink a context that has
+  // nothing to do with it. 503 overloaded names the real cause: proxy load.
+  if (
+    (lower.includes("timed out waiting for") && lower.includes(".lock"))
+    || lower.includes("ownership backlog is full")
+    || lower.includes("ownership capacity is full")
+  ) {
+    return {
+      status: 503,
+      type: "overloaded_error",
+      message: `Meridian's session bookkeeping is saturated (${errMsg.trim()}). This is proxy load, not the request; retry shortly.`
+    }
+  }
+
   // Timeout
   if (lower.includes("timeout") || lower.includes("timed out")) {
     return {

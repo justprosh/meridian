@@ -19,7 +19,7 @@ import {
   setSessionStoreDir,
 } from "../proxy/sessionStore"
 import { join } from "node:path"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 
 describe("Shared session store", () => {
@@ -87,6 +87,48 @@ describe("Shared session store", () => {
     clearSharedSessions()
     expect(lookupSharedSession("sess-1")).toBeUndefined()
     expect(lookupSharedSession("sess-2")).toBeUndefined()
+  })
+
+  it("should serve consecutive reads from the identity cache", () => {
+    storeSharedSession("session-123", "claude-sess-abc")
+    const first = lookupSharedSessionResult("session-123")
+    const second = lookupSharedSessionResult("session-123")
+    if (first.status !== "found" || second.status !== "found") throw new Error("lookup failed")
+    // Same object identity proves the second read served the cached document.
+    expect(second.session).toBe(first.session)
+    expect(second.generation).toBe(first.generation)
+  })
+
+  it("should reflect an in-process write after a cached read", () => {
+    storeSharedSession("session-123", "claude-sess-abc")
+    expect(lookupSharedSession("session-123")!.claudeSessionId).toBe("claude-sess-abc")
+
+    storeSharedSession("session-123", "claude-sess-def")
+    expect(lookupSharedSession("session-123")!.claudeSessionId).toBe("claude-sess-def")
+  })
+
+  it("should pick up a store replaced out of band by another process", () => {
+    storeSharedSession("session-123", "claude-sess-abc")
+    expect(lookupSharedSession("session-123")!.claudeSessionId).toBe("claude-sess-abc")
+
+    // Imitate a foreign proxy: a different valid document renamed over the
+    // store path, which changes the inode but not the path.
+    const replacement = join(tmpDir, "sessions.json.replacement")
+    writeFileSync(replacement, JSON.stringify({
+      "session-456": { claudeSessionId: "claude-sess-xyz", createdAt: 1, lastUsedAt: 1, messageCount: 0 },
+    }), { mode: 0o600 })
+    renameSync(replacement, join(getSessionStoreDir(), "sessions.json"))
+
+    expect(lookupSharedSession("session-123")).toBeUndefined()
+    expect(lookupSharedSession("session-456")!.claudeSessionId).toBe("claude-sess-xyz")
+  })
+
+  it("should treat a deleted store as missing instead of serving the stale cache", () => {
+    storeSharedSession("session-123", "claude-sess-abc")
+    expect(lookupSharedSession("session-123")!.claudeSessionId).toBe("claude-sess-abc")
+
+    unlinkSync(join(getSessionStoreDir(), "sessions.json"))
+    expect(lookupSharedSessionResult("session-123").status).toBe("missing")
   })
 
   it("should persist context usage and find it by Claude session ID", () => {
