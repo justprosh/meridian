@@ -16,6 +16,30 @@ import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maint
 import { buildNodeFixture } from "./fixtures/bookkeeping-support"
 import { readExportJournal } from "../proxy/session/bookkeeping/exportJournal"
 
+for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session-gc.migrated.json",
+  "linked:sessions.migrated.json", "moved:sessions.migrated.json", "linked:database", "moved:database",
+  "linked:session-bookkeeping-export.json", "moved:session-bookkeeping-export.json",
+  "linked:session-bookkeeping-migration.json", "moved:session-bookkeeping-migration.json", "ARCHIVED"]) {
+  it(`SIGKILL cycle archive ${cut} preserves export digests`, async () => {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-cycle-")))
+    try {
+      seed(directory, 2, 3)
+      const first = await migrateBookkeeping(directory, { writersStopped: true })
+      const down = exportBookkeepingJson(directory)
+      const point = cut.replace("database", `session-bookkeeping.sqlite.exported-${down.id}`)
+      child("migrate", directory, `cycle:${point}`)
+      const up = await migrateBookkeeping(directory, { writersStopped: true })
+      expect(up.id).not.toBe(first.id)
+      expect(up.resources).toBe(first.resources)
+      expect(up.mappings).toBe(first.mappings)
+      expect(existsSync(join(directory, "bookkeeping-cycles", first.id,
+        "session-bookkeeping-migration.json"))).toBe(true)
+      const again = exportBookkeepingJson(directory)
+      expect(again.documents).toEqual(down.documents)
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  }, 20000)
+}
+
 let buildDirectory: string
 beforeAll(async () => {
   buildDirectory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-crash-build-")))
@@ -58,7 +82,8 @@ const exportPoints = ["PREPARED", "staged:session-gc.json", "staged:sessions.jso
   "checkpoint", "closed", "CHECKPOINTED", "linked:session-bookkeeping.sqlite", "moved:session-bookkeeping.sqlite",
   "linked:session-bookkeeping.sqlite-wal", "moved:session-bookkeeping.sqlite-wal",
   "linked:session-bookkeeping.sqlite-shm", "moved:session-bookkeeping.sqlite-shm",
-  "ARCHIVED", "EXPORTED", "released:session-gc.json", "released:sessions.json"]
+  "ARCHIVED", "EXPORTED", "released:session-gc.json", "released:sessions.json",
+  "barrier:releasing:session-gc.json", "barrier:releasing:sessions.json"]
 
 for (const sidecarVersion of [1, 2]) for (const storeVersion of [1, 3]) {
   for (const point of migrationPoints) it(`SIGKILL migration ${sidecarVersion}/${storeVersion} ${point}`, async () => {
@@ -82,7 +107,7 @@ for (const sidecarVersion of [1, 2]) for (const storeVersion of [1, 3]) {
     try {
       const { entry, key } = seed(directory, sidecarVersion, storeVersion)
       await migrateBookkeeping(directory, { writersStopped: true })
-      child("export", directory, `export:${point}`)
+      child("export", directory, point.startsWith("barrier:") ? point : `export:${point}`)
       expect(() => initializeSessionBookkeeping(directory)).toThrow("export in progress or completed")
       const result = exportBookkeepingJson(directory)
       expect(result.phase).toBe("EXPORTED")

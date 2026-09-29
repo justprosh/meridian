@@ -20,8 +20,8 @@ export interface ExportJournal {
   documents: ExportFile[]
   archive?: ExportFile[]
 }
-export function protectedBytes(path: string, linked = false): Buffer {
-  const fd = ownedFd(path, false, linked)
+export function protectedBytes(path: string, linked = false, readOnly = false): Buffer {
+  const fd = ownedFd(path, false, linked, readOnly)
   try { return readFileSync(fd) } finally { closeSync(fd) }
 }
 export function fileIdentity(directory: string, name: string, linked = false): ExportFile {
@@ -34,10 +34,10 @@ export function verifyFile(directory: string, name: string, expected: ExportFile
     throw new Error(`export file digest/size mismatch: ${name}`)
   }
 }
-export function readExportJournal(directory: string): ExportJournal | undefined {
+export function readExportJournal(directory: string, readOnly = false): ExportJournal | undefined {
   const path = join(directory, EXPORT_JOURNAL_NAME)
   if (!existsSync(path)) return undefined
-  const value: unknown = JSON.parse(protectedBytes(path).toString("utf8"))
+  const value: unknown = JSON.parse(protectedBytes(path, true, readOnly).toString("utf8"))
   if (!value || typeof value !== "object") throw new Error("invalid export journal")
   const row = value as Record<string, unknown>
   const uuid = (v: unknown) => typeof v === "string" && /^[a-f0-9-]{36}$/.test(v)

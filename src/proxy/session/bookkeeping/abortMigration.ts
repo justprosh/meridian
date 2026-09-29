@@ -1,12 +1,13 @@
-import { existsSync, unlinkSync } from "node:fs"
+import { existsSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { acquireMaintenanceGuard } from "./guard"
 import { BOOKKEEPING_FILENAME } from "./connection"
 import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 import {
-  crashPoint, isOwnBarrier, readJournal, requireBarriers, saveJournal, SOURCE_NAMES,
+  crashPoint, readJournal, requireBarriers, saveJournal, SOURCE_NAMES,
 } from "./maintenanceJournal"
-import { syncDirectoryDurablySync } from "../durableFileSystem"
+import { releaseOwnBarrier } from "./barrier"
+import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 
 /** Only the pre-database BARRIERS failure is reversible without exporting SQLite authority. */
 export function abortBookkeepingMigration(input: string): void {
@@ -15,11 +16,11 @@ export function abortBookkeepingMigration(input: string): void {
   try {
     const journal = readJournal(directory)
     if (!journal || !["BARRIERS", "ABORTING", "ABORTED"].includes(journal.phase)) {
-      throw new Error("abort requires a BARRIERS migration journal")
+      throw new BookkeepingMaintenanceRequiredError("abort requires a BARRIERS migration journal")
     }
     if ([BOOKKEEPING_FILENAME, BOOKKEEPING_FILENAME + "-wal", BOOKKEEPING_FILENAME + "-shm",
       EXPORT_JOURNAL_NAME].some((name) => existsSync(join(directory, name)))) {
-      throw new Error("abort forbidden after database creation; use export-json")
+      throw new BookkeepingMaintenanceRequiredError("abort forbidden after database creation; use export-json")
     }
     if (journal.phase === "BARRIERS") {
       requireBarriers(directory, journal.id)
@@ -28,11 +29,7 @@ export function abortBookkeepingMigration(input: string): void {
       crashPoint("abort:ABORTING")
     }
     for (const source of SOURCE_NAMES) {
-      const path = join(directory, source + ".lock")
-      if (!existsSync(path)) continue
-      if (!isOwnBarrier(directory, source, journal.id)) throw new Error(`foreign barrier: ${source}`)
-      unlinkSync(path)
-      syncDirectoryDurablySync(directory)
+      releaseOwnBarrier(directory, source, journal.id)
       crashPoint(`abort:released:${source}`)
     }
     journal.phase = "ABORTED"

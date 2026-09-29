@@ -753,6 +753,52 @@ Clients just set their `ANTHROPIC_API_KEY` to the shared secret — since most t
 ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 opencode
 ```
 
+## Session bookkeeping maintenance
+
+Node 22: `meridian-bookkeeping <command> --session-dir /absolute/private/session-directory [--json]`.
+The npm entry is `dist/session-bookkeeping.js`; this is not a proxy request endpoint.
+
+* `inspect` is read-only, holds a shared maintenance guard when one exists, and can run beside live proxies.
+* Stop/drain **all** writers, then `migrate --writers-stopped`. The flag is the operator's assertion,
+  not a conclusion from an empty lease table. Missing `--writers-stopped` exits **2**.
+  An already READY store returns 0 without a new transition.
+* `export-json` returns to legacy JSON, preserving current database documents, then releases its barriers.
+* `abort-migration` reverses only a pre-database BARRIERS failure; otherwise resume migration or export.
+* `recanonicalize` repairs derived mapping paths offline; resource rekeying requires export/correction/migrate.
+
+After EXPORTED or ABORTED, a new migration archives the prior cycle in
+`bookkeeping-cycles/<migration_id>/` before preparing a new cycle. An interrupted archival move resumes
+from `session-bookkeeping-cycle.json`. Never move individual files by hand. The guard database, journals,
+archived cycles, main database and WAL/SHM belong to the backup boundary.
+
+Exit codes (all commands): **0** completed/already target; **2** usage; **3** refusal before transition
+(quiescence, live/unknown candidate/gate, busy guard, capacity); **4** refusal with barriers or export already
+active; **5** corrupt/unreadable state or replaced barrier; **6** caller uid differs from directory owner.
+Code 3 permits the old binary only when the starting state was legacy; it does not undo a pre-existing READY
+transition. Code 4 means **do not start legacy writers**: resume `migrate`, use `abort-migration` before any
+database creation, or resume `export-json`. UID mismatch handling is implemented but not privilege-tested.
+
+`inspect --json` reports `phase` (`legacy`, `prepared`, `barriers`, `imported`, `ready`, `exporting`,
+`exported`, `aborted`, or `corrupt`), `migration_id`, `cycle_id`, `cycle_number`, `archived_cycles`, resource
+counts by state, mappings, main/WAL/SHM sizes, barrier ownership (`own`, `foreign`, `none`), candidates and
+gates. Incarnations proven dead are `dead-incarnation`; unknown identities remain `live`. Gate scripts do
+not persist their own incarnation, so they conservatively remain `live`, not inferred dead from PID/age.
+Inspection never repairs permissions or bootstraps a missing guard. WAL without SHM requires offline recovery
+rather than creating SHM during inspection. Without `--json`, output is indented for human reading.
+
+All JSON output includes `timings.total_ms` and `timings.phases` (`phase`, `duration_ms`); use measured
+production-size transitions to choose systemd `TimeoutStartSec`, not a guessed constant.
+
+Both permanent legacy lock files (`session-gc.json.lock`, `sessions.json.lock`) contain one JSON line:
+
+```json
+{"backend":"sqlite","migration_id":"<uuid>","format":"meridian-bookkeeping-barrier-v1","instruction":"Stop all writers; use meridian-bookkeeping export-json. Never delete this barrier manually."}
+```
+
+This deliberately lacks the legacy canonical pid/incarnation/token owner tuple. Never delete these markers
+manually. Release temporarily uses `<lock>.releasing-<migration_id>` and resumes after a crash from that name.
+Old-package negative-write probes are a separate acceptance step; this command alone is not evidence for them.
+
 ## CLI Commands
 
 | Command | Description |

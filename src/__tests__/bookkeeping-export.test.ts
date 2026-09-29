@@ -115,7 +115,9 @@ it("aborts malformed sources only before database creation and keeps originals u
   expect(existsSync(join(directory, "sessions.json.lock"))).toBe(false)
   expect(existsSync(join(directory, "session-gc.json.lock"))).toBe(false)
   abortBookkeepingMigration(directory)
-  await expect(migrate()).rejects.toThrow("migration aborted")
+  source("sessions.json", { entry: entry() })
+  const next = await migrate()
+  expect(next.mappings).toBe(1)
 })
 it("refuses abort of committed authority or another operation's barrier", async () => {
   source("sessions.json", { invalid: {} })

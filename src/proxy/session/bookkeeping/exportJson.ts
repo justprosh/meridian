@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { existsSync, statfsSync, unlinkSync } from "node:fs"
+import { existsSync, statfsSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { acquireMaintenanceGuard } from "./guard"
 import { openForMaintenance } from "./maintenance"
@@ -7,13 +7,13 @@ import { BOOKKEEPING_FILENAME } from "./connection"
 import { checkpointBookkeepingOffline, withBookkeepingRead } from "./transaction"
 import { snapshotForExport, verifyExportSnapshot } from "./exportSnapshot"
 import {
-  crashPoint, digestBytes, isOwnBarrier, readJournal, requireBarriers, SOURCE_NAMES, writeDurably,
+  crashPoint, digestBytes, readJournal, requireBarriers, SOURCE_NAMES, writeDurably,
 } from "./maintenanceJournal"
 import {
   fileIdentity, moveExportFile, protectedBytes, readExportJournal, saveExportJournal, verifyFile,
 } from "./exportJournal"
 import type { ExportJournal } from "./exportJournal"
-import { syncDirectoryDurablySync } from "../durableFileSystem"
+import { releaseOwnBarrier } from "./barrier"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { assertQuiescent } from "./migrationImport"
 import { parseLegacySidecar } from "./legacyCodec"
@@ -25,7 +25,9 @@ export function exportBookkeepingJson(input: string): ExportJournal {
   const directory = dirname(guard.path)
   try {
     const migration = readJournal(directory)
-    if (migration?.phase !== "READY") throw new Error("export requires a READY migration journal")
+    if (migration?.phase !== "READY") {
+      throw new BookkeepingMaintenanceRequiredError("export requires a READY migration journal")
+    }
     let journal = readExportJournal(directory)
     if (journal && journal.migrationId !== migration.id) throw new Error("export migration identity mismatch")
     if (journal?.phase !== "EXPORTED") requireBarriers(directory, migration.id)
@@ -108,11 +110,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
     }
     // After this transition a legacy writer may legitimately change JSON; never revalidate its old digest.
     for (const source of SOURCE_NAMES) {
-      const path = join(directory, source + ".lock")
-      if (!existsSync(path)) continue
-      if (!isOwnBarrier(directory, source, migration.id)) throw new Error(`foreign barrier: ${source}`)
-      unlinkSync(path)
-      syncDirectoryDurablySync(directory)
+      releaseOwnBarrier(directory, source, migration.id)
       crashPoint(`export:released:${source}`)
     }
     return journal

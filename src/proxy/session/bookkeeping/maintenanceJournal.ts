@@ -80,10 +80,10 @@ function validSources(value: unknown): value is SourceIdentity[] {
   })
 }
 
-export function readJournal(directory: string): MigrationJournal | undefined {
+export function readJournal(directory: string, readOnly = false): MigrationJournal | undefined {
   const path = join(directory, JOURNAL_NAME)
   if (!existsSync(path)) return undefined
-  const fd = ownedFd(path)
+  const fd = ownedFd(path, false, true, readOnly)
   let value: unknown
   try { value = JSON.parse(readFileSync(fd, "utf8")) } finally { closeSync(fd) }
   if (!value || typeof value !== "object") throw new Error("invalid migration journal")
@@ -106,7 +106,7 @@ export function barrierBytes(id: string): string {
 export function isOwnBarrier(directory: string, source: SourceName, id: string): boolean {
   const path = join(directory, source + ".lock")
   try {
-    const fd = ownedFd(path)
+    const fd = ownedFd(path, false, false, true)
     try { return readFileSync(fd, "utf8") === barrierBytes(id) } finally { closeSync(fd) }
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error
@@ -119,7 +119,14 @@ export function requireBarriers(directory: string, id: string): void {
   }
 }
 
-/** Deliberately test-only fault point. SIGKILL leaves OS and filesystem, not JS cleanup, as the recovery carrier. */
+let phaseObserver: ((phase: string) => void) | undefined
+export function observeMaintenancePhases(observer: (phase: string) => void): () => void {
+  if (phaseObserver) throw new Error("maintenance timing observer already installed")
+  phaseObserver = observer
+  return () => { phaseObserver = undefined }
+}
+/** Durable phase timing, with an explicit test-only SIGKILL seam (no JS cleanup). */
 export function crashPoint(point: string): void {
+  phaseObserver?.(point)
   if (process.env.MERIDIAN_BOOKKEEPING_TEST_CRASH === point) process.kill(process.pid, "SIGKILL")
 }

@@ -12,6 +12,7 @@ import {
 } from "node:fs"
 import { cleanupBootstrapOrphans, createBootstrapPath, finishBootstrap } from "./bootstrapOwner"
 import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
 import { pragmaValue } from "./schema"
 import {
@@ -301,4 +302,27 @@ export function acquireRuntimeGuard(directory: string): GuardLease {
 }
 export function acquireMaintenanceGuard(directory: string): MaintenanceGuardLease {
   return openGuard(directory, "exclusive")
+}
+
+/** Inspection never bootstraps, repairs permissions, increments epochs or creates a journal. */
+export function acquireInspectionGuard(directory: string): GuardLease | undefined {
+  const canonical = realpathSync.native(resolve(directory))
+  closeSync(ownedFd(canonical, true, false, true))
+  const path = join(canonical, MAINTENANCE_GUARD_FILENAME)
+  if (!existsSync(path)) return undefined
+  for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+    if (existsSync(path + suffix)) closeSync(ownedFd(path + suffix, false, false, true))
+  }
+  // libsql 0.5 ignores the JS readonly option; the SQLite URI flag is the actual boundary.
+  const db = new Database(`${pathToFileURL(path).href}?mode=ro`)
+  try {
+    db.pragma("busy_timeout=0")
+    db.exec("BEGIN")
+    validate(db)
+    return { path, mode: "shared", close: () => closeDatabase(db) }
+  } catch (error) {
+    closeDatabase(db)
+    if (busyError(error)) throw new BookkeepingGuardBusyError("maintenance guard is held", { cause: error })
+    throw error
+  }
 }

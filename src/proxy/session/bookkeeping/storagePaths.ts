@@ -25,7 +25,7 @@ export function assertSupportedFilesystem(type: number, platform = process.platf
 }
 
 /** Shared main/guard filesystem boundary; callers own the returned descriptor. */
-export function ownedFd(path: string, directory = false, bootstrapLink = false): number {
+export function ownedFd(path: string, directory = false, bootstrapLink = false, readOnly = false): number {
   const before = lstatSync(path)
   if (directory ? !before.isDirectory() : !before.isFile()) {
     throw new Error(`not an owned regular path: ${path}`)
@@ -61,7 +61,7 @@ export function ownedFd(path: string, directory = false, bootstrapLink = false):
         throw new Error(`bookkeeping directory must already be private (0700): ${path}`)
       }
     } else {
-      fchmodSync(fd, 0o600)
+      if (!readOnly) fchmodSync(fd, 0o600)
       if ((fstatSync(fd).mode & 0o777) !== 0o600) throw new Error(`bookkeeping file permissions: ${path}`)
     }
     return fd

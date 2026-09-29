@@ -19,6 +19,7 @@ import {
 } from "./maintenanceJournal"
 import type { MigrationJournal, SourceName } from "./maintenanceJournal"
 import { EXPORT_JOURNAL_NAME } from "./exportJournal"
+import { archivePreviousCycle } from "./cycles"
 
 export interface MigrationOptions {
   /** Operator attestation, not something inferred from a quiet lease table. */
@@ -147,10 +148,13 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
-    if (existsSync(join(directory, EXPORT_JOURNAL_NAME))) throw new Error("export journal exists; resume export-json")
+    archivePreviousCycle(directory)
+    if (existsSync(join(directory, EXPORT_JOURNAL_NAME))) {
+      throw new BookkeepingMaintenanceRequiredError("export journal exists; resume export-json")
+    }
     let journal = readJournal(directory)
     if (journal?.phase === "ABORTING" || journal?.phase === "ABORTED") {
-      throw new Error("migration aborted; finish abort-migration before any new transition")
+      throw new BookkeepingMaintenanceRequiredError("migration aborted; finish abort-migration before any new transition")
     }
     if (!journal && existsSync(join(directory, BOOKKEEPING_FILENAME))) {
       throw new Error("database without migration journal; refuse implicit adoption")

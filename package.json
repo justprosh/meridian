@@ -6,6 +6,7 @@
   "main": "./dist/server.js",
   "types": "./dist/proxy/server.d.ts",
   "bin": {
+    "meridian-bookkeeping": "./dist/session-bookkeeping.js",
     "meridian": "./dist/cli.js",
     "claude-max-proxy": "./dist/cli.js"
   },
@@ -21,7 +22,7 @@
   "scripts": {
     "start": "./bin/claude-proxy-supervisor.sh",
     "proxy": "./bin/claude-proxy-supervisor.sh",
-    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && bun build bin/cli.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --entry-naming \"[name].js\" && bun build plugin/meridian/index.js --outdir dist/meridian --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --entry-naming \"[name].js\" && bun build plugin/meridian-v2/index.js --outdir dist/meridian-v2 --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --entry-naming \"[name].js\" && node scripts/package-opencode-plugins.mjs && tsc -p tsconfig.build.json",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && bun build bin/cli.ts bin/session-bookkeeping.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --external libsql --entry-naming \"[name].js\" && bun build plugin/meridian/index.js --outdir dist/meridian --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --entry-naming \"[name].js\" && bun build plugin/meridian-v2/index.js --outdir dist/meridian-v2 --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --entry-naming \"[name].js\" && node scripts/package-opencode-plugins.mjs && tsc -p tsconfig.build.json",
     "postbuild": "node scripts/fix-bun-exports.mjs && node --check dist/cli.js && node --check dist/server.js && node --check dist/meridian-v2.js && node --check dist/meridian/index.js && node --check dist/meridian-v2/index.js && node -e \"if(!require('fs').existsSync('dist/proxy/server.d.ts'))process.exit(1)\"",
     "postinstall": "node -e \"try{require('child_process').spawnSync(process.execPath,[require.resolve('@anthropic-ai/claude-code/install.cjs')],{stdio:'inherit'})}catch(e){console.error('[meridian] claude-code postinstall skipped:',e.message)}\"",
     "prepublishOnly": "bun run build",
@@ -54,6 +55,7 @@
   },
   "files": [
     "dist/",
+    "docs/configuration.md",
     "plugin/",
     "assets/",
     "bin/meridian-launchd.sh",
