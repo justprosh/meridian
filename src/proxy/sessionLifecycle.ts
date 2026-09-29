@@ -1217,6 +1217,11 @@ export async function createInitializedSidecarLockCandidate(
   }
 }
 
+/** Offline migration uses the same lifecycle lock and recovery protocol as legacy publication. */
+export function withLegacyLifecycleMaintenanceLock<T>(directory: string, operation: () => Promise<T>): Promise<T> {
+  return withSidecarLock({ storeDir: directory, lockWaitMs: 100, lockStaleMs: 1 }, operation)
+}
+
 async function withSidecarLock<T>(
   options: SessionLifecycleOptions,
   operation: (paths: SidecarPaths) => Promise<T>,

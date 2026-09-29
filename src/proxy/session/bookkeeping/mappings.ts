@@ -227,6 +227,7 @@ export function readSessionTranscriptPins(reader: BookkeepingReader): Transcript
 /** Capture under a read snapshot; invoke the returned filesystem audit only AFTER COMMIT. */
 export function captureMappingPinsValidation(reader: BookkeepingReader): () => void {
   const locators = new Set<string>()
+  const importedLocators: Array<{ raw: TranscriptLocator; projected: string }> = []
   let after: string | undefined
   while (true) {
     const rows = reader.all(
@@ -254,6 +255,11 @@ export function captureMappingPinsValidation(reader: BookkeepingReader): () => v
         for (const [property, column, json] of columns) {
           const value = entry[property]
           const expected = value === undefined ? null : json ? JSON.stringify(value) : value
+          if ((property === "currentTranscript" || property === "previousTranscript")
+            && value !== undefined && row[column] !== null) {
+            importedLocators.push({ raw: value as TranscriptLocator, projected: String(row[column]) })
+            continue
+          }
           if (expected !== row[column]) {
             throw new SessionLifecycleCorruptError(
               `legacy mapping metadata/payload mismatch: ${row.key}/${column}`,
@@ -288,6 +294,11 @@ export function captureMappingPinsValidation(reader: BookkeepingReader): () => v
     WHERE m.key IS NULL LIMIT 1`)) throw new SessionLifecycleCorruptError("orphan bookkeeping pin")
   return () => {
     const paths = new Map<string, string>()
+    for (const { raw, projected } of importedLocators) {
+      if (JSON.stringify(canonicalizeLocator(raw, paths)) !== projected) {
+        throw new BookkeepingMaintenanceRequiredError("legacy locator realpath changed; run offline recanonicalize")
+      }
+    }
     for (const raw of locators) {
       const stored = JSON.parse(raw) as TranscriptLocator
       const canonical = canonicalizeLocator(stored, paths)

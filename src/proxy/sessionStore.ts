@@ -391,7 +391,7 @@ function cleanupStoreRecoveryTombstones(claimPath: string): void {
   }
 }
 
-function retireStaleLock(lockPath: string): boolean {
+function retireStaleLock(lockPath: string, staleMs = STALE_LOCK_THRESHOLD_MS): boolean {
   let token: string
   let info: ReturnType<typeof statSync>
   try {
@@ -402,7 +402,7 @@ function retireStaleLock(lockPath: string): boolean {
     throw new Error(`[sessionStore] stale lock inspection failed: ${(error as Error).message}`, { cause: error })
   }
   if (
-    Date.now() - info.mtimeMs <= STALE_LOCK_THRESHOLD_MS
+    Date.now() - info.mtimeMs <= staleMs
     || !canonicalStoreLockOwnerIsDead(token)
   ) return false
 
@@ -441,7 +441,7 @@ function retireStaleLock(lockPath: string): boolean {
       return true
     }
     if (
-      Date.now() - currentInfo.mtimeMs <= STALE_LOCK_THRESHOLD_MS
+      Date.now() - currentInfo.mtimeMs <= staleMs
       || !canonicalStoreLockOwnerIsDead(currentToken)
     ) return false
 
@@ -471,7 +471,7 @@ function retireStaleLock(lockPath: string): boolean {
   }
 }
 
-function acquireLock(lockPath: string): StoreLock {
+function acquireLock(lockPath: string, waitMs = getLockWaitMs(), staleMs = STALE_LOCK_THRESHOLD_MS): StoreLock {
   const incarnation = captureProcessIncarnation()
   if (!incarnation) throw new Error("[sessionStore] cannot capture lock owner process incarnation")
   const token = JSON.stringify({
@@ -480,7 +480,7 @@ function acquireLock(lockPath: string): StoreLock {
     token: randomUUID(),
     incarnation,
   })
-  const deadline = performance.now() + getLockWaitMs()
+  const deadline = performance.now() + waitMs
 
   while (true) {
     try {
@@ -492,7 +492,7 @@ function acquireLock(lockPath: string): StoreLock {
     if (deadline - performance.now() <= 0) {
       throw new Error(`[sessionStore] timed out waiting for lock ${lockPath}`)
     }
-    if (retireStaleLock(lockPath)) continue
+    if (retireStaleLock(lockPath, staleMs)) continue
     const remaining = deadline - performance.now()
     if (remaining <= 0) {
       throw new Error(`[sessionStore] timed out waiting for lock ${lockPath}`)
@@ -513,6 +513,16 @@ function releaseLock(lock: StoreLock): void {
     if (err.code !== "ENOENT") {
       console.error("[sessionStore] lock release failed:", err.message)
     }
+  }
+}
+
+/** Offline migration only: reuse legacy acquisition; never release a substituted barrier. */
+export function withLegacyStoreMaintenanceLock<T>(directory: string, operation: () => T): T {
+  const lock = acquireLock(join(directory, "sessions.json.lock"), 100, 0)
+  try {
+    return operation()
+  } finally {
+    if (readFileSync(lock.path, "utf8") === lock.token) releaseLock(lock)
   }
 }
 

@@ -49,7 +49,7 @@ const statements = [
   ) STRICT`,
   `CREATE TABLE fence_slots (
     namespace TEXT NOT NULL CHECK(namespace IN ('lifecycle','store')), slot TEXT NOT NULL,
-    ${integer("counter", false, 1)}, PRIMARY KEY(namespace,slot)
+    ${integer("counter")}, CHECK(namespace='store' OR counter>0), PRIMARY KEY(namespace,slot)
   ) STRICT`,
   `CREATE TABLE mappings (
     key TEXT PRIMARY KEY NOT NULL, claude_session_id TEXT NOT NULL CHECK(length(claude_session_id)>0),

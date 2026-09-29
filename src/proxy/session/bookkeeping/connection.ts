@@ -31,6 +31,7 @@ import {
 } from "./guard"
 import type { GuardLease, MaintenanceGuardLease } from "./guard"
 import type { BookkeepingReader, SqlRow, SqlValue } from "./types"
+import { readJournal, requireBarriers } from "./maintenanceJournal"
 
 export const BOOKKEEPING_FILENAME = "session-bookkeeping.sqlite"
 export interface BookkeepingInitializeOptions {
@@ -145,7 +146,7 @@ function pragmas(db: Database.Database, journal: "WAL" | "DELETE"): void {
   }
 }
 
-function bootstrap(path: string): void {
+function bootstrap(path: string, phase = "READY"): void {
   cleanupBootstrapOrphans(path)
   if (existsSync(path)) return
   const temporary = createBootstrapPath(path)
@@ -166,6 +167,7 @@ function bootstrap(path: string): void {
     pragmas(db, "DELETE")
     db.exec("BEGIN IMMEDIATE")
     initializeBookkeepingSchema(db, true)
+    db.prepare("UPDATE schema_meta SET phase=?").run(phase)
     db.exec("COMMIT")
     close()
     const fd = ownedFd(temporary)
@@ -183,6 +185,13 @@ function bootstrap(path: string): void {
     close()
     if (!terminal.has(path)) finishBootstrap(temporary)
   }
+}
+
+/** Maintenance owns the guard before publishing even an empty, explicitly unfinished main database. */
+export function createMaintenanceDatabase(directory: string, guard: MaintenanceGuardLease): void {
+  const canonical = realpathSync.native(resolve(directory))
+  assertGuardLease(guard, canonical, "exclusive")
+  bootstrap(join(canonical, BOOKKEEPING_FILENAME), "PREPARED")
 }
 
 function openDatabase(path: string, phase: string, full: boolean): Database.Database {
@@ -300,7 +309,14 @@ export function openHandle(
     try {
       assertGuardLease(guard, canonical, expectPhase === undefined ? "shared" : "exclusive")
       releaseGuardReference = retainGuardLease(guard, expectPhase === undefined ? "shared" : "exclusive")
+      const migration = expectPhase === undefined ? readJournal(canonical) : undefined
       if (expectPhase === undefined) {
+        if (migration) {
+          if (migration.phase !== "READY" || !existsSync(path)) {
+            throw new BookkeepingMaintenanceRequiredError("migration in progress; resume explicit maintenance")
+          }
+          requireBarriers(canonical, migration.id)
+        }
         for (const name of [
           "sessions.json",
           "session-gc.json",
@@ -308,12 +324,26 @@ export function openHandle(
           "session-gc.json.lock",
         ]) {
           if (existsSync(join(canonical, name))) {
+            if (migration && name.endsWith(".lock")) continue
             throw new BookkeepingMaintenanceRequiredError("legacy bookkeeping requires offline migration")
           }
         }
         bootstrap(path)
       }
       const db = openDatabase(path, expectPhase ?? "READY", true)
+      if (expectPhase === undefined) {
+        const meta = getRow(db, "SELECT migration_id,source_digests_json FROM schema_meta", [])
+        if ((meta?.migration_id ?? undefined) !== migration?.id
+          || (migration && meta?.source_digests_json !== JSON.stringify(migration.finalSources))) {
+          try {
+            closeNative(db)
+          } catch (error) {
+            if (error instanceof BookkeepingMaintenanceRequiredError) terminal.set(path, error)
+            throw error
+          }
+          throw new BookkeepingMaintenanceRequiredError("migration database/journal identity mismatch")
+        }
+      }
       connection = {
         db,
         path,

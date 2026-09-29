@@ -1,0 +1,98 @@
+/** Offline-only import planning: OS observations and realpaths precede the SQL transaction. */
+import { canonicalizeLocator, resourceKey } from "./locator"
+import { probeProcessIncarnation } from "../processIncarnation"
+import type { ProcessIncarnation } from "../processIncarnation"
+import { importResource } from "./resourceImport"
+import { insertResourceLease } from "./resources"
+import { writeMappingRow } from "./mappings"
+import { parseLegacySidecar, parseLegacyStoreForMaintenance, emptyStoreDocument } from "./legacyCodec"
+import type { SessionGcSidecar, SessionStoreDocument } from "./legacyCodec"
+import type { BookkeepingResource, CanonicalStoredSession, BookkeepingTransaction } from "./types"
+import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
+
+export interface ImportPlan {
+  sidecar: SessionGcSidecar
+  store: SessionStoreDocument
+  resources: BookkeepingResource[]
+  mappings: Array<{ key: string; canonical: CanonicalStoredSession; original: string }>
+}
+
+export function assertQuiescent(sidecar: SessionGcSidecar): void {
+  const requireDead = (owner: ProcessIncarnation | undefined, address: string) => {
+    if (owner && probeProcessIncarnation(owner) !== "dead") {
+      throw new BookkeepingMaintenanceRequiredError(`live or indeterminate process at ${address}; stop all writers`)
+    }
+  }
+  for (const [key, resource] of Object.entries(sidecar.resources)) {
+    requireDead(resource.deletionOwner, `${key}/deletion-owner`)
+    requireDead(resource.deletionExecutor, `${key}/deletion-executor`)
+    for (const [token, lease] of Object.entries(resource.activeLeases ?? {})) {
+      requireDead(lease.owner, `${key}/lease/${token}/owner`)
+      requireDead(lease.executor, `${key}/lease/${token}/executor`)
+    }
+  }
+}
+
+export function prepareImport(sidecarRaw: string | undefined, storeRaw: string | undefined): ImportPlan {
+  const sidecar = sidecarRaw === undefined
+    ? { version: 2 as const, meta: { fenceSlots: {} }, resources: {} }
+    : parseLegacySidecar(sidecarRaw)
+  const store = storeRaw === undefined ? emptyStoreDocument() : parseLegacyStoreForMaintenance(storeRaw)
+  assertQuiescent(sidecar)
+  const paths = new Map<string, string>()
+  const resources = Object.values(sidecar.resources).map((resource): BookkeepingResource => {
+    const locator = canonicalizeLocator(resource.locator, paths)
+    if (resourceKey(locator) !== resource.key) {
+      throw new BookkeepingMaintenanceRequiredError(`resource realpath changed before migration: ${resource.key}`)
+    }
+    return { ...resource, locator, rowVersion: resource.rowVersion ?? 1 }
+  })
+  const mappings = Object.entries(store.sessions).map(([key, entry]) => ({
+    key, original: JSON.stringify(entry), canonical: {
+      ...entry,
+      ...(entry.currentTranscript ? { currentTranscript: canonicalizeLocator(entry.currentTranscript, paths) } : {}),
+      ...(entry.previousTranscript ? { previousTranscript: canonicalizeLocator(entry.previousTranscript, paths) } : {}),
+    } as CanonicalStoredSession,
+  }))
+  return { sidecar, store, resources, mappings }
+}
+
+export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: string, digests: string): void {
+  for (const resource of plan.resources) {
+    importResource(tx, resource)
+    for (const lease of Object.values(resource.activeLeases ?? {})) insertResourceLease(tx, resource.key, lease)
+  }
+  // importResource populates only a subset; the source maps, including unused and zero store slots, are authoritative.
+  tx.run("DELETE FROM fence_slots")
+  for (const [namespace, slots] of [
+    ["lifecycle", plan.sidecar.meta.fenceSlots], ["store", plan.store.meta.slots],
+  ] as const) {
+    for (const [slot, counter] of Object.entries(slots)) {
+      tx.run("INSERT INTO fence_slots VALUES(?,?,?)", namespace, slot, counter)
+    }
+  }
+  for (const { key, canonical, original } of plan.mappings) {
+    writeMappingRow(tx, key, canonical)
+    if (canonical.generationId === undefined) {
+      tx.run("UPDATE mapping_history SET history_json=? WHERE mapping_key=?", original, key)
+    }
+  }
+  const meta = plan.store.meta
+  if (meta.version === 3) {
+    for (const [key, row] of Object.entries(meta.priorityAssignments)) {
+      tx.run("INSERT INTO priority_assignments VALUES(?,?,?,?,?,?,?,?)", key, row.profileId,
+        row.lastHumanTurnDigest, row.lastHumanTurnIssuedAt, row.mappingKey, row.mappingGeneration,
+        row.generationId, row.updatedAt)
+    }
+    for (const [key, row] of Object.entries(meta.priorityAttempts)) {
+      tx.run("INSERT INTO priority_attempts VALUES(?,?,?,?,?,?,?,?,?)", key, Number(row.blocked),
+        row.blockedTurnDigest, row.blockedTurnIssuedAt, row.pendingTurnDigest, row.pendingTurnIssuedAt,
+        row.ownerToken, row.generationId, row.updatedAt)
+    }
+    for (const [key, row] of Object.entries(meta.priorityRollbackMappings)) {
+      tx.run("INSERT INTO priority_rollbacks VALUES(?,?,?)", key, row.mappingKey, row.mappingGeneration)
+    }
+  }
+  tx.run("UPDATE schema_meta SET migration_id=?,source_digests_json=?,store_meta_version=?,phase='READY'",
+    id, digests, meta.version)
+}
