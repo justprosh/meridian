@@ -15,7 +15,7 @@ import {
 import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
 import { buildNodeFixture } from "./fixtures/bookkeeping-support"
 import { readExportJournal } from "../proxy/session/bookkeeping/exportJournal"
-import { enrichFixture, richSnapshot } from "./fixtures/bookkeeping-rich-fixture"
+import { enrichFixture, richArchivedSnapshot, richSnapshot } from "./fixtures/bookkeeping-rich-fixture"
 
 for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session-gc.migrated.json",
   "linked:sessions.migrated.json", "moved:sessions.migrated.json", "linked:database", "moved:database",
@@ -28,7 +28,15 @@ for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session
       enrichFixture(directory)
       const first = await migrateBookkeeping(directory, { writersStopped: true })
       const expected = richSnapshot(directory)
+      expect(first.resources).toBe(2)
+      expect(first.mappings).toBe(3)
+      expect(expected.counts.resources).toBe(first.resources)
+      expect(expected.counts.mappings).toBe(first.mappings)
       const down = exportBookkeepingJson(directory)
+      expect(down.documents).toEqual(expected.documents)
+      expect(down.resources).toBe(first.resources)
+      expect(down.mappings).toBe(first.mappings)
+      expect(richArchivedSnapshot(directory, down)).toEqual(expected)
       const point = cut.replace("database", `session-bookkeeping.sqlite.exported-${down.id}`)
       child("migrate", directory, `cycle:${point}`)
       const up = await migrateBookkeeping(directory, { writersStopped: true })
@@ -40,6 +48,9 @@ for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session
         "session-bookkeeping-migration.json"))).toBe(true)
       const again = exportBookkeepingJson(directory)
       expect(again.documents).toEqual(down.documents)
+      expect(again.resources).toBe(up.resources)
+      expect(again.mappings).toBe(up.mappings)
+      expect(richArchivedSnapshot(directory, again)).toEqual(expected)
     } finally { rmSync(directory, { recursive: true, force: true }) }
   }, 20000)
 }
@@ -87,6 +98,8 @@ const exportPoints = ["PREPARED", "staged:session-gc.json", "staged:sessions.jso
   "linked:session-bookkeeping.sqlite-wal", "moved:session-bookkeeping.sqlite-wal",
   "linked:session-bookkeeping.sqlite-shm", "moved:session-bookkeeping.sqlite-shm",
   "ARCHIVED", "EXPORTED", "released:session-gc.json", "released:sessions.json",
+  "barrier:intent:session-gc.json", "barrier:intent:sessions.json",
+  "barrier:linked:session-gc.json", "barrier:linked:sessions.json",
   "barrier:releasing:session-gc.json", "barrier:releasing:sessions.json"]
 
 for (const sidecarVersion of [1, 2]) for (const storeVersion of [1, 3]) {

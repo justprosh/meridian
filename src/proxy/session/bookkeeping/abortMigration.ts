@@ -32,6 +32,7 @@ export function abortBookkeepingMigration(input: string): void {
       releaseOwnBarrier(directory, source, journal.id)
       crashPoint(`abort:released:${source}`)
     }
+    Object.assign(journal, readJournal(directory))
     journal.phase = "ABORTED"
     saveJournal(directory, journal)
     crashPoint("abort:ABORTED")

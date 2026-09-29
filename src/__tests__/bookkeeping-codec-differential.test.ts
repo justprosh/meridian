@@ -7,7 +7,11 @@ import { canonicalizeLocator, resourceKey } from "../proxy/session/bookkeeping/l
 import { STORE_META_KEY } from "../proxy/session/bookkeeping/legacyCodec"
 import { enrichFixture } from "./fixtures/bookkeeping-rich-fixture"
 
-it("ccc5ba3 codecs and extracted codecs produce identical bytes and error messages", async () => {
+const baseline = spawnSync("git", ["cat-file", "-e", "ccc5ba3^{commit}"], { encoding: "utf8" })
+const reason = baseline.status === 0 ? "" : " — git object ccc5ba3 unavailable (e.g. shallow checkout)"
+if (reason) console.warn(`SKIP differential codecs${reason}`)
+const differentialTest = reason ? it.skip : it
+differentialTest(`ccc5ba3 codecs and extracted codecs produce identical bytes and error messages${reason}`, async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-codec-differential-")))
   try {
     const tree = spawnSync("git", ["archive", "ccc5ba3", "src"], { maxBuffer: 64 * 1024 * 1024 })

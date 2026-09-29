@@ -2,7 +2,7 @@ import { closeSync, existsSync, lstatSync, readdirSync } from "node:fs"
 import { join } from "node:path"
 import { captureProcessIncarnation, parseProcessIncarnation, probeProcessIncarnation } from "../processIncarnation"
 import { protectedBytes } from "./exportJournal"
-import { ownedFd } from "./storagePaths"
+import { errorCode, ownedFd } from "./storagePaths"
 import type { Residue, ResidueVerdict } from "./residueTypes"
 
 export function candidateVerdict(path: string): ResidueVerdict {
@@ -13,7 +13,7 @@ export function candidateVerdict(path: string): ResidueVerdict {
       true, true).toString("utf8").split("\n")[0]!)
     if (raw && typeof raw === "object") owner = (raw as Record<string, unknown>).incarnation
   } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error
+    if (!(error instanceof SyntaxError) && !(stat.isDirectory() && errorCode(error) === "ENOENT")) throw error
   }
   const incarnation = parseProcessIncarnation(owner)
   if (!incarnation) return "unknown"
@@ -30,7 +30,11 @@ export function candidateVerdict(path: string): ResidueVerdict {
 export function inspectArtifacts(directory: string): { candidates: Residue[]; gates: Residue[]; temporary: Residue[] } {
   const names = readdirSync(directory)
   const candidates = names.filter((name) => /^(session-gc|sessions)\.json\.lock[^/]*\.candidate-/.test(name))
-    .map((path) => ({ path, verdict: candidateVerdict(join(directory, path)) }))
+    .map((path): Residue => {
+      const full = join(directory, path)
+      const incomplete = lstatSync(full).isDirectory() && !existsSync(join(full, "owner.json"))
+      return { path, verdict: candidateVerdict(full), ...(incomplete ? { kind: "incomplete-candidate" as const } : {}) }
+    })
   const gates: Residue[] = []
   for (const name of ["deletion-gates", "sdk-process-gates"]) {
     const path = join(directory, name)

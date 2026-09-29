@@ -10,6 +10,14 @@ import {
 import { initializeSessionBookkeeping, withBookkeepingRead } from "../../proxy/session/bookkeeping/database"
 import { snapshotForExport } from "../../proxy/session/bookkeeping/exportSnapshot"
 import { digestBytes, SOURCE_NAMES } from "../../proxy/session/bookkeeping/maintenanceJournal"
+import Database from "libsql"
+import { pathToFileURL } from "node:url"
+import { fileIdentity } from "../../proxy/session/bookkeeping/exportJournal"
+import type { ExportJournal } from "../../proxy/session/bookkeeping/exportJournal"
+import { validateBookkeepingSchema } from "../../proxy/session/bookkeeping/schema"
+
+const TABLES = ["resources", "resource_leases", "fence_slots", "mappings", "mapping_history",
+  "mapping_pins", "priority_assignments", "priority_attempts", "priority_rollbacks", "bookkeeping_counts"]
 
 export function enrichFixture(directory: string): void {
   const sidecar = parseLegacySidecar(readFileSync(join(directory, "session-gc.json"), "utf8"))
@@ -57,10 +65,20 @@ export function richSnapshot(directory: string) {
         const bytes = index === 0 ? snapshot.sidecar : snapshot.store
         return { name, digest: digestBytes(bytes), bytes: Buffer.byteLength(bytes) }
       })
-      const counts = Object.fromEntries(["resources", "resource_leases", "fence_slots", "mappings", "mapping_history",
-        "mapping_pins", "priority_assignments", "priority_attempts", "priority_rollbacks", "bookkeeping_counts"]
+      const counts = Object.fromEntries(TABLES
         .map((table) => [table, Number(reader.get(`SELECT count(*) AS n FROM ${table}`)?.n)]))
       return { documents, counts }
     })
   } finally { handle.close() }
+}
+
+export function richArchivedSnapshot(directory: string, journal: ExportJournal) {
+  const path = join(directory, `session-bookkeeping.sqlite.exported-${journal.id}`)
+  const db = new Database(`${pathToFileURL(path).href}?mode=ro&immutable=1`)
+  try {
+    validateBookkeepingSchema(db)
+    const counts = Object.fromEntries(TABLES.map((table) => [table,
+      (db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n]))
+    return { documents: SOURCE_NAMES.map((name) => fileIdentity(directory, name)), counts }
+  } finally { db.close() }
 }

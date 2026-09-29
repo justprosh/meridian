@@ -22,6 +22,7 @@ import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 import { archivePreviousCycle } from "./cycles"
 import { archiveResidues, planResidueArchive } from "./residueArchive"
 import type { ArchivedResidue } from "./residueTypes"
+import { refuseUnjournaledDatabase } from "./maintenancePreflight"
 
 export interface MigrationOptions {
   /** Operator attestation, not something inferred from a quiet lease table. */
@@ -149,6 +150,7 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
       "--writers-stopped is required; idle legacy proxies are not observable",
     )
   }
+  refuseUnjournaledDatabase(input)
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
@@ -161,7 +163,7 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
       throw new BookkeepingMaintenanceRequiredError("migration aborted; finish abort-migration before any new transition")
     }
     if (!journal && existsSync(join(directory, BOOKKEEPING_FILENAME))) {
-      throw new Error("database without migration journal; refuse implicit adoption")
+      throw new BookkeepingMaintenanceRequiredError("database without migration journal; refuse implicit adoption")
     }
     const residues = journal ? journal.residues ?? [] : planResidueArchive(directory)
     if (journal) archiveResidues(directory, journal.id, residues)

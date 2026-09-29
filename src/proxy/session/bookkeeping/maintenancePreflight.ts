@@ -3,8 +3,15 @@ import { join } from "node:path"
 import { protectedBytes } from "./exportJournal"
 import { parseLegacySidecar } from "./legacyCodec"
 import { assertQuiescent } from "./migrationImport"
-import { SOURCE_NAMES } from "./maintenanceJournal"
+import { JOURNAL_NAME, SOURCE_NAMES } from "./maintenanceJournal"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
+
+/** Refuse foreign SQLite authority before bootstrapping any maintenance files. */
+export function refuseUnjournaledDatabase(directory: string): void {
+  if (existsSync(join(directory, "session-bookkeeping.sqlite")) && !existsSync(join(directory, JOURNAL_NAME))) {
+    throw new BookkeepingMaintenanceRequiredError("database without migration journal; refuse implicit adoption")
+  }
+}
 
 /** CLI refusal before guard bootstrap. The migrator repeats checks under exclusive ownership. */
 export function preflightLegacyMigration(directory: string): void {

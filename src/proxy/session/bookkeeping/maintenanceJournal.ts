@@ -30,6 +30,7 @@ export interface MigrationJournal {
   sources: SourceIdentity[]
   finalSources?: SourceIdentity[]
   residues?: ArchivedResidue[]
+  releases?: Partial<Record<SourceName, { name: string; dev: number; ino: number }>>
 }
 export const digestBytes = (value: string) => createHash("sha256").update(value).digest("hex")
 
@@ -96,8 +97,21 @@ export function readJournal(directory: string, readOnly = false): MigrationJourn
     || !["PREPARED", "BARRIERS", "IMPORTED", "READY", "ABORTING", "ABORTED"].includes(String(row.phase))
     || !validSources(row.sources) || (row.finalSources !== undefined && !validSources(row.finalSources))
     || (row.residues !== undefined && !validResidues(row.residues))
+    || (row.releases !== undefined && !validReleases(row.releases, String(row.id)))
     || (row.phase !== "PREPARED" && !row.finalSources)) throw new Error("invalid migration journal")
   return row as unknown as MigrationJournal
+}
+
+function validReleases(value: unknown, id: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  return Object.entries(value).every(([source, item]) => {
+    if (!SOURCE_NAMES.includes(source as SourceName) || !item || typeof item !== "object") return false
+    const row = item as Record<string, unknown>
+    const prefix = `${source}.lock.releasing-${id}-`
+    return typeof row.name === "string" && row.name.startsWith(prefix)
+      && /^[a-f0-9-]{36}$/.test(row.name.slice(prefix.length))
+      && [row.dev, row.ino].every((v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0)
+  })
 }
 
 export function saveJournal(directory: string, journal: MigrationJournal): void {

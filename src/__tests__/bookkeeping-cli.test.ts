@@ -1,7 +1,9 @@
 import { afterEach, beforeAll, beforeEach, expect, it } from "bun:test"
 import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import Database from "libsql"
+import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { initializeSessionBookkeeping } from "../proxy/session/bookkeeping/database"
@@ -174,3 +176,80 @@ it("archives an unknown candidate only with attestation, and ignores nonempty le
   expect(after.result.residues[0].verdict).toBe("unknown")
   expect(readFileSync(join(directory, temporary), "utf8")).toBe("not empty")
 })
+
+it("inspects and archives an incomplete directory candidate without inventing an owner", () => {
+  const name = "sessions.json.lock.candidate-1-00000000-0000-4000-8000-000000000001"
+  mkdirSync(join(directory, name), { mode: 0o700 })
+  expect(success("inspect").candidates).toEqual([{ path: name, verdict: "unknown", kind: "incomplete-candidate" }])
+  expect(readdirSync(join(directory, name))).toEqual([])
+  const result = success("migrate", ["--writers-stopped"])
+  expect(result.phase).toBe("ready")
+  expect(result.result.residues[0].kind).toBe("incomplete-candidate")
+  const archived = join(directory, "bookkeeping-cycles", result.migration_id, "residue", name)
+  expect(JSON.parse(readFileSync(join(archived, ".bookkeeping-residue.json"), "utf8")))
+    .toEqual(result.result.residues[0])
+  expect(readdirSync(directory)).not.toContain(name)
+})
+
+it("refuses a foreign SQLite before guard creation without changing files or inodes", async () => {
+  const path = join(directory, "session-bookkeeping.sqlite")
+  const db = new Database(path)
+  db.exec("CREATE TABLE foreign_authority(value TEXT)")
+  db.close()
+  const snapshot = () => readdirSync(directory).sort().map((name) => {
+    const stat = lstatSync(join(directory, name))
+    return { name, ino: stat.ino, dev: stat.dev, mode: stat.mode, bytes: readFileSync(join(directory, name)).toString("hex") }
+  })
+  const before = snapshot()
+  const refused = cli("migrate", ["--writers-stopped"])
+  expect(refused.status, refused.stdout + refused.stderr).toBe(3)
+  expect(snapshot()).toEqual(before)
+  await expect(migrateBookkeeping(directory, { writersStopped: true })).rejects.toThrow("without migration journal")
+  expect(snapshot()).toEqual(before)
+})
+
+it("resumes an archived incomplete candidate after SIGKILL", () => {
+  const name = "sessions.json.lock.candidate-1-00000000-0000-4000-8000-000000000003"
+  mkdirSync(join(directory, name), { mode: 0o700 })
+  expect(cli("migrate", ["--writers-stopped"], `residue:moved:${name}`).signal).toBe("SIGKILL")
+  expect(success("migrate", ["--writers-stopped"]).phase).toBe("ready")
+})
+
+it("refuses an ambiguous incomplete-directory archive without deleting the source", () => {
+  const name = "sessions.json.lock.candidate-1-00000000-0000-4000-8000-000000000004"
+  mkdirSync(join(directory, name), { mode: 0o700 })
+  expect(cli("migrate", ["--writers-stopped"], "PREPARED").signal).toBe("SIGKILL")
+  const journal = JSON.parse(readFileSync(join(directory, "session-bookkeeping-migration.json"), "utf8"))
+  const target = join(directory, "bookkeeping-cycles", journal.id, "residue", name)
+  mkdirSync(target, { recursive: true, mode: 0o700 })
+  expect(cli("migrate", ["--writers-stopped"]).status).toBe(5)
+  expect(readdirSync(join(directory, name))).toEqual([])
+  expect(readdirSync(target)).toEqual([])
+})
+
+for (const scenario of ["occupied-private", "replaced-public", "resume-linked"]) {
+  it(`packaged export release ${scenario} preserves foreign data or resumes its own inode`, () => {
+    success("migrate", ["--writers-stopped"])
+    const point = scenario === "occupied-private" ? "intent" : "linked"
+    expect(cli("export-json", [], `barrier:${point}:sessions.json`).signal).toBe("SIGKILL")
+    const journal = JSON.parse(readFileSync(join(directory, "session-bookkeeping-migration.json"), "utf8"))
+    const privatePath = join(directory, journal.releases["sessions.json"].name)
+    const publicPath = join(directory, "sessions.json.lock")
+    if (scenario === "occupied-private") {
+      writeFileSync(privatePath, "foreign", { mode: 0o600 })
+      expect(cli("export-json").status).toBe(5)
+      expect(readFileSync(privatePath, "utf8")).toBe("foreign")
+    } else if (scenario === "replaced-public") {
+      renameSync(publicPath, publicPath + ".original")
+      writeFileSync(publicPath, "foreign", { mode: 0o600 })
+      expect(cli("export-json").status).toBe(5)
+      expect(readFileSync(publicPath, "utf8")).toBe("foreign")
+      expect(readdirSync(directory)).not.toContain(journal.releases["sessions.json"].name)
+    } else {
+      expect(lstatSync(privatePath).ino).toBe(lstatSync(publicPath).ino)
+      expect(success("export-json").phase).toBe("exported")
+      expect(readdirSync(directory)).not.toContain("sessions.json.lock")
+      expect(readdirSync(directory)).not.toContain(journal.releases["sessions.json"].name)
+    }
+  })
+}

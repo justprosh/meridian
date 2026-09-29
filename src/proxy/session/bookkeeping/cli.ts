@@ -10,7 +10,7 @@ import { barrierBytes, observeMaintenancePhases, readJournal, SOURCE_NAMES } fro
 import { protectedBytes, readExportJournal } from "./exportJournal"
 import { BookkeepingBusyError, BookkeepingMaintenanceRequiredError, errorCode } from "./storagePaths"
 import { BookkeepingBarrierReplacedError } from "./barrier"
-import { preflightLegacyMigration } from "./maintenancePreflight"
+import { preflightLegacyMigration, refuseUnjournaledDatabase } from "./maintenancePreflight"
 import { SessionStoreLockTimeoutError } from "../storeErrors"
 import { SessionLifecycleLockError } from "../lifecycleErrors"
 
@@ -57,7 +57,8 @@ function unsafeState(directory: string): boolean {
   const migration = readJournal(directory, true)
   if (migration && SOURCE_NAMES.some((source) => {
     const path = join(directory, source + ".lock")
-    return existsSync(`${path}.releasing-${migration.id}`)
+    const releasing = migration.releases?.[source]?.name
+    return Boolean(releasing && existsSync(join(directory, releasing)))
       || (existsSync(path) && protectedBytes(path, false, true).toString("utf8") === barrierBytes(migration.id))
   })) return true
   return Boolean(exported && exported.phase !== "EXPORTED")
@@ -84,6 +85,7 @@ export async function runBookkeepingCli(args: string[]): Promise<number> {
   try {
     const options = parse(args)
     directory = inspectionDirectory(options.directory)
+    if (options.command === "migrate") refuseUnjournaledDatabase(directory)
     try { before = inspectBookkeeping(directory) } catch (error) {
       if (options.command !== "abort-migration") throw error
       // Invalid legacy JSON is the main reason to abort a pre-database migration.

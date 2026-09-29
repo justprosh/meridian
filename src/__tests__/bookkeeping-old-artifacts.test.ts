@@ -11,16 +11,28 @@ import { pathToFileURL } from "node:url"
 import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
 import { buildNodeFixture } from "./fixtures/bookkeeping-support"
 
-let root: string
+const root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-old-artifacts-")))
 const artifacts: Array<{ name: string; module: string }> = []
+const unavailable = new Map<string, string>()
+const tarballs: Array<[string, string]> = []
+const pack = spawnSync("npm", ["pack", "@rynfar/meridian@1.78.0", "--pack-destination", root,
+  "--fetch-retries=0", "--fetch-timeout=10000"], { encoding: "utf8", timeout: 20000 })
+if (pack.status === 0) tarballs.push(["npm", join(root, "rynfar-meridian-1.78.0.tgz")])
+else unavailable.set("npm", `npm 1.78.0 unavailable (network/cache/tool): ${pack.error?.message ?? pack.stderr.slice(-200)}`)
+const fork = process.env.BOOKKEEPING_OLD_FORK_TARBALL
+if (fork && existsSync(fork)) tarballs.push(["fork", fork])
+else unavailable.set("fork", "BOOKKEEPING_OLD_FORK_TARBALL is unset, empty or does not exist")
+for (const [name, reason] of unavailable) console.warn(`SKIP ${name}: ${reason}`)
+if (tarballs.length === 0) rmSync(root, { recursive: true, force: true })
+
+function artifactTest(name: string, title: string, body: () => void | Promise<void>, timeout: number) {
+  const reason = unavailable.get(name)
+  if (reason) it.skip(`${title} — ${reason}`, body)
+  else it(title, body, timeout)
+}
 beforeAll(async () => {
-  root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-old-artifacts-")))
-  const pack = spawnSync("npm", ["pack", "@rynfar/meridian@1.78.0", "--pack-destination", root],
-    { encoding: "utf8", timeout: 120000 })
-  expect(pack.status, pack.stdout + pack.stderr).toBe(0)
-  const fork = process.env.BOOKKEEPING_OLD_FORK_TARBALL
-    ?? "/Users/aleksei/dev/meridian-wt/hub-1.78/rynfar-meridian-1.78.0-hub.1.tgz"
-  for (const [name, tarball] of [["npm", join(root, "rynfar-meridian-1.78.0.tgz")], ["fork", fork]]) {
+  if (!tarballs.length) return
+  for (const [name, tarball] of tarballs) {
     const directory = join(root, name!)
     mkdirSync(directory)
     const unpack = spawnSync("tar", ["-xzf", tarball!, "-C", directory], { encoding: "utf8" })
@@ -74,7 +86,7 @@ function oldChild(module: string, directory: string, action: "store" | "lifecycl
     env: { ...process.env, HOME: root, MERIDIAN_SESSION_DIR: directory, MERIDIAN_SESSION_LOCK_TIMEOUT_MS: "80" } })
 }
 
-for (const name of ["npm", "fork"]) it(`${name} physical SDK gate positive control really executes the writer`, () => {
+for (const name of ["npm", "fork"]) artifactTest(name, `${name} physical SDK gate positive control really executes the writer`, () => {
   const artifact = artifacts.find((item) => item.name === name)!
   const directory = realpathSync(mkdtempSync(join(root, "sdk-control-")))
   const result = oldChild(artifact.module, directory, "sdk-control")
@@ -89,7 +101,7 @@ const cuts = [undefined, ...["PREPARED", "staged:session-gc.json", "staged:sessi
   "linked:session-bookkeeping.sqlite-shm", "moved:session-bookkeeping.sqlite-shm", "ARCHIVED", "EXPORTED"]
   .map((point) => `export:${point}`)]
 for (const name of ["npm", "fork"]) for (const cut of cuts) {
-  it(`${name} actual old bundle cannot write beyond stale TTL at ${cut ?? "READY"}`, async () => {
+  artifactTest(name, `${name} actual old bundle cannot write beyond stale TTL at ${cut ?? "READY"}`, async () => {
     const artifact = artifacts.find((item) => item.name === name)!
     const directory = realpathSync(mkdtempSync(join(root, "data-")))
     await migrateBookkeeping(directory, { writersStopped: true })
@@ -118,7 +130,7 @@ for (const name of ["npm", "fork"]) for (const cut of cuts) {
   }, 60000)
 }
 
-for (const name of ["npm", "fork"]) it(`${name} old process holding its lock refuses migration with 3`, async () => {
+for (const name of ["npm", "fork"]) artifactTest(name, `${name} old process holding its lock refuses migration with 3`, async () => {
   const artifact = artifacts.find((item) => item.name === name)!
   const directory = realpathSync(mkdtempSync(join(root, "held-")))
   const child = spawn("node", ["--input-type=module", "-e", `
@@ -148,7 +160,7 @@ for (const name of ["npm", "fork"]) it(`${name} old process holding its lock ref
 // Release is intentionally the end of fencing, not another negative-write window.
 for (const name of ["npm", "fork"]) for (const cut of ["barrier:releasing:session-gc.json",
   "export:released:session-gc.json", "barrier:releasing:sessions.json", "export:released:sessions.json"]) {
-  it(`${name} old writes follow each per-file release boundary at ${cut}`, async () => {
+  artifactTest(name, `${name} old writes follow each per-file release boundary at ${cut}`, async () => {
     const artifact = artifacts.find((item) => item.name === name)!
     const directory = realpathSync(mkdtempSync(join(root, "release-")))
     await migrateBookkeeping(directory, { writersStopped: true })

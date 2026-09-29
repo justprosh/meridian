@@ -788,6 +788,11 @@ at that identity still refuses maintenance. Unobservable/malformed identities ar
 Gate files do not persist an incarnation, so their verdict is `unknown`, never inferred from PID/age.
 `temporary` lists empty `session-gc.json.tmp-<pid>-<uuid>` files (interrupted legacy atomic writes).
 `turn-locks/` is outside bookkeeping and is neither listed nor moved.
+An empty directory candidate lacking `owner.json` is `unknown` with `kind: "incomplete-candidate"`,
+not corruption. Its archive is a directory containing `.bookkeeping-residue.json` with the original
+empty directory's identity. Removal uses `rmdir` only after that manifest is durable; populated/inode-changed
+sources are refused. An interrupted archive directory without its manifest is ambiguous: migration refuses
+without removing the original, rather than adopting a foreign directory.
 
 For `migrate --writers-stopped`, the operator attests that all proxies **and SDK/deletion children**
 have stopped. Under that attestation, unknown/dead residues are moved, not deleted, to
@@ -798,6 +803,11 @@ A live candidate refuses migration with its address (3 from legacy; 4 if barrier
 Other maintenance commands do not accept unknown candidates/gates. An already-ready CLI migrate is a
 no-op and does not archive newly appeared residues. The current cycle's residue directory does not count
 as an archived cycle. Inspection alone only reports residues, without applying the operator attestation.
+Barrier release records a random private name and the barrier inode in the migration journal **before**
+linking `<source>.lock.releasing-<migration_id>-<uuid>`. Exclusive link creation never overwrites a foreign
+private name. Resume accepts only the journaled inode; a replacement public inode is left intact and
+returns 5. A foreign SQLite database without a migration journal refuses migration with 3 before guard
+creation or any other write to the directory.
 Inspection never repairs permissions or bootstraps a missing guard. WAL without SHM requires offline recovery
 rather than creating SHM during inspection. Without `--json`, output is indented for human reading.
 

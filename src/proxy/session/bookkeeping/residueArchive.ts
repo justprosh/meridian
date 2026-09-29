@@ -1,8 +1,9 @@
-import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, unlinkSync } from "node:fs"
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, unlinkSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { fileIdentity, verifyFile } from "./exportJournal"
-import { crashPoint } from "./maintenanceJournal"
+import { crashPoint, digestBytes } from "./maintenanceJournal"
+import { archiveIncompleteDirectory } from "./residueDirectory"
 import { candidateVerdict, inspectArtifacts } from "./residueInventory"
 import type { ArchivedResidue } from "./residueTypes"
 import { BookkeepingMaintenanceRequiredError, ownedFd } from "./storagePaths"
@@ -12,8 +13,13 @@ export function planResidueArchive(directory: string): ArchivedResidue[] {
   const inventory = inspectArtifacts(directory)
   return [...inventory.candidates, ...inventory.gates, ...inventory.temporary].map((row) => {
     if (row.verdict === "live") throw new BookkeepingMaintenanceRequiredError(`live residue: ${row.path}`)
-    const identity = fileIdentity(directory, row.path, true)
     const stat = lstatSync(join(directory, row.path))
+    if (row.kind === "incomplete-candidate") {
+      closeSync(ownedFd(join(directory, row.path), true, false, true))
+      if (readdirSync(join(directory, row.path)).length) throw new Error(`nonempty incomplete candidate: ${row.path}`)
+      return { ...row, digest: digestBytes(""), bytes: 0, dev: stat.dev, ino: stat.ino }
+    }
+    const identity = fileIdentity(directory, row.path, true)
     return { ...row, digest: identity.digest, bytes: identity.bytes, dev: stat.dev, ino: stat.ino }
   })
 }
@@ -36,6 +42,11 @@ export function archiveResidues(directory: string, id: string, residues: Archive
     if (!existsSync(parent)) mkdirSync(parent, { mode: 0o700 })
     closeSync(ownedFd(parent, true))
     syncDirectoryDurablySync(dirname(parent))
+    if (row.kind === "incomplete-candidate") {
+      archiveIncompleteDirectory(source, target, row)
+      crashPoint(`residue:moved:${row.path}`)
+      continue
+    }
     const expected = { name: row.path, digest: row.digest, bytes: row.bytes }
     if (existsSync(source)) {
       if (row.path.includes(".candidate-") && candidateVerdict(source) === "live") {
