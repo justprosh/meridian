@@ -5,6 +5,7 @@ import { SessionLifecycleLockError, SessionLifecycleReentrancyError } from "../l
 import { claudeLog } from "../../../logger"
 import {
   assertRead,
+  assertSingleStatement,
   busy,
   checkParameters,
   connectionFor,
@@ -66,7 +67,7 @@ function commit(connection: Connection): void {
   try {
     executeTransaction(connection, "COMMIT")
   } catch (error) {
-    if (busy(error)) throw error
+    if (busy(error)) throw new BookkeepingBusyError("bookkeeping COMMIT busy; callback not replayed", { cause: error })
     const closeError = poison(connection)
     const cause = closeError ? new AggregateError([error, closeError]) : error
     throw new BookkeepingCommitUncertainError("bookkeeping COMMIT outcome unknown; retain publication pins", {
@@ -104,12 +105,19 @@ function scopeFor(connection: Connection, mode: Scope["mode"]): Scope {
       run(sql, ...parameters) {
         check()
         if (mode === "read") throw new Error("write inside read snapshot")
-        const forbidden = /\b(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|ATTACH|DETACH|PRAGMA|VACUUM)\b/i
+        const forbidden = /\b(BEGIN|END|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|ATTACH|DETACH|PRAGMA|VACUUM)\b/i
         if (forbidden.test(sql)) throw new Error("transaction-control SQL is not a row operation")
+        assertSingleStatement(sql)
         checkParameters(parameters)
-        return database(connection)
-          .prepare(sql)
-          .run(...parameters).changes
+        const db = database(connection)
+        try {
+          return db.prepare(sql).run(...parameters).changes
+        } finally {
+          if (!db.inTransaction) {
+            const closeError = poison(connection)
+            throw new BookkeepingCommitUncertainError("row operation lost its transaction", { cause: closeError })
+          }
+        }
       },
       afterCommit(hook) {
         check()

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { resourceKey, canonicalizeLocator } from "./locator"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
+import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import type { CanonicalStoredSession } from "./types"
 import type {
   BookkeepingReader,
@@ -66,7 +67,7 @@ function validateEntry(entry: StoredSession): void {
   }
 }
 
-function writeRow(
+export function writeMappingRow(
   tx: BookkeepingTransaction,
   key: string,
   entry: CanonicalStoredSession,
@@ -137,12 +138,6 @@ function advanceSlot(tx: BookkeepingTransaction, key: string): void {
   )
 }
 
-/** Fixture insertion; semantic publication and fence-preserving import are separate operations. */
-export function insertMapping(tx: BookkeepingTransaction, key: string, entry: CanonicalStoredSession): void {
-  writeRow(tx, key, entry)
-  advanceSlot(tx, key)
-}
-
 export function readMapping(reader: BookkeepingReader, key: string): StoredSession | undefined {
   const row = reader.get("SELECT * FROM mappings WHERE key=?", key)
   if (!row) return undefined
@@ -204,7 +199,7 @@ export function compareAndSwapMapping(
     throw new TypeError("mapping mutation requires a new generationId")
   if (replacement && `p:${digest(key)}:${replacement.generationId}` === expectedGeneration)
     throw new TypeError("mapping mutation must advance generation")
-  if (replacement) writeRow(tx, key, replacement, true)
+  if (replacement) writeMappingRow(tx, key, replacement, true)
   else tx.run("DELETE FROM mappings WHERE key=?", key)
   advanceSlot(tx, key)
   return true
@@ -231,57 +226,75 @@ export function readSessionTranscriptPins(reader: BookkeepingReader): Transcript
 
 /** Capture under a read snapshot; invoke the returned filesystem audit only AFTER COMMIT. */
 export function captureMappingPinsValidation(reader: BookkeepingReader): () => void {
-  const legacy = reader.all(`SELECT m.*,h.history_json FROM mappings m JOIN mapping_history h
-    ON h.mapping_key=m.key WHERE h.encoding='legacy-entry'`)
-  const missing = reader.get(`SELECT m.key FROM mappings m LEFT JOIN mapping_history h ON h.mapping_key=m.key
-    WHERE h.mapping_key IS NULL OR (m.generation_id IS NULL AND h.encoding!='legacy-entry')
-    OR (m.generation_id IS NOT NULL AND h.encoding!='history') LIMIT 1`)
-  const metadata = reader.all("SELECT key,current_locator_json,previous_locator_json FROM mappings")
-  const pins = reader.all("SELECT * FROM mapping_pins")
-  return () => {
-    for (const row of legacy) {
-      const entry = JSON.parse(String(row.history_json)) as StoredSession
-      validateEntry(entry)
-      const columns = [
-        ["claudeSessionId", "claude_session_id", false],
-        ["createdAt", "created_at", false],
-        ["lastUsedAt", "last_used_at", false],
-        ["messageCount", "message_count", false],
-        ...optionalColumns,
-      ] as const
-      for (const [property, column, json] of columns) {
-        const value = entry[property]
-        const expected = value === undefined ? null : json ? JSON.stringify(value) : value
-        if (expected !== row[column]) {
-          throw new SessionLifecycleCorruptError(
-            `legacy mapping metadata/payload mismatch: ${row.key}/${column}`,
-          )
+  const locators = new Set<string>()
+  let after: string | undefined
+  while (true) {
+    const rows = reader.all(
+      `SELECT m.*,h.encoding,
+      CASE WHEN h.encoding='legacy-entry' THEN h.history_json ELSE NULL END AS history_json
+      FROM mappings m LEFT JOIN mapping_history h ON h.mapping_key=m.key
+      ${after === undefined ? "" : "WHERE m.key>?"} ORDER BY m.key LIMIT 128`,
+      ...(after === undefined ? [] : [after]),
+    )
+    if (!rows.length) break
+    for (const row of rows) {
+      if (row.encoding !== (row.generation_id === null ? "legacy-entry" : "history")) {
+        throw new SessionLifecycleCorruptError("mapping history/encoding mismatch")
+      }
+      if (row.encoding === "legacy-entry") {
+        const entry = JSON.parse(String(row.history_json)) as StoredSession
+        validateEntry(entry)
+        const columns = [
+          ["claudeSessionId", "claude_session_id", false],
+          ["createdAt", "created_at", false],
+          ["lastUsedAt", "last_used_at", false],
+          ["messageCount", "message_count", false],
+          ...optionalColumns,
+        ] as const
+        for (const [property, column, json] of columns) {
+          const value = entry[property]
+          const expected = value === undefined ? null : json ? JSON.stringify(value) : value
+          if (expected !== row[column]) {
+            throw new SessionLifecycleCorruptError(
+              `legacy mapping metadata/payload mismatch: ${row.key}/${column}`,
+            )
+          }
         }
       }
-    }
-    if (missing) throw new Error("mapping history/encoding mismatch")
-    const expected = new Map<string, string>()
-    const paths = new Map<string, string>()
-    for (const row of metadata) {
+      const expected = new Map<string, string>()
       for (const [slot, value] of [
         ["current", row.current_locator_json],
         ["previous", row.previous_locator_json],
       ]) {
         if (value === null) continue
-        const locator = canonicalizeLocator(JSON.parse(String(value)) as TranscriptLocator, paths)
+        const locator = JSON.parse(String(value)) as TranscriptLocator
+        locators.add(String(value))
         expected.set(
-          JSON.stringify([row.key, slot]),
+          String(slot),
           JSON.stringify([resourceKey(locator), locator.lifecycleGeneration ?? null]),
         )
       }
+      for (const pin of reader.all("SELECT * FROM mapping_pins WHERE mapping_key=?", row.key!)) {
+        if (expected.get(String(pin.slot)) !== JSON.stringify([pin.resource_key, pin.generation])) {
+          throw new SessionLifecycleCorruptError("bookkeeping pin projection mismatch")
+        }
+        expected.delete(String(pin.slot))
+      }
+      if (expected.size) throw new SessionLifecycleCorruptError("bookkeeping pin projection missing")
     }
-    for (const pin of pins) {
-      const key = JSON.stringify([pin.mapping_key, pin.slot])
-      if (expected.get(key) !== JSON.stringify([pin.resource_key, pin.generation]))
-        throw new Error("bookkeeping pin projection mismatch")
-      expected.delete(key)
+    after = String(rows.at(-1)!.key)
+  }
+  if (reader.get(`SELECT p.mapping_key FROM mapping_pins p LEFT JOIN mappings m ON m.key=p.mapping_key
+    WHERE m.key IS NULL LIMIT 1`)) throw new SessionLifecycleCorruptError("orphan bookkeeping pin")
+  return () => {
+    const paths = new Map<string, string>()
+    for (const raw of locators) {
+      const stored = JSON.parse(raw) as TranscriptLocator
+      const canonical = canonicalizeLocator(stored, paths)
+      if (stored.configDir !== canonical.configDir || stored.projectDir !== canonical.projectDir) {
+        throw new BookkeepingMaintenanceRequiredError("transcript realpath changed; run offline recanonicalize")
+      }
     }
-    if (expected.size) throw new Error("bookkeeping pin projection missing")
   }
 }
 

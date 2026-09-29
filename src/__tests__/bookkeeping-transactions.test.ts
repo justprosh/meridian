@@ -16,7 +16,8 @@ import {
   withBookkeepingWriteAsync,
   type BookkeepingHandle,
 } from "../proxy/session/bookkeeping/database"
-import { insertMapping, readMapping } from "../proxy/session/bookkeeping/mappings"
+import { readMapping } from "../proxy/session/bookkeeping/mappings"
+import { insertMapping } from "../proxy/session/bookkeeping/resourceImport"
 import { allocateResource } from "../proxy/session/bookkeeping/resources"
 import { canonicalizeLocator } from "../proxy/session/bookkeeping/locator"
 import { tmpdir } from "node:os"

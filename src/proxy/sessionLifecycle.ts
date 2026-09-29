@@ -1,11 +1,6 @@
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
-import { canonicalizeLocator, resourceKey } from "./session/bookkeeping/locator"
 import { realpathSync } from "node:fs"
-import type {
-  TranscriptLocator, TranscriptResourceState, TranscriptResource, ActiveTranscriptLeaseRecord,
-} from "./session/bookkeeping/types"
-export type { TranscriptLocator, TranscriptResourceState } from "./session/bookkeeping/types"
 import {
   chmod,
   link,
@@ -22,6 +17,14 @@ import {
 import { hostname } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { setTimeout as waitForLockRetry } from "node:timers/promises"
+import {
+  SIDECAR_VERSION, allocateLifecycleGeneration, isRecord, parseLegacySidecar, serializeLegacySidecar,
+} from "./session/bookkeeping/legacyCodec"
+import type { SessionGcSidecar } from "./session/bookkeeping/legacyCodec"
+export { parseLegacySidecar, serializeLegacySidecar } from "./session/bookkeeping/legacyCodec"
+import { canonicalizeLocator, resourceKey } from "./session/bookkeeping/locator"
+import type { TranscriptLocator, TranscriptResource } from "./session/bookkeeping/types"
+export type { TranscriptLocator, TranscriptResourceState } from "./session/bookkeeping/types"
 import { lifecycleLockQueue } from "./session/lifecycleLockQueue"
 import {
   SessionLifecycleError,
@@ -59,8 +62,6 @@ import {
   processIncarnationProbeBudgetMs,
   type ProcessIncarnation,
 } from "./session/processIncarnation"
-
-const SIDECAR_VERSION = 2
 const SIDECAR_NAME = "session-gc.json"
 const DEFAULT_MAX_PENDING = 256
 const DEFAULT_MAX_TOMBSTONES = 256
@@ -81,14 +82,6 @@ const DEFAULT_DELETE_TIMEOUT_MS = 30_000
 // "Nothing to delete" travels as an exit code because child output is clipped,
 // and a Node crash report can bury the verdict. 75 is the gate timeout.
 const SESSION_GC_NOT_FOUND_EXIT_CODE = 69
-
-type LegacyTranscriptResource = Omit<TranscriptResource, "generation">
-
-interface SessionGcSidecar {
-  version: typeof SIDECAR_VERSION
-  meta: { fenceSlots: Record<string, number> }
-  resources: Record<string, TranscriptResource>
-}
 
 export type SessionDeleter = (locator: TranscriptLocator) => Promise<void>
 
@@ -1551,17 +1544,7 @@ async function readSidecar(path: string): Promise<SessionGcSidecar> {
     throw error
   }
 
-  let value: unknown
-  try {
-    value = JSON.parse(raw)
-  } catch (error) {
-    throw new SessionLifecycleCorruptError(`cannot parse ${path}: ${errorMessage(error)}`)
-  }
-  const upgraded = upgradeLegacySidecar(value)
-  if (!isValidSidecar(upgraded)) {
-    throw new SessionLifecycleCorruptError(`invalid or unsupported ${path}`)
-  }
-  return upgraded
+  return parseLegacySidecar(raw, path)
 }
 
 async function writeSidecar(path: string, sidecar: SessionGcSidecar): Promise<void> {
@@ -1571,7 +1554,7 @@ async function writeSidecar(path: string, sidecar: SessionGcSidecar): Promise<vo
     handle = await open(temp, "wx", 0o600)
     // Compact on purpose: machine-read only, and indentation costs ~25% of the
     // bytes and of the serialisation CPU spent under the lock.
-    await handle.writeFile(`${JSON.stringify(sidecar)}\n`, "utf8")
+    await handle.writeFile(serializeLegacySidecar(sidecar), "utf8")
     await handle.sync()
     await handle.close()
     handle = undefined
@@ -1585,115 +1568,6 @@ async function writeSidecar(path: string, sidecar: SessionGcSidecar): Promise<vo
     await unlink(temp).catch(() => undefined)
     throw error
   }
-}
-
-function isValidActiveLeases(value: unknown): value is Record<string, ActiveTranscriptLeaseRecord> {
-  if (!isRecord(value)) return false
-  return Object.entries(value).every(([token, lease]) =>
-    token.length > 0
-    && isRecord(lease)
-    && lease.token === token
-    && parseProcessIncarnation(lease.owner) !== undefined
-    && (lease.purpose === undefined || lease.purpose === "publication")
-    && (lease.purpose !== "publication" || (lease.executor === undefined && lease.executorRecoverable === undefined))
-    && (lease.executor === undefined || parseProcessIncarnation(lease.executor) !== undefined)
-    && (lease.executorRecoverable === undefined || typeof lease.executorRecoverable === "boolean")
-    && (lease.executorRecoverable === undefined || lease.executor !== undefined)
-    && isFiniteNumber(lease.createdAt)
-  )
-}
-
-function fenceSlotForKey(key: string): string {
-  return key.slice(0, 4)
-}
-
-function allocateLifecycleGeneration(sidecar: SessionGcSidecar, key: string): string {
-  const slot = fenceSlotForKey(key)
-  const current = sidecar.meta.fenceSlots[slot] ?? 0
-  if (!Number.isSafeInteger(current) || current < 0 || current === Number.MAX_SAFE_INTEGER) {
-    throw new SessionLifecycleCorruptError(`lifecycle fence slot ${slot} is exhausted or corrupt`)
-  }
-  const next = current + 1
-  sidecar.meta.fenceSlots[slot] = next
-  return `r:${key}:${next}`
-}
-
-function lifecycleGenerationIsValid(value: unknown, key: string): value is string {
-  if (typeof value !== "string") return false
-  const prefix = `r:${key}:`
-  if (!value.startsWith(prefix)) return false
-  const counter = Number(value.slice(prefix.length))
-  return Number.isSafeInteger(counter) && counter > 0
-}
-
-function hasValidTranscriptResourceFields(
-  value: unknown,
-  key: string,
-): value is Record<string, unknown> & LegacyTranscriptResource {
-  if (!/^[a-f0-9]{64}$/.test(key) || !isRecord(value)) return false
-  if (value.key !== key || !isValidLocator(value.locator)) return false
-  if (getTranscriptResourceKey(value.locator) !== key || !isState(value.state)) return false
-  if (!isFiniteNumber(value.createdAt) || !isFiniteNumber(value.updatedAt)) return false
-  if (typeof value.attempts !== "number"
-    || !Number.isSafeInteger(value.attempts)
-    || value.attempts < 0) return false
-  if (value.nextAttemptAt !== undefined && !isFiniteNumber(value.nextAttemptAt)) return false
-  if (value.lastError !== undefined && typeof value.lastError !== "string") return false
-  if (value.deletionToken !== undefined && typeof value.deletionToken !== "string") return false
-  if (value.deletionOwner !== undefined && !parseProcessIncarnation(value.deletionOwner)) return false
-  if (value.deletionExecutor !== undefined && !parseProcessIncarnation(value.deletionExecutor)) return false
-  if (value.deletionProcessGroupId !== undefined && (
-    typeof value.deletionProcessGroupId !== "number"
-    || !Number.isSafeInteger(value.deletionProcessGroupId)
-    || value.deletionProcessGroupId <= 0
-  )) return false
-  // Legacy deleting entries without exact owners/group identity remain permanently fenced.
-  if (value.state !== "deleting" && (
-    value.deletionToken !== undefined
-    || value.deletionOwner !== undefined
-    || value.deletionExecutor !== undefined
-    || value.deletionProcessGroupId !== undefined
-  )) return false
-  if (value.deletionExecutor !== undefined && value.deletionOwner === undefined) return false
-  if (value.deletionProcessGroupId !== undefined && value.deletionExecutor === undefined) return false
-  return value.activeLeases === undefined || isValidActiveLeases(value.activeLeases)
-}
-
-function upgradeLegacySidecar(value: unknown): unknown {
-  if (!isRecord(value) || value.version !== 1 || !isRecord(value.resources)) return value
-  const upgraded: SessionGcSidecar = {
-    version: SIDECAR_VERSION,
-    meta: { fenceSlots: {} },
-    resources: {},
-  }
-  for (const [key, raw] of Object.entries(value.resources)) {
-    if (!hasValidTranscriptResourceFields(raw, key)) return value
-    const generation = allocateLifecycleGeneration(upgraded, key)
-    upgraded.resources[key] = {
-      ...raw,
-      key,
-      generation,
-    }
-  }
-  return upgraded
-}
-
-function isValidSidecar(value: unknown): value is SessionGcSidecar {
-  if (!isRecord(value) || value.version !== SIDECAR_VERSION
-    || !isRecord(value.meta) || !isRecord(value.meta.fenceSlots)
-    || !isRecord(value.resources)) return false
-  const meta = value.meta as { fenceSlots: Record<string, unknown> }
-  if (!Object.entries(meta.fenceSlots).every(([slot, counter]) =>
-    /^[a-f0-9]{4}$/.test(slot)
-    && typeof counter === "number"
-    && Number.isSafeInteger(counter)
-    && counter > 0)) return false
-  return Object.entries(value.resources).every(([key, resource]) => {
-    if (!hasValidTranscriptResourceFields(resource, key)) return false
-    if (!lifecycleGenerationIsValid(resource.generation, key)) return false
-    return Number(meta.fenceSlots[fenceSlotForKey(key)] ?? 0)
-      >= Number(resource.generation.slice(`r:${key}:`.length))
-  })
 }
 
 function assertResourceCapacity(
@@ -1853,21 +1727,7 @@ function pruneTombstones(sidecar: SessionGcSidecar, options: SessionLifecycleOpt
 }
 
 export function canonicalizeTranscriptLocator(locator: TranscriptLocator): TranscriptLocator {
-  return canonicalizeLocator(locator, undefined)
-}
-
-function isValidLocator(value: unknown): value is TranscriptLocator {
-  if (!isRecord(value)) return false
-  return typeof value.sessionId === "string"
-    && value.sessionId.length > 0
-    && typeof value.configDir === "string"
-    && isAbsolute(value.configDir)
-    && (value.projectDir === undefined
-      || (typeof value.projectDir === "string" && isAbsolute(value.projectDir)))
-    && (value.lifecycleGeneration === undefined
-      || (typeof value.lifecycleGeneration === "string" && value.lifecycleGeneration.length > 0))
-    && Object.keys(value).every((key) =>
-      key === "sessionId" || key === "configDir" || key === "projectDir" || key === "lifecycleGeneration")
+  return { ...canonicalizeLocator(locator, undefined) }
 }
 
 function assertSameLocator(left: TranscriptLocator, right: TranscriptLocator): void {
@@ -1876,11 +1736,6 @@ function assertSameLocator(left: TranscriptLocator, right: TranscriptLocator): v
     || left.projectDir !== right.projectDir) {
     throw new SessionLifecycleCorruptError("resource key collision or locator mismatch")
   }
-}
-
-function isState(value: unknown): value is TranscriptResourceState {
-  return value === "prepared" || value === "live" || value === "retired"
-    || value === "deleting" || value === "deleted"
 }
 
 /** The SDK's UUID-specific absence verdict — the only wording either the parent
@@ -1926,14 +1781,6 @@ function errorMessage(error: unknown): string {
 
 function hasCode(error: unknown, code: string): boolean {
   return isRecord(error) && error.code === code
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value)
 }
 
 function nowMs(options: SessionLifecycleOptions): number {

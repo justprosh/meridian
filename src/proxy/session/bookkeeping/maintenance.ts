@@ -1,5 +1,9 @@
 /** MIGRATOR ONLY. This module is not exported by the runtime database facade. */
 import { openHandle } from "./connection"
-export function openForMaintenance(directory: string, options: { expectPhase: string }) {
-  return openHandle(directory, {}, options.expectPhase)
+import type { MaintenanceGuardLease } from "./guard"
+export function openForMaintenance(
+  directory: string,
+  options: { expectPhase: string; guard?: MaintenanceGuardLease },
+) {
+  return openHandle(directory, {}, options.expectPhase, options.guard)
 }

@@ -4,17 +4,18 @@ import { performance } from "node:perf_hooks"
 import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 import {
-  initializeSessionBookkeeping,
+  initializeSessionBookkeepingAsync,
   withBookkeepingWriteAsync,
 } from "../../proxy/session/bookkeeping/database"
 import { SessionLifecycleLockError } from "../../proxy/session/lifecycleErrors"
 
 const directory = process.argv[2]!
 const id = process.argv[3]
+if (id !== undefined) process.once("disconnect", () => process.exit(0))
 let nativeMs = 0,
   maxBeginMs = 0,
   beginAttempts = 0
-const handle = initializeSessionBookkeeping(directory, {
+const handle = await initializeSessionBookkeepingAsync(directory, {
   executeTransaction(db, sql) {
     const start = performance.now()
     try {
@@ -30,7 +31,6 @@ const handle = initializeSessionBookkeeping(directory, {
   },
 })
 if (id !== undefined) {
-  process.once("disconnect", () => process.exit(0))
   const start = new Promise<void>((resolve) => process.once("message", () => resolve()))
   process.send?.("ready")
   await start

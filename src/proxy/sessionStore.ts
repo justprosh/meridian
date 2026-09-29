@@ -1,3 +1,15 @@
+import {
+  STORE_META_VERSION, PRIORITY_STORE_META_VERSION, keyDigest, getStoredSessionGeneration,
+  UUID_PATTERN, emptyStoreDocument, parseStoreDocument, serializeLegacyStore,
+} from "./session/bookkeeping/legacyCodec"
+import type {
+  StoredSessionGeneration, DurablePriorityAssignment, PriorityAssignmentGeneration,
+  DurablePriorityAttempt, SessionStoreMeta, SessionStoreDocument,
+} from "./session/bookkeeping/legacyCodec"
+export { getStoredSessionGeneration, parseStoreDocument, serializeLegacyStore } from "./session/bookkeeping/legacyCodec"
+export type {
+  StoredSessionGeneration, DurablePriorityAssignment, PriorityAssignmentGeneration, DurablePriorityAttempt,
+} from "./session/bookkeeping/legacyCodec"
 /**
  * File-based session store for cross-proxy session resume.
  *
@@ -29,7 +41,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs"
-import { createHash, randomUUID } from "node:crypto"
+import { randomUUID } from "node:crypto"
 import { homedir, hostname } from "node:os"
 import { basename, dirname, isAbsolute, join } from "node:path"
 import {
@@ -55,74 +67,6 @@ import {
 import type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 export type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 
-export type StoredSessionGeneration = string
-
-const STORE_META_KEY = "\u0000meridian-session-store"
-const STORE_META_VERSION = 1
-const PRIORITY_STORE_META_VERSION = 3
-
-export interface DurablePriorityAssignment {
-  profileId: string
-  lastHumanTurnDigest: string
-  /** Monotonic signed issue-time high-water mark for replay suppression. */
-  lastHumanTurnIssuedAt: number
-  mappingKey: string
-  /** Exact mapping generation published atomically with this route. */
-  mappingGeneration: StoredSessionGeneration
-  /** Unique route publication token. Replaced on every route mutation. */
-  generationId: string
-  updatedAt: number
-}
-
-export type PriorityAssignmentGeneration = string
-
-export interface DurablePriorityAttempt {
-  /** A prior exposed or crashed attempt blocks untrusted/same-turn replay. */
-  blocked: boolean
-  blockedTurnDigest: string | null
-  blockedTurnIssuedAt: number | null
-  /** One exact in-flight request owns publication/release for this route. */
-  pendingTurnDigest: string | null
-  pendingTurnIssuedAt: number | null
-  ownerToken: string | null
-  generationId: string
-  updatedAt: number
-}
-
-interface SessionStoreMetaV1 {
-  version: 1
-  /** Fixed hash slots fence absent-key create/delete ABA without unbounded tombstones. */
-  slots: Record<string, number>
-}
-
-interface DurablePriorityRollbackMapping {
-  mappingKey: string
-  /** Exact fallback generation protected until terminal finalization/rollback. */
-  mappingGeneration: StoredSessionGeneration
-}
-
-interface SessionStoreMetaV2 {
-  version: 3
-  /** Shared fixed slots fence both mapping and namespaced route ABA. */
-  slots: Record<string, number>
-  priorityAssignments: Record<string, DurablePriorityAssignment>
-  /** Durable request claims block cross-request replay after committed exposure. */
-  priorityAttempts: Record<string, DurablePriorityAttempt>
-  /** Previous routed mappings retained only until terminal finalization/rollback. */
-  priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping>
-}
-
-type SessionStoreMeta = SessionStoreMetaV1 | SessionStoreMetaV2
-
-interface SessionStoreDocument {
-  sessions: Record<string, StoredSession>
-  meta: SessionStoreMeta
-}
-
-function keyDigest(key: string): string {
-  return createHash("sha256").update(key).digest("hex")
-}
-
 function keySlot(key: string): string {
   // At most 65,536 counters are persisted. A collision can reject safe work,
   // but can never admit stale work because the full key digest is in the token.
@@ -131,16 +75,6 @@ function keySlot(key: string): string {
 
 function absenceGeneration(key: string, meta: SessionStoreMeta): StoredSessionGeneration {
   return `a:${keyDigest(key)}:${meta.slots[keySlot(key)] ?? 0}`
-}
-
-/** Exact, key-bound durable generation used for compare-and-swap fencing. */
-export function getStoredSessionGeneration(
-  session: StoredSession,
-  key: string,
-): StoredSessionGeneration {
-  const generationId = session.generationId
-    ?? `legacy-${createHash("sha256").update(JSON.stringify(session)).digest("hex")}`
-  return `p:${keyDigest(key)}:${generationId}`
 }
 
 function keyGeneration(
@@ -637,289 +571,6 @@ function getDefaultCacheDir(): string {
   return newDir
 }
 
-function isTranscriptLocator(value: unknown, expectedSessionId: string): value is TranscriptLocator {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const locator = value as Record<string, unknown>
-  return locator.sessionId === expectedSessionId
-    && typeof locator.configDir === "string"
-    && isAbsolute(locator.configDir)
-    && (locator.projectDir === undefined
-      || (typeof locator.projectDir === "string" && isAbsolute(locator.projectDir)))
-    && (locator.lifecycleGeneration === undefined
-      || (typeof locator.lifecycleGeneration === "string" && locator.lifecycleGeneration.length > 0))
-}
-
-function validateStoredSession(key: string, value: unknown): asserts value is StoredSession {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`session store entry ${JSON.stringify(key)} must be an object`)
-  }
-  const entry = value as Record<string, unknown>
-  if (typeof entry.claudeSessionId !== "string" || entry.claudeSessionId.length === 0) {
-    throw new Error(`session store entry ${JSON.stringify(key)} has an invalid Claude session ID`)
-  }
-  if (entry.revision !== undefined && (
-    typeof entry.revision !== "number" || !Number.isInteger(entry.revision) || entry.revision < 1
-  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid revision`)
-  if (entry.generationId !== undefined && (
-    typeof entry.generationId !== "string" || entry.generationId.length === 0
-  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid generationId`)
-  for (const field of ["createdAt", "lastUsedAt", "messageCount"] as const) {
-    if (typeof entry[field] !== "number" || !Number.isFinite(entry[field]) || entry[field] < 0) {
-      throw new Error(`session store entry ${JSON.stringify(key)} has invalid ${field}`)
-    }
-  }
-  if (entry.lineageHash !== undefined && typeof entry.lineageHash !== "string") {
-    throw new Error(`session store entry ${JSON.stringify(key)} has invalid lineageHash`)
-  }
-  const stringArrays = ["messageHashes", "passthroughToolCallIds"] as const
-  for (const field of stringArrays) {
-    const item = entry[field]
-    if (item !== undefined && (!Array.isArray(item) || item.some((part) => typeof part !== "string"))) {
-      throw new Error(`session store entry ${JSON.stringify(key)} has invalid ${field}`)
-    }
-  }
-  if (entry.sdkMessageUuids !== undefined && (
-    !Array.isArray(entry.sdkMessageUuids)
-    || entry.sdkMessageUuids.some((part) => part !== null && typeof part !== "string")
-  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid sdkMessageUuids`)
-  if (entry.passthroughToolCallAssistantUuid !== undefined
-    && typeof entry.passthroughToolCallAssistantUuid !== "string") {
-    throw new Error(`session store entry ${JSON.stringify(key)} has invalid passthrough UUID`)
-  }
-  if (entry.previousClaudeSessionId !== undefined && typeof entry.previousClaudeSessionId !== "string") {
-    throw new Error(`session store entry ${JSON.stringify(key)} has invalid previous Claude session ID`)
-  }
-  if (entry.currentTranscript !== undefined
-    && !isTranscriptLocator(entry.currentTranscript, entry.claudeSessionId)) {
-    throw new Error(`session store entry ${JSON.stringify(key)} has invalid current transcript locator`)
-  }
-  if (entry.previousTranscript !== undefined) {
-    if (typeof entry.previousClaudeSessionId !== "string"
-      || !isTranscriptLocator(entry.previousTranscript, entry.previousClaudeSessionId)) {
-      throw new Error(`session store entry ${JSON.stringify(key)} has invalid previous transcript locator`)
-    }
-  }
-}
-
-function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort()
-  const wanted = [...expected].sort()
-  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index])
-}
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-
-function validatePriorityAssignment(routeKey: string, value: unknown): DurablePriorityAssignment {
-  if (!routeKey || routeKey.length > 512 || !value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} is invalid`)
-  }
-  const assignment = value as Record<string, unknown>
-  if (!hasExactObjectKeys(assignment, [
-    "profileId",
-    "lastHumanTurnDigest",
-    "lastHumanTurnIssuedAt",
-    "mappingKey",
-    "mappingGeneration",
-    "generationId",
-    "updatedAt",
-  ])) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has unknown or missing fields`)
-  }
-  if (typeof assignment.profileId !== "string" || !assignment.profileId || assignment.profileId.length > 128) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid profileId`)
-  }
-  if (typeof assignment.lastHumanTurnDigest !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(assignment.lastHumanTurnDigest)) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid human-turn digest`)
-  }
-  if (
-    typeof assignment.lastHumanTurnIssuedAt !== "number"
-    || !Number.isSafeInteger(assignment.lastHumanTurnIssuedAt)
-    || assignment.lastHumanTurnIssuedAt < 0
-  ) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid human-turn issue time`)
-  }
-  if (typeof assignment.mappingKey !== "string" || !assignment.mappingKey || assignment.mappingKey.length > 1_024) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid mappingKey`)
-  }
-  const expectedMappingPrefix = typeof assignment.mappingKey === "string"
-    ? `p:${keyDigest(assignment.mappingKey)}:`
-    : ""
-  if (
-    typeof assignment.mappingGeneration !== "string"
-    || !assignment.mappingGeneration.startsWith(expectedMappingPrefix)
-    || !UUID_PATTERN.test(assignment.mappingGeneration.slice(expectedMappingPrefix.length))
-  ) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid mapping generation`)
-  }
-  if (typeof assignment.generationId !== "string" || !UUID_PATTERN.test(assignment.generationId)) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid generationId`)
-  }
-  if (
-    typeof assignment.updatedAt !== "number"
-    || !Number.isSafeInteger(assignment.updatedAt)
-    || assignment.updatedAt < 0
-  ) {
-    throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid updatedAt`)
-  }
-  return {
-    profileId: assignment.profileId,
-    lastHumanTurnDigest: assignment.lastHumanTurnDigest,
-    lastHumanTurnIssuedAt: assignment.lastHumanTurnIssuedAt,
-    mappingKey: assignment.mappingKey,
-    mappingGeneration: assignment.mappingGeneration,
-    generationId: assignment.generationId,
-    updatedAt: assignment.updatedAt,
-  }
-}
-
-function validatePriorityAttempt(routeKey: string, value: unknown): DurablePriorityAttempt {
-  if (!routeKey || routeKey.length > 512 || !value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} is invalid`)
-  }
-  const attempt = value as Record<string, unknown>
-  if (!hasExactObjectKeys(attempt, [
-    "blocked",
-    "blockedTurnDigest",
-    "blockedTurnIssuedAt",
-    "pendingTurnDigest",
-    "pendingTurnIssuedAt",
-    "ownerToken",
-    "generationId",
-    "updatedAt",
-  ])) throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has unknown or missing fields`)
-  const validDigest = (digest: unknown): digest is string | null => (
-    digest === null || (typeof digest === "string" && /^[A-Za-z0-9_-]{43}$/.test(digest))
-  )
-  const validIssuedAt = (issuedAt: unknown): issuedAt is number | null => (
-    issuedAt === null || (typeof issuedAt === "number" && Number.isSafeInteger(issuedAt) && issuedAt >= 0)
-  )
-  if (typeof attempt.blocked !== "boolean"
-    || !validDigest(attempt.blockedTurnDigest)
-    || !validIssuedAt(attempt.blockedTurnIssuedAt)
-    || !validDigest(attempt.pendingTurnDigest)
-    || !validIssuedAt(attempt.pendingTurnIssuedAt)
-    || (attempt.blockedTurnDigest === null) !== (attempt.blockedTurnIssuedAt === null)
-    || (attempt.pendingTurnDigest === null) !== (attempt.pendingTurnIssuedAt === null)
-    || (attempt.ownerToken !== null && (typeof attempt.ownerToken !== "string" || !UUID_PATTERN.test(attempt.ownerToken)))
-    || (attempt.ownerToken === null && attempt.pendingTurnDigest !== null)
-    || (!attempt.blocked && attempt.ownerToken === null)) {
-    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid state`)
-  }
-  if (typeof attempt.generationId !== "string" || !UUID_PATTERN.test(attempt.generationId)) {
-    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid generationId`)
-  }
-  if (typeof attempt.updatedAt !== "number" || !Number.isSafeInteger(attempt.updatedAt) || attempt.updatedAt < 0) {
-    throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid updatedAt`)
-  }
-  return {
-    blocked: attempt.blocked,
-    blockedTurnDigest: attempt.blockedTurnDigest,
-    blockedTurnIssuedAt: attempt.blockedTurnIssuedAt,
-    pendingTurnDigest: attempt.pendingTurnDigest,
-    pendingTurnIssuedAt: attempt.pendingTurnIssuedAt,
-    ownerToken: attempt.ownerToken,
-    generationId: attempt.generationId,
-    updatedAt: attempt.updatedAt,
-  }
-}
-
-function emptyStoreDocument(): SessionStoreDocument {
-  return { sessions: {}, meta: { version: STORE_META_VERSION, slots: {} } }
-}
-
-function validateStoreMeta(value: unknown): SessionStoreMeta {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("session store metadata must be an object")
-  }
-  const meta = value as Record<string, unknown> & {
-    version?: unknown
-    slots?: unknown
-    priorityAssignments?: unknown
-    priorityAttempts?: unknown
-    priorityRollbackMappings?: unknown
-  }
-  if (
-    (meta.version !== STORE_META_VERSION && meta.version !== PRIORITY_STORE_META_VERSION)
-    || typeof meta.slots !== "object"
-    || meta.slots === null
-    || Array.isArray(meta.slots)
-  ) {
-    throw new Error("session store metadata has an unsupported format")
-  }
-  for (const [slot, counter] of Object.entries(meta.slots)) {
-    if (!/^[0-9a-f]{4}$/.test(slot) || typeof counter !== "number" || !Number.isSafeInteger(counter) || counter < 0) {
-      throw new Error(`session store metadata has invalid generation slot ${JSON.stringify(slot)}`)
-    }
-  }
-  const slots = { ...(meta.slots as Record<string, number>) }
-  if (meta.version === STORE_META_VERSION) {
-    if (!hasExactObjectKeys(meta, ["version", "slots"])) {
-      throw new Error("session store v1 metadata has unknown or missing fields")
-    }
-    return { version: STORE_META_VERSION, slots }
-  }
-  if (!hasExactObjectKeys(meta, ["version", "slots", "priorityAssignments", "priorityAttempts", "priorityRollbackMappings"])) {
-    throw new Error("session store v3 metadata has unknown or missing fields")
-  }
-  if (
-    typeof meta.priorityAssignments !== "object"
-    || meta.priorityAssignments === null
-    || Array.isArray(meta.priorityAssignments)
-  ) throw new Error("session store v3 metadata has invalid priority assignments")
-  if (
-    typeof meta.priorityAttempts !== "object"
-    || meta.priorityAttempts === null
-    || Array.isArray(meta.priorityAttempts)
-  ) throw new Error("session store v3 metadata has invalid priority attempts")
-  if (
-    typeof meta.priorityRollbackMappings !== "object"
-    || meta.priorityRollbackMappings === null
-    || Array.isArray(meta.priorityRollbackMappings)
-  ) throw new Error("session store v3 metadata has invalid priority rollback mappings")
-  const priorityAssignments: Record<string, DurablePriorityAssignment> = {}
-  for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
-    priorityAssignments[routeKey] = validatePriorityAssignment(routeKey, assignment)
-  }
-  const priorityAttempts: Record<string, DurablePriorityAttempt> = {}
-  for (const [routeKey, attempt] of Object.entries(meta.priorityAttempts)) {
-    priorityAttempts[routeKey] = validatePriorityAttempt(routeKey, attempt)
-  }
-  const priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping> = {}
-  for (const [routeKey, value] of Object.entries(meta.priorityRollbackMappings)) {
-    if (!priorityAssignments[routeKey] || !value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
-    }
-    const rollback = value as Record<string, unknown>
-    if (
-      !hasExactObjectKeys(rollback, ["mappingKey", "mappingGeneration"])
-      || typeof rollback.mappingKey !== "string"
-      || !rollback.mappingKey
-      || rollback.mappingKey.length > 1_024
-    ) {
-      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
-    }
-    const expectedMappingPrefix = `p:${keyDigest(rollback.mappingKey)}:`
-    if (
-      typeof rollback.mappingGeneration !== "string"
-      || !rollback.mappingGeneration.startsWith(expectedMappingPrefix)
-      || !UUID_PATTERN.test(rollback.mappingGeneration.slice(expectedMappingPrefix.length))
-    ) {
-      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has invalid mapping generation`)
-    }
-    priorityRollbackMappings[routeKey] = {
-      mappingKey: rollback.mappingKey,
-      mappingGeneration: rollback.mappingGeneration,
-    }
-  }
-  return {
-    version: PRIORITY_STORE_META_VERSION,
-    slots,
-    priorityAssignments,
-    priorityAttempts,
-    priorityRollbackMappings,
-  }
-}
-
 interface StoreDocumentCache {
   path: string
   ino: number
@@ -984,40 +635,6 @@ function readStoreDocumentStrict(path: string): SessionStoreDocument {
   return parseStoreDocument(data)
 }
 
-/** Parse and validate raw store bytes, for both the strict and the cached read. */
-function parseStoreDocument(data: string): SessionStoreDocument {
-  const parsed: unknown = JSON.parse(data)
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("session store must contain a JSON object")
-  }
-  const sessions: Record<string, StoredSession> = {}
-  let meta: SessionStoreMeta = { version: STORE_META_VERSION, slots: {} }
-  for (const [key, value] of Object.entries(parsed)) {
-    if (key === STORE_META_KEY) {
-      meta = validateStoreMeta(value)
-      continue
-    }
-    validateStoredSession(key, value)
-    sessions[key] = value as StoredSession
-  }
-  if (meta.version === PRIORITY_STORE_META_VERSION) {
-    for (const [routeKey, rollback] of Object.entries(meta.priorityRollbackMappings)) {
-      const assignment = meta.priorityAssignments[routeKey]!
-      const mapping = sessions[rollback.mappingKey]
-      if (!mapping) {
-        throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has no retained mapping`)
-      }
-      if (rollback.mappingKey === assignment.mappingKey) {
-        throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} aliases its current mapping`)
-      }
-      if (getStoredSessionGeneration(mapping, rollback.mappingKey) !== rollback.mappingGeneration) {
-        throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has a stale mapping generation`)
-      }
-    }
-  }
-  return { sessions, meta }
-}
-
 function readStoreStrict(path: string): Record<string, StoredSession> {
   return readStoreDocumentCached(path).sessions
 }
@@ -1074,10 +691,9 @@ function writeStore(path: string, document: SessionStoreDocument): void {
   try {
     fd = openSync(tmp, "wx", 0o600)
     fchmodSync(fd, 0o600)
-    const serialized = { [STORE_META_KEY]: document.meta, ...document.sessions }
     // Compact on purpose: machine-read only, and indentation costs ~20% of the
     // bytes and of the stringify CPU on a large store.
-    writeFileSync(fd, JSON.stringify(serialized), "utf8")
+    writeFileSync(fd, serializeLegacyStore(document), "utf8")
     fsyncSync(fd)
     closeSync(fd)
     fd = undefined

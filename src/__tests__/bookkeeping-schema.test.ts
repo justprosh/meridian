@@ -21,7 +21,6 @@ import {
 } from "../proxy/session/bookkeeping/database"
 import {
   compareAndSwapMapping,
-  insertMapping,
   LOOKUP_CLAUDE_SQL,
   PIN_LOOKUP_SQL,
   readMapping,
@@ -38,6 +37,7 @@ import {
   RETIRED_PAGE_SQL,
 } from "../proxy/session/bookkeeping/resources"
 import { importResource as insertResource } from "../proxy/session/bookkeeping/resourceImport"
+import { insertMapping } from "../proxy/session/bookkeeping/resourceImport"
 import { canonicalizeLocator, resourceKey } from "../proxy/session/bookkeeping/locator"
 import { tmpdir } from "node:os"
 import { RESOURCE_STATES } from "../proxy/session/bookkeeping/schema"

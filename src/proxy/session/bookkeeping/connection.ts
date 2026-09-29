@@ -3,32 +3,39 @@ import {
   constants,
   closeSync,
   existsSync,
-  fchmodSync,
-  fstatSync,
   fsyncSync,
   linkSync,
   mkdirSync,
   openSync,
-  readdirSync,
   realpathSync,
   statfsSync,
-  unlinkSync,
 } from "node:fs"
-import { randomUUID } from "node:crypto"
+import { cleanupBootstrapOrphans, createBootstrapPath, finishBootstrap } from "./bootstrapOwner"
 import { setTimeout as delay } from "node:timers/promises"
-import { dirname, join, resolve } from "node:path"
-import { syncDirectoryDurablySync } from "../durableFileSystem"
-import { SessionLifecycleCorruptError, SessionLifecycleLockError } from "../lifecycleErrors"
+import { join, resolve } from "node:path"
+import { SessionLifecycleCorruptError } from "../lifecycleErrors"
+import {
+  BookkeepingBusyError, BookkeepingMaintenanceRequiredError, errorCode, ownedFd, assertSupportedFilesystem,
+} from "./storagePaths"
+export { BookkeepingBusyError, errorCode, assertSupportedFilesystem } from "./storagePaths"
+export { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { initializeBookkeepingSchema, validateBookkeepingSchema, pragmaValue } from "./schema"
 import { captureMappingPinsValidation } from "./mappings"
 import { validateResourceRows } from "./resources"
+import {
+  acquireMaintenanceGuard,
+  acquireRuntimeGuard,
+  assertGuardLease,
+  assertGuardHeld,
+  retainGuardLease,
+} from "./guard"
+import type { GuardLease, MaintenanceGuardLease } from "./guard"
 import type { BookkeepingReader, SqlRow, SqlValue } from "./types"
 
 export const BOOKKEEPING_FILENAME = "session-bookkeeping.sqlite"
-export class BookkeepingBusyError extends SessionLifecycleLockError {}
-export class BookkeepingMaintenanceRequiredError extends SessionLifecycleCorruptError {}
 export interface BookkeepingInitializeOptions {
   executeTransaction?: (db: Database.Database, sql: string) => void
+  closeDatabase?: (db: Database.Database) => void
 }
 export interface Connection {
   db?: Database.Database
@@ -38,14 +45,17 @@ export interface Connection {
   scope: "read" | "write" | undefined
   poisoned?: boolean
   phase: string
+  guard: GuardLease
+  ownsGuard: boolean
+  maintenance: boolean
+  releaseGuardReference: () => void
   executeTransaction?: BookkeepingInitializeOptions["executeTransaction"]
+  closeDatabase?: BookkeepingInitializeOptions["closeDatabase"]
 }
 const registry = new Map<string, Connection>()
 const directories = new Map<string, string>()
+const terminal = new Map<string, unknown>()
 
-export function errorCode(error: unknown): string | undefined {
-  return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined
-}
 export function busy(error: unknown): boolean {
   return /^(SQLITE_BUSY|SQLITE_LOCKED)(_|$)/.test(errorCode(error) ?? "")
 }
@@ -64,54 +74,6 @@ export function getBookkeepingLockWaitMs(env: NodeJS.ProcessEnv = process.env): 
   )
 }
 
-export function assertSupportedFilesystem(type: number, platform = process.platform): void {
-  const APFS = 26,
-    HFS = 17,
-    EXT = 0xef53,
-    XFS = 0x58465342,
-    BTRFS = 0x9123683e,
-    TMPFS = 0x01021994
-  const allowed = platform === "darwin" ? [APFS, HFS] : platform === "linux" ? [EXT, XFS, BTRFS, TMPFS] : []
-  if (!allowed.includes(type >>> 0) && process.env.BOOKKEEPING_ALLOW_UNVERIFIED_FS !== "1") {
-    throw new Error(
-      `unsupported bookkeeping filesystem ${platform}/${type}; ` +
-        "operator may explicitly set BOOKKEEPING_ALLOW_UNVERIFIED_FS=1",
-    )
-  }
-}
-
-function ownedFd(path: string, directory = false, bootstrapLink = false): number {
-  let fd: number
-  try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-  } catch (error) {
-    if (errorCode(error) === "ELOOP") throw new Error(`not an owned regular path: ${path}`, { cause: error })
-    throw error
-  }
-  try {
-    const stat = fstatSync(fd)
-    if (!directory && stat.isFile() && stat.nlink === 2 && path.endsWith(BOOKKEEPING_FILENAME)) {
-      throw new BookkeepingBusyError("bootstrap publication is unlinking its temporary name")
-    }
-    const linksOkay = stat.nlink === 1 || (bootstrapLink && stat.nlink === 2)
-    if (
-      (directory ? !stat.isDirectory() : !stat.isFile() || !linksOkay) ||
-      (process.getuid && stat.uid !== process.getuid())
-    )
-      throw new Error(`not an owned regular path: ${path}`)
-    if (directory) {
-      if ((stat.mode & 0o777) !== 0o700)
-        throw new Error(`bookkeeping directory must already be private (0700): ${path}`)
-    } else {
-      fchmodSync(fd, 0o600)
-      if ((fstatSync(fd).mode & 0o777) !== 0o600) throw new Error(`bookkeeping file permissions: ${path}`)
-    }
-    return fd
-  } catch (error) {
-    closeSync(fd)
-    throw error
-  }
-}
 function checkFiles(path: string): void {
   for (const suffix of ["", "-wal", "-shm", "-journal"]) {
     try {
@@ -122,15 +84,26 @@ function checkFiles(path: string): void {
     }
   }
 }
-export function closeNative(db: Database.Database): void {
+export function closeNative(
+  db: Database.Database,
+  close: (value: Database.Database) => void = (value) => { value.close() },
+): void {
   try {
     if (db.inTransaction) db.exec("ROLLBACK")
   } finally {
-    db.close()
+    try {
+      close(db)
+    } catch (cause) {
+      throw new BookkeepingMaintenanceRequiredError("native close failed; restart process before maintenance", {
+        cause,
+      })
+    }
   }
 }
 export function database(connection: Connection): Database.Database {
+  assertNotTerminal(connection.path)
   if (!connection.db) throw new Error("bookkeeping connection is closed")
+  assertGuardHeld(connection.guard, connection.maintenance ? "exclusive" : "shared")
   return connection.db
 }
 export function checkParameters(parameters: SqlValue[]): void {
@@ -145,6 +118,7 @@ export function getRow(db: Database.Database, sql: string, parameters: SqlValue[
   return row
 }
 export function assertRead(sql: string): void {
+  assertSingleStatement(sql)
   const pragmas =
     "journal_mode|synchronous|foreign_keys|busy_timeout|wal_autocheckpoint|user_version|application_id"
   if (
@@ -153,6 +127,9 @@ export function assertRead(sql: string): void {
   ) {
     throw new Error("bookkeeping reader cannot mutate")
   }
+}
+export function assertSingleStatement(sql: string): void {
+  if (/;\s*\S/.test(sql)) throw new Error("multiple SQL statements are forbidden")
 }
 function pragmas(db: Database.Database, journal: "WAL" | "DELETE"): void {
   const values = [
@@ -168,65 +145,29 @@ function pragmas(db: Database.Database, journal: "WAL" | "DELETE"): void {
   }
 }
 
-function cleanupOrphans(path: string): void {
-  const directory = dirname(path)
-  for (const name of readdirSync(directory)) {
-    const match = /^session-bookkeeping\.sqlite\.tmp-(\d+)-[a-f0-9-]+$/.exec(name)
-    if (!match) continue
-    try {
-      process.kill(Number(match[1]), 0)
-      continue
-    } catch (error) {
-      if (errorCode(error) !== "ESRCH") continue
-    }
-    const temporary = join(directory, name)
-    try {
-      const fd = ownedFd(temporary, false, true)
-      try {
-        const stat = fstatSync(fd)
-        if (stat.nlink === 2) {
-          const main = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-          try {
-            const target = fstatSync(main)
-            if (target.ino !== stat.ino || target.dev !== stat.dev)
-              throw new Error("foreign bootstrap hardlink")
-          } finally {
-            closeSync(main)
-          }
-        }
-        unlinkSync(temporary)
-      } finally {
-        closeSync(fd)
-      }
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") continue
-      throw error
-    }
-    for (const suffix of ["-journal", "-wal", "-shm"]) {
-      try {
-        closeSync(ownedFd(temporary + suffix))
-        unlinkSync(temporary + suffix)
-      } catch (error) {
-        if (errorCode(error) !== "ENOENT") throw error
-      }
-    }
-  }
-}
-
 function bootstrap(path: string): void {
-  cleanupOrphans(path)
+  cleanupBootstrapOrphans(path)
   if (existsSync(path)) return
-  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`
+  const temporary = createBootstrapPath(path)
   closeSync(openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600))
   let db: Database.Database | undefined
+  const close = () => {
+    const owned = db
+    db = undefined
+    try {
+      if (owned) closeNative(owned)
+    } catch (error) {
+      if (error instanceof BookkeepingMaintenanceRequiredError) terminal.set(path, error)
+      throw error
+    }
+  }
   try {
     db = new Database(temporary)
     pragmas(db, "DELETE")
     db.exec("BEGIN IMMEDIATE")
     initializeBookkeepingSchema(db, true)
     db.exec("COMMIT")
-    closeNative(db)
-    db = undefined
+    close()
     const fd = ownedFd(temporary)
     try {
       fsyncSync(fd)
@@ -239,9 +180,8 @@ function bootstrap(path: string): void {
       if (errorCode(error) !== "EEXIST") throw error
     }
   } finally {
-    if (db) closeNative(db)
-    unlinkSync(temporary)
-    syncDirectoryDurablySync(dirname(path))
+    close()
+    if (!terminal.has(path)) finishBootstrap(temporary)
   }
 }
 
@@ -266,14 +206,19 @@ function openDatabase(path: string, phase: string, full: boolean): Database.Data
     }
     db.exec("COMMIT")
     validatePins?.()
-    checkFiles(path)
     return db
   } catch (error) {
-    closeNative(db)
+    try {
+      closeNative(db)
+    } catch (closeError) {
+      if (closeError instanceof BookkeepingMaintenanceRequiredError) terminal.set(path, closeError)
+      throw new AggregateError([error, closeError], "bookkeeping startup cleanup failed")
+    }
     throw error
   }
 }
 export function recover(connection: Connection): void {
+  assertNotTerminal(connection.path)
   if (!connection.poisoned) return
   connection.db = openDatabase(connection.path, connection.phase, false)
   connection.poisoned = false
@@ -283,9 +228,17 @@ export function poison(connection: Connection): unknown | undefined {
   const db = connection.db
   connection.db = undefined
   try {
-    if (db) closeNative(db)
+    if (db) closeNative(db, connection.closeDatabase)
   } catch (error) {
+    if (error instanceof BookkeepingMaintenanceRequiredError) terminal.set(connection.path, error)
     return error
+  }
+}
+function assertNotTerminal(path: string): void {
+  if (terminal.has(path)) {
+    throw new BookkeepingMaintenanceRequiredError("native close failed; restart process before maintenance", {
+      cause: terminal.get(path),
+    })
   }
 }
 export function executeTransaction(connection: Connection, sql: string): void {
@@ -314,6 +267,7 @@ export function openHandle(
   directory: string,
   options: BookkeepingInitializeOptions = {},
   expectPhase?: string,
+  maintenanceGuard?: MaintenanceGuardLease,
 ): BookkeepingHandle {
   if ([...registry.values()].some((connection) => connection.scope)) {
     throw new Error("cannot initialize bookkeeping inside a transaction")
@@ -323,22 +277,42 @@ export function openHandle(
   closeSync(ownedFd(canonical, true))
   assertSupportedFilesystem(Number(statfsSync(canonical).type))
   const path = join(canonical, BOOKKEEPING_FILENAME)
+  assertNotTerminal(path)
   let connection = registry.get(path)
   if (connection) {
-    if (options.executeTransaction) throw new Error("cannot change executor on an already open connection")
+    if (connection.maintenance !== (expectPhase !== undefined)) {
+      throw new BookkeepingBusyError("stop all proxies before maintenance; incompatible main handle is open")
+    }
+    if (expectPhase !== undefined && maintenanceGuard !== connection.guard) {
+      throw new BookkeepingBusyError("maintenance main handle requires its owning guard lease")
+    }
+    if (options.executeTransaction || options.closeDatabase)
+      throw new Error("cannot change executor on an already open connection")
     if (connection.scope) throw new Error("cannot initialize bookkeeping inside a transaction")
     if (connection.phase !== (expectPhase ?? "READY"))
       throw new BookkeepingMaintenanceRequiredError("phase mismatch")
   } else {
-    if (expectPhase === undefined) {
-      for (const name of ["sessions.json", "session-gc.json", "sessions.json.lock", "session-gc.json.lock"]) {
-        if (existsSync(join(canonical, name))) {
-          throw new BookkeepingMaintenanceRequiredError("legacy bookkeeping requires offline migration")
-        }
-      }
-      bootstrap(path)
-    }
+    const guard =
+      maintenanceGuard ??
+      (expectPhase === undefined ? acquireRuntimeGuard(canonical) : acquireMaintenanceGuard(canonical))
+    const ownsGuard = maintenanceGuard === undefined
+    let releaseGuardReference: (() => void) | undefined
     try {
+      assertGuardLease(guard, canonical, expectPhase === undefined ? "shared" : "exclusive")
+      releaseGuardReference = retainGuardLease(guard, expectPhase === undefined ? "shared" : "exclusive")
+      if (expectPhase === undefined) {
+        for (const name of [
+          "sessions.json",
+          "session-gc.json",
+          "sessions.json.lock",
+          "session-gc.json.lock",
+        ]) {
+          if (existsSync(join(canonical, name))) {
+            throw new BookkeepingMaintenanceRequiredError("legacy bookkeeping requires offline migration")
+          }
+        }
+        bootstrap(path)
+      }
       const db = openDatabase(path, expectPhase ?? "READY", true)
       connection = {
         db,
@@ -347,14 +321,23 @@ export function openHandle(
         pending: 0,
         scope: undefined,
         phase: expectPhase ?? "READY",
+        guard,
+        ownsGuard,
+        maintenance: expectPhase !== undefined,
+        releaseGuardReference,
         executeTransaction: options.executeTransaction,
+        closeDatabase: options.closeDatabase,
       }
       registry.set(path, connection)
     } catch (error) {
+      if (terminal.has(path)) throw error
+      releaseGuardReference?.()
+      if (ownsGuard) guard.close()
       if (error instanceof BookkeepingBusyError || busy(error)) {
         throw new BookkeepingBusyError("bookkeeping startup busy; retry admission", { cause: error })
       }
-      if (error instanceof SessionLifecycleCorruptError) throw error
+      if (error instanceof SessionLifecycleCorruptError || error instanceof BookkeepingMaintenanceRequiredError)
+        throw error
       throw new SessionLifecycleCorruptError(`bookkeeping startup failed: ${String(error)}`, { cause: error })
     }
   }
@@ -388,11 +371,24 @@ export function openHandle(
       const closing = owned
       owned = undefined
       if (--closing.refs === 0) {
+        assertNotTerminal(path)
         const db = closing.db
+        let rollbackError: unknown
+        try {
+          if (db) closeNative(db, closing.closeDatabase)
+        } catch (error) {
+          if (error instanceof BookkeepingMaintenanceRequiredError) {
+            terminal.set(path, error)
+            throw error
+          }
+          rollbackError = error
+        }
         closing.db = undefined
         registry.delete(path)
         for (const [alias, target] of directories) if (target === path) directories.delete(alias)
-        if (db) closeNative(db)
+        closing.releaseGuardReference()
+        if (closing.ownsGuard) closing.guard.close()
+        if (rollbackError) throw rollbackError
       }
     },
   }

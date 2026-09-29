@@ -3,9 +3,13 @@ import { realpathSync } from "node:fs"
 import { isAbsolute, resolve } from "node:path"
 
 export interface TranscriptLocator {
+  /** Physical Claude transcript session ID, not a client conversation key. */
   sessionId: string
+  /** Absolute profile config directory; canonical SQL writers resolve realpath before admission. */
   configDir: string
+  /** Optional absolute project directory used by the transcript locator. */
   projectDir?: string
+  /** Exact lifecycle generation; absent means a conservative pin across generations. */
   lifecycleGeneration?: string
 }
 
@@ -60,12 +64,12 @@ export function canonicalizeLocator(
     realpaths?.set(lexical, result)
     return result
   }
-  return {
+  return Object.freeze({
     sessionId: locator.sessionId,
     configDir: path(locator.configDir),
     ...(locator.projectDir ? { projectDir: path(locator.projectDir) } : {}),
     ...(locator.lifecycleGeneration ? { lifecycleGeneration: locator.lifecycleGeneration } : {}),
-  } as CanonicalTranscriptLocator
+  }) as CanonicalTranscriptLocator
 }
 
 /** Decode already-canonical persisted metadata; realpath drift requires offline recanonicalize. */
@@ -77,5 +81,5 @@ export function persistedCanonicalLocator(locator: TranscriptLocator): Canonical
   ) {
     throw new TypeError("noncanonical persisted locator")
   }
-  return locator as CanonicalTranscriptLocator
+  return Object.freeze({ ...locator }) as CanonicalTranscriptLocator
 }
