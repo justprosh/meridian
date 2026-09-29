@@ -753,6 +753,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // No lease a live request holds can outlive the turn watchdog.
     unarmedLeaseTtlMs: SESSION_TURN_MAX_HOLD_MS + 60_000,
     deletionTimeoutMs: Math.max(1_000, envInt("SESSION_GC_DELETE_TIMEOUT_MS", 30_000)),
+    // Executor handshake (durable attach under the sidecar lock) gets its own
+    // budget so a FIFO wait can never eat the deletion budget it fences.
+    deletionHandshakeTimeoutMs: Math.max(1_000, envInt("SESSION_GC_HANDSHAKE_TIMEOUT_MS", 30_000)),
     runTimeoutMs: Math.max(1_000, envInt("SESSION_GC_RUN_TIMEOUT_MS", 30_000)),
   }
   let sessionGcRunning: Promise<void> | undefined
