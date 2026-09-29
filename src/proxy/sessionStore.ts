@@ -52,47 +52,8 @@ import {
   type ProcessIncarnation,
 } from "./session/processIncarnation"
 
-export interface TranscriptLocator {
-  sessionId: string
-  configDir: string
-  projectDir?: string
-  /** Opaque lifecycle ownership fence; absent only on legacy mappings. */
-  lifecycleGeneration?: string
-}
-
-export interface StoredSession {
-  claudeSessionId: string
-  /** Monotonic per-entry revision retained for diagnostics and upgrades. */
-  revision?: number
-  /** Unique publication token. Replaced on every durable mapping mutation. */
-  generationId?: string
-  createdAt: number
-  lastUsedAt: number
-  messageCount: number
-  /** Hash of messages[0..messageCount-1] for conversation lineage verification */
-  lineageHash?: string
-  /** Per-message content hashes for precise diff-based compaction detection */
-  messageHashes?: string[]
-  /** Per-message hashes of individual content blocks for append-only tool results */
-  messageBlockHashes?: string[][]
-  /** Per-message SDK assistant UUIDs for undo rollback (null for user messages) */
-  sdkMessageUuids?: Array<string | null>
-  /** SDK assistant UUID immediately before synthetic passthrough denials.
-   *  Continuations resume the same session here, preserving the stable prefix. */
-  passthroughToolCallAssistantUuid?: string
-  /** Forwarded tool IDs pending at the stored assistant checkpoint. */
-  passthroughToolCallIds?: string[]
-  /** Last observed token usage for this Claude session */
-  contextUsage?: TokenUsage
-  /** Previous Claude session ID preserved when the session mapping is replaced.
-   *  Enables recovery when a lineage bug (e.g. false compaction) causes the
-   *  original session to be abandoned and a new one started. */
-  previousClaudeSessionId?: string
-  /** Exact transcript location for the current Claude session. */
-  currentTranscript?: TranscriptLocator
-  /** Transcript location retained when the session mapping is replaced. */
-  previousTranscript?: TranscriptLocator
-}
+import type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
+export type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 
 export type StoredSessionGeneration = string
 

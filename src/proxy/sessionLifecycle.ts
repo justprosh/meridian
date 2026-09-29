@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
+import { canonicalizeLocator, resourceKey } from "./session/bookkeeping/locator"
 import { realpathSync } from "node:fs"
+import type {
+  TranscriptLocator, TranscriptResourceState, TranscriptResource, ActiveTranscriptLeaseRecord,
+} from "./session/bookkeeping/types"
+export type { TranscriptLocator, TranscriptResourceState } from "./session/bookkeeping/types"
 import {
   chmod,
   link,
@@ -77,45 +82,6 @@ const DEFAULT_DELETE_TIMEOUT_MS = 30_000
 // and a Node crash report can bury the verdict. 75 is the gate timeout.
 const SESSION_GC_NOT_FOUND_EXIT_CODE = 69
 
-export interface TranscriptLocator {
-  sessionId: string
-  /** The absolute CLAUDE_CONFIG_DIR which owns this transcript. */
-  configDir: string
-  /** SDK project directory, passed as deleteSession(..., { dir }). */
-  projectDir?: string
-  /** Opaque physical-ownership fence. Omitted only on legacy store locators. */
-  lifecycleGeneration?: string
-}
-
-export type TranscriptResourceState = "prepared" | "live" | "retired" | "deleting" | "deleted"
-
-interface ActiveTranscriptLeaseRecord {
-  token: string
-  owner: ProcessIncarnation
-  /** Absent on SDK writer leases, including all legacy records. */
-  purpose?: "publication"
-  executor?: ProcessIncarnation
-  executorRecoverable?: boolean
-  createdAt: number
-}
-
-interface TranscriptResource {
-  key: string
-  generation: string
-  locator: TranscriptLocator
-  state: TranscriptResourceState
-  createdAt: number
-  updatedAt: number
-  attempts: number
-  nextAttemptAt?: number
-  lastError?: string
-  deletionToken?: string
-  deletionOwner?: ProcessIncarnation
-  deletionExecutor?: ProcessIncarnation
-  deletionProcessGroupId?: number
-  activeLeases?: Record<string, ActiveTranscriptLeaseRecord>
-}
-
 type LegacyTranscriptResource = Omit<TranscriptResource, "generation">
 
 interface SessionGcSidecar {
@@ -181,12 +147,7 @@ export interface GcResult {
 
 /** Stable ownership key. The separator prevents ambiguous concatenation. */
 export function getTranscriptResourceKey(locator: TranscriptLocator): string {
-  validateLocator(locator)
-  return createHash("sha256")
-    .update(locator.configDir)
-    .update("\0")
-    .update(locator.sessionId)
-    .digest("hex")
+  return resourceKey(locator)
 }
 
 function physicalLocator(locator: TranscriptLocator): TranscriptLocator {
@@ -1891,54 +1852,8 @@ function pruneTombstones(sidecar: SessionGcSidecar, options: SessionLifecycleOpt
   for (const resource of tombstones.slice(maximum)) delete sidecar.resources[resource.key]
 }
 
-function canonicalLocatorPath(path: string, realpaths: Map<string, string> | undefined): string {
-  const lexical = resolve(path)
-  const known = realpaths?.get(lexical)
-  if (known !== undefined) return known
-  let canonical: string
-  try {
-    canonical = realpathSync.native(lexical)
-  } catch (error) {
-    if (!hasCode(error, "ENOENT")) throw error
-    canonical = lexical
-  }
-  realpaths?.set(lexical, canonical)
-  return canonical
-}
-
 export function canonicalizeTranscriptLocator(locator: TranscriptLocator): TranscriptLocator {
   return canonicalizeLocator(locator, undefined)
-}
-
-/** `realpaths` memoises resolution across one batch; its pins share a few directories. */
-function canonicalizeLocator(
-  locator: TranscriptLocator,
-  realpaths: Map<string, string> | undefined,
-): TranscriptLocator {
-  validateLocator(locator)
-  return {
-    sessionId: locator.sessionId,
-    configDir: canonicalLocatorPath(locator.configDir, realpaths),
-    ...(locator.projectDir ? { projectDir: canonicalLocatorPath(locator.projectDir, realpaths) } : {}),
-    ...(locator.lifecycleGeneration ? { lifecycleGeneration: locator.lifecycleGeneration } : {}),
-  }
-}
-
-function validateLocator(locator: TranscriptLocator): void {
-  if (!locator || typeof locator.sessionId !== "string" || locator.sessionId.length === 0) {
-    throw new TypeError("sessionId must be a non-empty string")
-  }
-  if (typeof locator.configDir !== "string" || !isAbsolute(locator.configDir)) {
-    throw new TypeError("configDir must be an absolute path")
-  }
-  if (locator.projectDir !== undefined
-    && (typeof locator.projectDir !== "string" || !isAbsolute(locator.projectDir))) {
-    throw new TypeError("projectDir must be an absolute path when provided")
-  }
-  if (locator.lifecycleGeneration !== undefined
-    && (typeof locator.lifecycleGeneration !== "string" || locator.lifecycleGeneration.length === 0)) {
-    throw new TypeError("lifecycleGeneration must be a non-empty string when provided")
-  }
 }
 
 function isValidLocator(value: unknown): value is TranscriptLocator {
