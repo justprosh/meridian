@@ -15,7 +15,9 @@ import {
 import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
 import { buildNodeFixture } from "./fixtures/bookkeeping-support"
 import { readExportJournal } from "../proxy/session/bookkeeping/exportJournal"
-import { enrichFixture, richArchivedSnapshot, richSnapshot } from "./fixtures/bookkeeping-rich-fixture"
+import {
+  enrichFixture, richArchivedSnapshot, richSnapshot, uninterruptedRichSnapshot,
+} from "./fixtures/bookkeeping-rich-fixture"
 
 for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session-gc.migrated.json",
   "linked:sessions.migrated.json", "moved:sessions.migrated.json", "linked:database", "moved:database",
@@ -102,21 +104,34 @@ const exportPoints = ["PREPARED", "staged:session-gc.json", "staged:sessions.jso
   "barrier:linked:session-gc.json", "barrier:linked:sessions.json",
   "barrier:releasing:session-gc.json", "barrier:releasing:sessions.json"]
 
-for (const sidecarVersion of [1, 2]) for (const storeVersion of [1, 3]) {
+for (const sidecarVersion of [1, 2] as const) for (const storeVersion of [1, 3]) {
   for (const point of migrationPoints) it(`SIGKILL migration ${sidecarVersion}/${storeVersion} ${point}`, async () => {
     const directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-crash-migrate-")))
     try {
       const { entry, key } = seed(directory, sidecarVersion, storeVersion)
+      enrichFixture(directory, sidecarVersion)
+      expect(JSON.parse(readFileSync(join(directory, "session-gc.json"), "utf8")).version).toBe(sidecarVersion)
+      const expected = await uninterruptedRichSnapshot(directory)
+      expect(expected.counts.schema_meta).toBe(1)
+      expect(expected.counts.resource_leases).toBe(1)
+      expect(expected.counts.fence_slots).toBeGreaterThanOrEqual(4)
+      for (const table of ["priority_assignments", "priority_attempts", "priority_rollbacks"]) {
+        expect(expected.counts[table]).toBe(storeVersion === 3 ? 1 : 0)
+      }
       child("migrate", directory, point)
       const result = await migrateBookkeeping(directory, { writersStopped: true })
-      expect(result.resources).toBe(1)
-      expect(result.mappings).toBe(1)
+      expect(result.resources).toBe(2)
+      expect(result.mappings).toBe(3)
+      expect(richSnapshot(directory)).toEqual(expected)
       requireBarriers(directory, result.id)
       const handle = initializeSessionBookkeeping(directory)
       try {
         expect(readMappingGeneration(handle.reader, "entry")).toBe(getStoredSessionGeneration(entry, "entry"))
         expect(handle.reader.get("SELECT generation FROM resources WHERE key=?", key)?.generation).toBe(`r:${key}:1`)
       } finally { handle.close() }
+      const exported = exportBookkeepingJson(directory)
+      expect(exported.documents).toEqual(expected.documents)
+      expect(richArchivedSnapshot(directory, exported)).toEqual(expected)
     } finally { rmSync(directory, { recursive: true, force: true }) }
   }, 20000)
   for (const point of exportPoints) it(`SIGKILL export ${sidecarVersion}/${storeVersion} ${point}`, async () => {

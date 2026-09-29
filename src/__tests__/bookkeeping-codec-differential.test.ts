@@ -6,6 +6,9 @@ import { join, resolve } from "node:path"
 import { canonicalizeLocator, resourceKey } from "../proxy/session/bookkeeping/locator"
 import { STORE_META_KEY } from "../proxy/session/bookkeeping/legacyCodec"
 import { enrichFixture } from "./fixtures/bookkeeping-rich-fixture"
+import { nestedCodecCases } from "./fixtures/bookkeeping-nested-codec-corpus"
+import type { CodecCase } from "./fixtures/bookkeeping-nested-codec-corpus"
+import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
 
 const baseline = spawnSync("git", ["cat-file", "-e", "ccc5ba3^{commit}"], { encoding: "utf8" })
 const reason = baseline.status === 0 ? "" : " — git object ccc5ba3 unavailable (e.g. shallow checkout)"
@@ -39,7 +42,7 @@ differentialTest(`ccc5ba3 codecs and extracted codecs produce identical bytes an
     writeFileSync(join(data, "session-gc.json"), JSON.stringify(sidecar), { mode: 0o600 })
     writeFileSync(join(data, "sessions.json"), JSON.stringify(store), { mode: 0o600 })
     enrichFixture(data)
-    const cases: Array<{ kind: "sidecar" | "store"; raw: string }> = []
+    const cases: CodecCase[] = []
     const add = (kind: "sidecar" | "store", value: unknown) => cases.push({ kind, raw: JSON.stringify(value) })
     add("sidecar", sidecar)
     cases.push({ kind: "sidecar", raw: readFileSync(join(data, "session-gc.json"), "utf8") })
@@ -61,6 +64,7 @@ differentialTest(`ccc5ba3 codecs and extracted codecs produce identical bytes an
     add("sidecar", { version: 2, meta: { fenceSlots: { abcd: 0 } }, resources: {} })
     add("store", { ...store, [STORE_META_KEY]: { ...store[STORE_META_KEY], unknown: true } })
     add("store", { entry: { ...entry, currentTranscript: { configDir: "relative", sessionId: "session" } } })
+    cases.push(...nestedCodecCases(data))
     writeFileSync(join(root, "cases.json"), JSON.stringify(cases))
     const runner = join(root, "runner.ts")
     writeFileSync(runner, `
@@ -99,6 +103,10 @@ differentialTest(`ccc5ba3 codecs and extracted codecs produce identical bytes an
     expect(outcomes).toHaveLength(cases.length)
     expect(outcomes.filter((row) => row.old.bytes !== undefined).length).toBeGreaterThanOrEqual(7)
     expect(outcomes.filter((row) => row.old.error !== undefined).length).toBeGreaterThan(20)
+    writeBenchArtifact("codec-differential-corpus.json", cases.map((row, index) => ({
+      ...row, ...outcomes[index],
+      equal: JSON.stringify(outcomes[index]?.old) === JSON.stringify(outcomes[index]?.current),
+    })))
     for (const [index, row] of outcomes.entries()) expect(row.current, JSON.stringify(cases[index])).toEqual(row.old)
   } finally { rmSync(root, { recursive: true, force: true }) }
 }, 60000)

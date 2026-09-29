@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
-import { readFileSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { captureProcessIncarnation } from "../../proxy/session/processIncarnation"
 import { canonicalizeLocator, resourceKey } from "../../proxy/session/bookkeeping/locator"
@@ -15,11 +16,12 @@ import { pathToFileURL } from "node:url"
 import { fileIdentity } from "../../proxy/session/bookkeeping/exportJournal"
 import type { ExportJournal } from "../../proxy/session/bookkeeping/exportJournal"
 import { validateBookkeepingSchema } from "../../proxy/session/bookkeeping/schema"
+import { migrateBookkeeping } from "../../proxy/session/bookkeeping/migration"
 
-const TABLES = ["resources", "resource_leases", "fence_slots", "mappings", "mapping_history",
+const TABLES = ["schema_meta", "resources", "resource_leases", "fence_slots", "mappings", "mapping_history",
   "mapping_pins", "priority_assignments", "priority_attempts", "priority_rollbacks", "bookkeeping_counts"]
 
-export function enrichFixture(directory: string): void {
+export function enrichFixture(directory: string, sidecarVersion: 1 | 2 = 2): void {
   const sidecar = parseLegacySidecar(readFileSync(join(directory, "session-gc.json"), "utf8"))
   const store = parseLegacyStoreForMaintenance(readFileSync(join(directory, "sessions.json"), "utf8"))
   const captured = captureProcessIncarnation()
@@ -28,8 +30,12 @@ export function enrichFixture(directory: string): void {
   const first = Object.values(sidecar.resources)[0]!
   first.rowVersion = Number.MAX_SAFE_INTEGER
   first.activeLeases = { dead: { token: "dead", owner, executor: owner, executorRecoverable: false, createdAt: 1 } }
-  const locator = canonicalizeLocator({ configDir: directory, projectDir: directory, sessionId: "retired" })
-  const key = resourceKey(locator)
+  let locator = canonicalizeLocator({ configDir: directory, projectDir: directory, sessionId: "retired" })
+  let key = resourceKey(locator)
+  for (let suffix = 1; key.slice(0, 4) === first.key.slice(0, 4); suffix++) {
+    locator = canonicalizeLocator({ configDir: directory, projectDir: directory, sessionId: `retired-${suffix}` })
+    key = resourceKey(locator)
+  }
   sidecar.resources[key] = { key, locator, state: "retired", generation: `r:${key}:7`,
     createdAt: 1, updatedAt: 2, attempts: 1, nextAttemptAt: 99, lastError: "retry" }
   sidecar.meta.fenceSlots[key.slice(0, 4)] = 7
@@ -52,14 +58,36 @@ export function enrichFixture(directory: string): void {
     store.meta.priorityRollbackMappings.route = { mappingKey: "previous",
       mappingGeneration: getStoredSessionGeneration(previous, "previous") }
   }
-  writeFileSync(join(directory, "session-gc.json"), serializeLegacySidecar(sidecar))
+  const sidecarBytes = sidecarVersion === 1 ? JSON.stringify({ version: 1,
+    resources: Object.fromEntries(Object.entries(sidecar.resources).map(([key, resource]) => {
+      const { generation: _generation, ...legacy } = resource
+      return [key, legacy]
+    })) }) : serializeLegacySidecar(sidecar)
+  writeFileSync(join(directory, "session-gc.json"), sidecarBytes)
   writeFileSync(join(directory, "sessions.json"), serializeLegacyStore(store))
+}
+
+/** Same source bytes/locator paths, separate uninterrupted control migration. */
+export async function uninterruptedRichSnapshot(directory: string) {
+  const control = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-migration-control-")))
+  try {
+    for (const name of SOURCE_NAMES) {
+      writeFileSync(join(control, name), readFileSync(join(directory, name)), { mode: 0o600 })
+    }
+    await migrateBookkeeping(control, { writersStopped: true })
+    return richSnapshot(control)
+  } finally { rmSync(control, { recursive: true, force: true }) }
 }
 
 export function richSnapshot(directory: string) {
   const handle = initializeSessionBookkeeping(directory)
   try {
     return withBookkeepingRead(directory, (reader) => {
+      const tables = reader.all("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .map((row) => String(row.name)).sort()
+      if (JSON.stringify(tables) !== JSON.stringify([...TABLES].sort())) {
+        throw new Error("rich snapshot must count every bookkeeping table")
+      }
       const snapshot = snapshotForExport(reader)
       const documents = SOURCE_NAMES.map((name, index) => {
         const bytes = index === 0 ? snapshot.sidecar : snapshot.store
