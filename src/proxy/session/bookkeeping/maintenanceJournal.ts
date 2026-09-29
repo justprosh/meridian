@@ -10,7 +10,7 @@ import { errorCode, ownedFd } from "./storagePaths"
 export const JOURNAL_NAME = "session-bookkeeping-migration.json"
 export const SOURCE_NAMES = ["session-gc.json", "sessions.json"] as const
 export type SourceName = typeof SOURCE_NAMES[number]
-export type MigrationPhase = "PREPARED" | "BARRIERS" | "IMPORTED" | "READY"
+export type MigrationPhase = "PREPARED" | "BARRIERS" | "IMPORTED" | "READY" | "ABORTING" | "ABORTED"
 export interface SourceIdentity {
   path: SourceName
   existed: boolean
@@ -90,7 +90,7 @@ export function readJournal(directory: string): MigrationJournal | undefined {
   const row = value as Record<string, unknown>
   if (row.format !== "meridian-bookkeeping-migration" || row.version !== 1 || row.targetVersion !== 1
     || typeof row.id !== "string" || !/^[a-f0-9-]{36}$/.test(row.id)
-    || !["PREPARED", "BARRIERS", "IMPORTED", "READY"].includes(String(row.phase))
+    || !["PREPARED", "BARRIERS", "IMPORTED", "READY", "ABORTING", "ABORTED"].includes(String(row.phase))
     || !validSources(row.sources) || (row.finalSources !== undefined && !validSources(row.finalSources))
     || (row.phase !== "PREPARED" && !row.finalSources)) throw new Error("invalid migration journal")
   return row as unknown as MigrationJournal

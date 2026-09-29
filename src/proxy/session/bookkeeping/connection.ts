@@ -32,6 +32,7 @@ import {
 import type { GuardLease, MaintenanceGuardLease } from "./guard"
 import type { BookkeepingReader, SqlRow, SqlValue } from "./types"
 import { readJournal, requireBarriers } from "./maintenanceJournal"
+import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 
 export const BOOKKEEPING_FILENAME = "session-bookkeeping.sqlite"
 export interface BookkeepingInitializeOptions {
@@ -311,6 +312,9 @@ export function openHandle(
       releaseGuardReference = retainGuardLease(guard, expectPhase === undefined ? "shared" : "exclusive")
       const migration = expectPhase === undefined ? readJournal(canonical) : undefined
       if (expectPhase === undefined) {
+        if (existsSync(join(canonical, EXPORT_JOURNAL_NAME))) {
+          throw new BookkeepingMaintenanceRequiredError("export in progress or completed; resume export-json, not runtime")
+        }
         if (migration) {
           if (migration.phase !== "READY" || !existsSync(path)) {
             throw new BookkeepingMaintenanceRequiredError("migration in progress; resume explicit maintenance")

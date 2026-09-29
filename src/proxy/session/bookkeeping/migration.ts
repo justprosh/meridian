@@ -18,6 +18,7 @@ import {
   saveJournal, SOURCE_NAMES, writeDurably,
 } from "./maintenanceJournal"
 import type { MigrationJournal, SourceName } from "./maintenanceJournal"
+import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 
 export interface MigrationOptions {
   /** Operator attestation, not something inferred from a quiet lease table. */
@@ -79,6 +80,12 @@ function importOrResume(directory: string, journal: MigrationJournal, guard: Mai
   const path = join(directory, BOOKKEEPING_FILENAME)
   if (!existsSync(path)) {
     if (journal.phase !== "BARRIERS") throw new Error("committed migration database is missing")
+    const final = sources(directory, journal)
+    if (JSON.stringify(final.map((entry) => entry.identity)) !== JSON.stringify(journal.finalSources)) {
+      throw new Error("protected source identity/digest changed after BARRIERS")
+    }
+    // A malformed source must remain abortable without ever publishing an empty database.
+    prepareImport(final[0]?.raw, final[1]?.raw)
     createMaintenanceDatabase(directory, guard)
     crashPoint("database-prepared")
   }
@@ -140,7 +147,11 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
+    if (existsSync(join(directory, EXPORT_JOURNAL_NAME))) throw new Error("export journal exists; resume export-json")
     let journal = readJournal(directory)
+    if (journal?.phase === "ABORTING" || journal?.phase === "ABORTED") {
+      throw new Error("migration aborted; finish abort-migration before any new transition")
+    }
     if (!journal && existsSync(join(directory, BOOKKEEPING_FILENAME))) {
       throw new Error("database without migration journal; refuse implicit adoption")
     }
