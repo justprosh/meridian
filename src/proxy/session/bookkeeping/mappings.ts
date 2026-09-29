@@ -257,6 +257,13 @@ export function captureMappingPinsValidation(reader: BookkeepingReader): () => v
           const expected = value === undefined ? null : json ? JSON.stringify(value) : value
           if ((property === "currentTranscript" || property === "previousTranscript")
             && value !== undefined && row[column] !== null) {
+            const raw = value as TranscriptLocator
+            const projected = JSON.parse(String(row[column])) as TranscriptLocator
+            if (raw.sessionId !== projected.sessionId
+              || raw.lifecycleGeneration !== projected.lifecycleGeneration
+              || (raw.projectDir === undefined) !== (projected.projectDir === undefined)) {
+              throw new SessionLifecycleCorruptError("legacy locator identity/payload mismatch")
+            }
             importedLocators.push({ raw: value as TranscriptLocator, projected: String(row[column]) })
             continue
           }

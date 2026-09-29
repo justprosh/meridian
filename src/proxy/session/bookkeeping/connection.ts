@@ -195,7 +195,7 @@ export function createMaintenanceDatabase(directory: string, guard: MaintenanceG
   bootstrap(join(canonical, BOOKKEEPING_FILENAME), "PREPARED")
 }
 
-function openDatabase(path: string, phase: string, full: boolean): Database.Database {
+function openDatabase(path: string, phase: string, full: boolean, skipRealpathAudit = false): Database.Database {
   checkFiles(path)
   const db = new Database(path)
   try {
@@ -206,16 +206,20 @@ function openDatabase(path: string, phase: string, full: boolean): Database.Data
       throw new BookkeepingMaintenanceRequiredError(`bookkeeping phase is not ${phase}`)
     validateBookkeepingSchema(db, phase, full)
     let validatePins: (() => void) | undefined
+    let validateResourcePaths: (() => void) | undefined
     if (full) {
       const reader: BookkeepingReader = {
         get: (sql, ...params) => getRow(db, sql, params),
         all: (sql, ...params) => db.prepare(sql).all(...params) as SqlRow[],
       }
       validatePins = captureMappingPinsValidation(reader)
-      validateResourceRows(reader)
+      validateResourcePaths = validateResourceRows(reader)
     }
     db.exec("COMMIT")
-    validatePins?.()
+    if (!skipRealpathAudit) {
+      validatePins?.()
+      validateResourcePaths?.()
+    }
     return db
   } catch (error) {
     try {
@@ -278,7 +282,11 @@ export function openHandle(
   options: BookkeepingInitializeOptions = {},
   expectPhase?: string,
   maintenanceGuard?: MaintenanceGuardLease,
+  skipRealpathAudit = false,
 ): BookkeepingHandle {
+  if (skipRealpathAudit && (!maintenanceGuard || expectPhase !== "READY")) {
+    throw new Error("skipping realpath audit requires an exclusive READY maintenance handle")
+  }
   if ([...registry.values()].some((connection) => connection.scope)) {
     throw new Error("cannot initialize bookkeeping inside a transaction")
   }
@@ -290,6 +298,7 @@ export function openHandle(
   assertNotTerminal(path)
   let connection = registry.get(path)
   if (connection) {
+    if (skipRealpathAudit) throw new BookkeepingBusyError("projection maintenance requires its own handle")
     if (connection.maintenance !== (expectPhase !== undefined)) {
       throw new BookkeepingBusyError("stop all proxies before maintenance; incompatible main handle is open")
     }
@@ -334,7 +343,7 @@ export function openHandle(
         }
         bootstrap(path)
       }
-      const db = openDatabase(path, expectPhase ?? "READY", true)
+      const db = openDatabase(path, expectPhase ?? "READY", true, skipRealpathAudit)
       if (expectPhase === undefined) {
         const meta = getRow(db, "SELECT migration_id,source_digests_json FROM schema_meta", [])
         if ((meta?.migration_id ?? undefined) !== migration?.id

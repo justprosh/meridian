@@ -1,4 +1,5 @@
-import { resourceKey, persistedCanonicalLocator } from "./locator"
+import { resourceKey, persistedCanonicalLocator, canonicalizeLocator } from "./locator"
+import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import type { CanonicalTranscriptLocator } from "./locator"
 import { writeResourceRow } from "./resourceRow"
 import { parseProcessIncarnation } from "../processIncarnation"
@@ -154,9 +155,11 @@ export function readRetiredPage(
 }
 
 /** Startup/offline audit of the semantic constraints SQL cannot express as FKs. */
-export function validateResourceRows(reader: BookkeepingReader): void {
+export function validateResourceRows(reader: BookkeepingReader): () => void {
+  const locators: CanonicalTranscriptLocator[] = []
   for (const row of reader.all("SELECT key FROM resources")) {
     const resource = readResource(reader, String(row.key))!
+    locators.push(resource.locator)
     const counter = validateResource(resource)
     const fence = reader.get(
       "SELECT counter FROM fence_slots WHERE namespace='lifecycle' AND slot=?",
@@ -168,5 +171,14 @@ export function validateResourceRows(reader: BookkeepingReader): void {
   for (const row of reader.all("SELECT owner_json,executor_json FROM resource_leases")) {
     incarnationJson(JSON.parse(String(row.owner_json)))
     if (row.executor_json !== null) incarnationJson(JSON.parse(String(row.executor_json)))
+  }
+  return () => {
+    const paths = new Map<string, string>()
+    for (const locator of locators) {
+      const canonical = canonicalizeLocator(locator, paths)
+      if (canonical.configDir !== locator.configDir || canonical.projectDir !== locator.projectDir) {
+        throw new BookkeepingMaintenanceRequiredError("resource realpath changed; run offline recanonicalize")
+      }
+    }
   }
 }

@@ -3,7 +3,7 @@ import { openHandle } from "./connection"
 import type { MaintenanceGuardLease } from "./guard"
 export function openForMaintenance(
   directory: string,
-  options: { expectPhase: string; guard?: MaintenanceGuardLease },
+  options: { expectPhase: string; guard?: MaintenanceGuardLease; skipRealpathAudit?: boolean },
 ) {
-  return openHandle(directory, {}, options.expectPhase, options.guard)
+  return openHandle(directory, {}, options.expectPhase, options.guard, options.skipRealpathAudit)
 }

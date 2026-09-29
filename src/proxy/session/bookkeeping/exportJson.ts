@@ -30,7 +30,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
     if (journal && journal.migrationId !== migration.id) throw new Error("export migration identity mismatch")
     if (journal?.phase !== "EXPORTED") requireBarriers(directory, migration.id)
     if (!journal || ["PREPARED", "STAGED", "INSTALLED"].includes(journal.phase)) {
-      const handle = openForMaintenance(directory, { expectPhase: "READY", guard })
+      const handle = openForMaintenance(directory, { expectPhase: "READY", guard, skipRealpathAudit: true })
       try {
         const meta = handle.reader.get("SELECT migration_id,source_digests_json FROM schema_meta")
         if (meta?.migration_id !== migration.id
