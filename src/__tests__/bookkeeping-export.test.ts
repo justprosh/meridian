@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, it } from "bun:test"
 import { randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
+import Database from "libsql"
+import { pathToFileURL } from "node:url"
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -16,6 +19,7 @@ import {
 } from "../proxy/session/bookkeeping/legacyCodec"
 import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
 import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
+import { validateBookkeepingSchema } from "../proxy/session/bookkeeping/schema"
 
 let directory: string
 beforeEach(() => { directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-export-"))) })
@@ -72,6 +76,19 @@ for (const version of [1, 3] as const) it(`exports current state to store v${ver
   expect(sidecar.resources[row.key]?.generation).toBe(`r:${row.key}:1`)
   expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
   expect(existsSync(join(directory, `session-bookkeeping.sqlite.exported-${result.id}`))).toBe(true)
+  expect(result.archive?.some((file) => file.name === "session-bookkeeping.sqlite")).toBe(true)
+  for (const file of result.archive!) {
+    const archived = readFileSync(join(directory, `${file.name}.exported-${result.id}`))
+    expect(archived.length).toBe(file.bytes)
+    expect(createHash("sha256").update(archived).digest("hex")).toBe(file.digest)
+  }
+  const archivePath = join(directory, `session-bookkeeping.sqlite.exported-${result.id}`)
+  const archived = new Database(`${pathToFileURL(archivePath).href}?mode=ro&immutable=1`)
+  try {
+    validateBookkeepingSchema(archived)
+    expect(archived.prepare("SELECT migration_id FROM schema_meta").get()).toMatchObject({ migration_id: result.migrationId })
+    expect(() => archived.exec("DELETE FROM mappings")).toThrow()
+  } finally { archived.close() }
   for (const name of ["sessions.json.lock", "session-gc.json.lock"]) expect(existsSync(join(directory, name))).toBe(false)
   expect(() => initializeSessionBookkeeping(directory)).toThrow("export in progress or completed")
   expect(exportBookkeepingJson(directory)).toEqual(result)

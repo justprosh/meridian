@@ -42,6 +42,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { randomUUID } from "node:crypto"
+import { SessionStoreLockTimeoutError } from "./session/storeErrors"
 import { homedir, hostname } from "node:os"
 import { basename, dirname, isAbsolute, join } from "node:path"
 import {
@@ -490,12 +491,12 @@ function acquireLock(lockPath: string, waitMs = getLockWaitMs(), staleMs = STALE
     }
 
     if (deadline - performance.now() <= 0) {
-      throw new Error(`[sessionStore] timed out waiting for lock ${lockPath}`)
+      throw new SessionStoreLockTimeoutError(`[sessionStore] timed out waiting for lock ${lockPath}`)
     }
     if (retireStaleLock(lockPath, staleMs)) continue
     const remaining = deadline - performance.now()
     if (remaining <= 0) {
-      throw new Error(`[sessionStore] timed out waiting for lock ${lockPath}`)
+      throw new SessionStoreLockTimeoutError(`[sessionStore] timed out waiting for lock ${lockPath}`)
     }
     sleepSync(Math.min(LOCK_RETRY_MS, remaining))
   }

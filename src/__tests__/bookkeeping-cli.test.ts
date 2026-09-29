@@ -1,10 +1,12 @@
 import { afterEach, beforeAll, beforeEach, expect, it } from "bun:test"
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
+import { once } from "node:events"
 import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { initializeSessionBookkeeping } from "../proxy/session/bookkeeping/database"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
+import { seedResidueInventory } from "./fixtures/bookkeeping-residue-inventory"
 
 let directory: string
 beforeAll(() => {
@@ -94,6 +96,81 @@ it("reports candidate incarnation verdicts and refuses a live candidate before m
     incarnation: { ...incarnation, bootId: "00000000-0000-0000-0000-000000000001" } }))
   expect(success("inspect").candidates[0].verdict).toBe("dead-incarnation")
   expect(success("migrate", ["--writers-stopped"]).phase).toBe("ready")
-  writeFileSync(path, JSON.stringify(owner))
+  writeFileSync(path, JSON.stringify(owner), { mode: 0o600 })
   expect(success("migrate", ["--writers-stopped"]).phase).toBe("ready")
+})
+
+it("archives the staging residue inventory with an explicit stop/drain attestation", () => {
+  const names = seedResidueInventory(directory)
+  const original = Object.fromEntries(names.map((name) => [name, readFileSync(join(directory, name), "utf8")]))
+  const before = success("inspect")
+  expect(before.candidates).toHaveLength(4)
+  expect(before.candidates.every((row: { verdict: string }) => row.verdict === "dead-incarnation")).toBe(true)
+  expect(before.gates).toHaveLength(15)
+  expect(before.gates.every((row: { verdict: string }) => row.verdict === "unknown")).toBe(true)
+  expect(before.temporary).toHaveLength(3)
+  expect(before.temporary.every((row: { verdict: string }) => row.verdict === "unknown")).toBe(true)
+  const after = success("migrate", ["--writers-stopped"])
+  expect(after.phase).toBe("ready")
+  expect(after.archived_cycles).toBe(0)
+  expect(after.result.residues).toHaveLength(22)
+  const journal = JSON.parse(readFileSync(join(directory, "session-bookkeeping-migration.json"), "utf8"))
+  expect(journal.residues).toEqual(after.result.residues)
+  for (const name of names) {
+    expect(readFileSync(join(directory, "bookkeeping-cycles", after.migration_id, "residue", name), "utf8"))
+      .toBe(original[name]!)
+  }
+  expect(after.candidates).toEqual([])
+  expect(after.gates).toEqual([])
+  expect(after.temporary).toEqual([])
+  expect(readdirSync(join(directory, "turn-locks"))).toHaveLength(42)
+  for (let i = 0; i < 42; i++) expect(readFileSync(join(directory, "turn-locks", `${i}.lock`), "utf8"))
+    .toBe(`turn-${i}`)
+  success("export-json")
+  expect(success("migrate", ["--writers-stopped"]).archived_cycles).toBe(1)
+})
+
+it("refuses an actual child candidate with exit 3 and its address", async () => {
+  const child = spawn("node", ["-e", "console.log('ready');setInterval(()=>{},1000)"], { stdio: "pipe" })
+  try {
+    await once(child.stdout!, "data")
+    const incarnation = captureProcessIncarnation(child.pid)
+    expect(incarnation).toBeDefined()
+    const name = `sessions.json.lock.candidate-${child.pid}-00000000-0000-4000-8000-000000000001`
+    writeFileSync(join(directory, name), JSON.stringify({ incarnation }), { mode: 0o600 })
+    expect(success("inspect").candidates).toEqual([{ path: name, verdict: "live" }])
+    const refused = cli("migrate", ["--writers-stopped"])
+    expect(refused.status, refused.stdout + refused.stderr).toBe(3)
+    expect(JSON.parse(refused.stdout).error).toContain(name)
+    expect(readdirSync(directory).some((path) => path.endsWith(".sqlite"))).toBe(false)
+  } finally {
+    const exited = once(child, "exit")
+    child.kill("SIGKILL")
+    await exited
+  }
+})
+
+for (const operation of ["linked", "moved"]) it(`resumes residue ${operation} without losing inventory`, () => {
+  const names = seedResidueInventory(directory)
+  const cut = `residue:${operation}:${names[0]}`
+  expect(cli("migrate", ["--writers-stopped"], cut).signal).toBe("SIGKILL")
+  const resumed = success("migrate", ["--writers-stopped"])
+  expect(resumed.phase).toBe("ready")
+  expect(resumed.result.residues).toHaveLength(22)
+  expect(success("inspect").candidates).toEqual([])
+})
+
+it("archives an unknown candidate only with attestation, and ignores nonempty legacy temporary files", () => {
+  const candidate = "sessions.json.lock.candidate-1-00000000-0000-4000-8000-000000000001"
+  const temporary = "session-gc.json.tmp-1-00000000-0000-4000-8000-000000000002"
+  writeFileSync(join(directory, candidate), "unknown owner", { mode: 0o600 })
+  writeFileSync(join(directory, temporary), "not empty", { mode: 0o600 })
+  expect(success("inspect").candidates).toEqual([{ path: candidate, verdict: "unknown" }])
+  expect(success("inspect").temporary).toEqual([])
+  expect(cli("migrate").status).toBe(2)
+  expect(readFileSync(join(directory, candidate), "utf8")).toBe("unknown owner")
+  const after = success("migrate", ["--writers-stopped"])
+  expect(after.result.residues).toHaveLength(1)
+  expect(after.result.residues[0].verdict).toBe("unknown")
+  expect(readFileSync(join(directory, temporary), "utf8")).toBe("not empty")
 })

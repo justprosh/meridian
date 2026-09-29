@@ -1,0 +1,63 @@
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, unlinkSync } from "node:fs"
+import { dirname, join } from "node:path"
+import { syncDirectoryDurablySync } from "../durableFileSystem"
+import { fileIdentity, verifyFile } from "./exportJournal"
+import { crashPoint } from "./maintenanceJournal"
+import { candidateVerdict, inspectArtifacts } from "./residueInventory"
+import type { ArchivedResidue } from "./residueTypes"
+import { BookkeepingMaintenanceRequiredError, ownedFd } from "./storagePaths"
+
+/** Called only under maintenance ownership and explicit operator stop/drain attestation. */
+export function planResidueArchive(directory: string): ArchivedResidue[] {
+  const inventory = inspectArtifacts(directory)
+  return [...inventory.candidates, ...inventory.gates, ...inventory.temporary].map((row) => {
+    if (row.verdict === "live") throw new BookkeepingMaintenanceRequiredError(`live residue: ${row.path}`)
+    const identity = fileIdentity(directory, row.path, true)
+    const stat = lstatSync(join(directory, row.path))
+    return { ...row, digest: identity.digest, bytes: identity.bytes, dev: stat.dev, ino: stat.ino }
+  })
+}
+
+/** Intent is already in PREPARED. Hardlink + fsync + unlink resumes on either side of a crash. */
+export function archiveResidues(directory: string, id: string, residues: ArchivedResidue[]): void {
+  if (!residues.length) return
+  const root = join(directory, "bookkeeping-cycles")
+  const cycle = join(root, id)
+  const archive = join(cycle, "residue")
+  for (const path of [root, cycle, archive]) {
+    if (!existsSync(path)) mkdirSync(path, { mode: 0o700 })
+    closeSync(ownedFd(path, true))
+    syncDirectoryDurablySync(dirname(path))
+  }
+  for (const row of residues) {
+    const source = join(directory, row.path)
+    const target = join(archive, row.path)
+    const parent = dirname(target)
+    if (!existsSync(parent)) mkdirSync(parent, { mode: 0o700 })
+    closeSync(ownedFd(parent, true))
+    syncDirectoryDurablySync(dirname(parent))
+    const expected = { name: row.path, digest: row.digest, bytes: row.bytes }
+    if (existsSync(source)) {
+      if (row.path.includes(".candidate-") && candidateVerdict(source) === "live") {
+        throw new BookkeepingMaintenanceRequiredError(`live residue: ${row.path}`)
+      }
+      verifyFile(directory, row.path, expected)
+      const stat = lstatSync(source)
+      if (stat.dev !== row.dev || stat.ino !== row.ino) throw new Error(`residue inode changed: ${row.path}`)
+    }
+    if (!existsSync(target)) {
+      if (!existsSync(source)) throw new Error(`residue disappeared: ${row.path}`)
+      linkSync(source, target)
+      syncDirectoryDurablySync(parent)
+      crashPoint(`residue:linked:${row.path}`)
+    }
+    verifyFile(archive, row.path, expected)
+    const archived = lstatSync(target)
+    if (archived.dev !== row.dev || archived.ino !== row.ino) throw new Error(`foreign residue archive: ${row.path}`)
+    if (existsSync(source)) {
+      unlinkSync(source)
+      syncDirectoryDurablySync(dirname(source))
+    }
+    crashPoint(`residue:moved:${row.path}`)
+  }
+}

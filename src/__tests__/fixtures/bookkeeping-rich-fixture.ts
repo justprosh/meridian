@@ -1,0 +1,66 @@
+import { randomUUID } from "node:crypto"
+import { readFileSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+import { captureProcessIncarnation } from "../../proxy/session/processIncarnation"
+import { canonicalizeLocator, resourceKey } from "../../proxy/session/bookkeeping/locator"
+import {
+  getStoredSessionGeneration, parseLegacySidecar, parseLegacyStoreForMaintenance, serializeLegacySidecar,
+  serializeLegacyStore,
+} from "../../proxy/session/bookkeeping/legacyCodec"
+import { initializeSessionBookkeeping, withBookkeepingRead } from "../../proxy/session/bookkeeping/database"
+import { snapshotForExport } from "../../proxy/session/bookkeeping/exportSnapshot"
+import { digestBytes, SOURCE_NAMES } from "../../proxy/session/bookkeeping/maintenanceJournal"
+
+export function enrichFixture(directory: string): void {
+  const sidecar = parseLegacySidecar(readFileSync(join(directory, "session-gc.json"), "utf8"))
+  const store = parseLegacyStoreForMaintenance(readFileSync(join(directory, "sessions.json"), "utf8"))
+  const captured = captureProcessIncarnation()
+  if (!captured) throw new Error("rich fixture requires incarnation")
+  const owner = { ...captured, bootId: "00000000-0000-0000-0000-000000000001" }
+  const first = Object.values(sidecar.resources)[0]!
+  first.rowVersion = Number.MAX_SAFE_INTEGER
+  first.activeLeases = { dead: { token: "dead", owner, executor: owner, executorRecoverable: false, createdAt: 1 } }
+  const locator = canonicalizeLocator({ configDir: directory, projectDir: directory, sessionId: "retired" })
+  const key = resourceKey(locator)
+  sidecar.resources[key] = { key, locator, state: "retired", generation: `r:${key}:7`,
+    createdAt: 1, updatedAt: 2, attempts: 1, nextAttemptAt: 99, lastError: "retry" }
+  sidecar.meta.fenceSlots[key.slice(0, 4)] = 7
+  sidecar.meta.fenceSlots.abcd = Math.max(sidecar.meta.fenceSlots.abcd ?? 0, 9)
+  sidecar.meta.fenceSlots.dcba = Math.max(sidecar.meta.fenceSlots.dcba ?? 0, 3)
+  const common = { claudeSessionId: "history", createdAt: 1, lastUsedAt: 2, messageCount: 2,
+    sdkMessageUuids: [null, "uuid"], messageHashes: [] }
+  const previous = { ...common, generationId: randomUUID(), unknown: { b: 1, a: 2 }, nullableExtension: null }
+  const current = { ...common, generationId: randomUUID(), unknown: { b: 1, a: 2 } }
+  store.sessions.previous = previous
+  store.sessions.current = current
+  store.meta.slots.dcba = 12
+  store.meta.slots.abcd = 0
+  if (store.meta.version === 3) {
+    store.meta.priorityAssignments.route = { profileId: "p", lastHumanTurnDigest: "a".repeat(43),
+      lastHumanTurnIssuedAt: 1, mappingKey: "current", mappingGeneration: getStoredSessionGeneration(current, "current"),
+      generationId: randomUUID(), updatedAt: 2 }
+    store.meta.priorityAttempts.route = { blocked: true, blockedTurnDigest: null, blockedTurnIssuedAt: null,
+      pendingTurnDigest: null, pendingTurnIssuedAt: null, ownerToken: null, generationId: randomUUID(), updatedAt: 2 }
+    store.meta.priorityRollbackMappings.route = { mappingKey: "previous",
+      mappingGeneration: getStoredSessionGeneration(previous, "previous") }
+  }
+  writeFileSync(join(directory, "session-gc.json"), serializeLegacySidecar(sidecar))
+  writeFileSync(join(directory, "sessions.json"), serializeLegacyStore(store))
+}
+
+export function richSnapshot(directory: string) {
+  const handle = initializeSessionBookkeeping(directory)
+  try {
+    return withBookkeepingRead(directory, (reader) => {
+      const snapshot = snapshotForExport(reader)
+      const documents = SOURCE_NAMES.map((name, index) => {
+        const bytes = index === 0 ? snapshot.sidecar : snapshot.store
+        return { name, digest: digestBytes(bytes), bytes: Buffer.byteLength(bytes) }
+      })
+      const counts = Object.fromEntries(["resources", "resource_leases", "fence_slots", "mappings", "mapping_history",
+        "mapping_pins", "priority_assignments", "priority_attempts", "priority_rollbacks", "bookkeeping_counts"]
+        .map((table) => [table, Number(reader.get(`SELECT count(*) AS n FROM ${table}`)?.n)]))
+      return { documents, counts }
+    })
+  } finally { handle.close() }
+}

@@ -6,6 +6,8 @@ import {
 import { dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { errorCode, ownedFd } from "./storagePaths"
+import { validResidues } from "./residueTypes"
+import type { ArchivedResidue } from "./residueTypes"
 
 export const JOURNAL_NAME = "session-bookkeeping-migration.json"
 export const SOURCE_NAMES = ["session-gc.json", "sessions.json"] as const
@@ -27,6 +29,7 @@ export interface MigrationJournal {
   phase: MigrationPhase
   sources: SourceIdentity[]
   finalSources?: SourceIdentity[]
+  residues?: ArchivedResidue[]
 }
 export const digestBytes = (value: string) => createHash("sha256").update(value).digest("hex")
 
@@ -92,6 +95,7 @@ export function readJournal(directory: string, readOnly = false): MigrationJourn
     || typeof row.id !== "string" || !/^[a-f0-9-]{36}$/.test(row.id)
     || !["PREPARED", "BARRIERS", "IMPORTED", "READY", "ABORTING", "ABORTED"].includes(String(row.phase))
     || !validSources(row.sources) || (row.finalSources !== undefined && !validSources(row.finalSources))
+    || (row.residues !== undefined && !validResidues(row.residues))
     || (row.phase !== "PREPARED" && !row.finalSources)) throw new Error("invalid migration journal")
   return row as unknown as MigrationJournal
 }

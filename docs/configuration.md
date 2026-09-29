@@ -780,9 +780,24 @@ database creation, or resume `export-json`. UID mismatch handling is implemented
 
 `inspect --json` reports `phase` (`legacy`, `prepared`, `barriers`, `imported`, `ready`, `exporting`,
 `exported`, `aborted`, or `corrupt`), `migration_id`, `cycle_id`, `cycle_number`, `archived_cycles`, resource
-counts by state, mappings, main/WAL/SHM sizes, barrier ownership (`own`, `foreign`, `none`), candidates and
-gates. Incarnations proven dead are `dead-incarnation`; unknown identities remain `live`. Gate scripts do
-not persist their own incarnation, so they conservatively remain `live`, not inferred dead from PID/age.
+counts by state, mappings, main/WAL/SHM sizes, barrier ownership (`own`, `foreign`, `none`), `candidates`,
+`gates` and `temporary` residue lists, each with a relative `path` and `verdict`.
+Incarnations proven dead are `dead-incarnation`; `live` requires an OS observation of a live process.
+Darwin's second-resolution start time cannot prove incarnation equality, but an observed live process
+at that identity still refuses maintenance. Unobservable/malformed identities are `unknown`.
+Gate files do not persist an incarnation, so their verdict is `unknown`, never inferred from PID/age.
+`temporary` lists empty `session-gc.json.tmp-<pid>-<uuid>` files (interrupted legacy atomic writes).
+`turn-locks/` is outside bookkeeping and is neither listed nor moved.
+
+For `migrate --writers-stopped`, the operator attests that all proxies **and SDK/deletion children**
+have stopped. Under that attestation, unknown/dead residues are moved, not deleted, to
+`bookkeeping-cycles/<migration_id>/residue/<relative-path>`. The PREPARED migration journal records
+`residues` (path, verdict, SHA256, bytes, device/inode); the command returns the same list in
+`result.residues`. Link/fsync/unlink steps are resumable and never overwrite a foreign archive inode.
+A live candidate refuses migration with its address (3 from legacy; 4 if barriers are already active).
+Other maintenance commands do not accept unknown candidates/gates. An already-ready CLI migrate is a
+no-op and does not archive newly appeared residues. The current cycle's residue directory does not count
+as an archived cycle. Inspection alone only reports residues, without applying the operator attestation.
 Inspection never repairs permissions or bootstraps a missing guard. WAL without SHM requires offline recovery
 rather than creating SHM during inspection. Without `--json`, output is indented for human reading.
 

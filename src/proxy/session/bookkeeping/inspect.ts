@@ -9,7 +9,8 @@ import { CYCLES_DIRECTORY, readTransition } from "./cycles"
 import { ownedFd } from "./storagePaths"
 import { BOOKKEEPING_APPLICATION_ID, pragmaValue, RESOURCE_STATES } from "./schema"
 import { parseLegacySidecar, parseLegacyStoreForMaintenance } from "./legacyCodec"
-import { parseProcessIncarnation, probeProcessIncarnation } from "../processIncarnation"
+import { inspectArtifacts } from "./residueInventory"
+import type { Residue } from "./residueTypes"
 
 export class BookkeepingOwnerMismatchError extends Error { readonly exitCode = 6 }
 export type InspectionPhase = "legacy" | "prepared" | "barriers" | "imported" | "ready"
@@ -24,8 +25,9 @@ export interface Inspection {
   mappings: number
   sizes: { main: number; wal: number; shm: number }
   barriers: Record<string, "own" | "foreign" | "none">
-  candidates: Array<{ path: string; verdict: "dead-incarnation" | "live" }>
-  gates: Array<{ path: string; verdict: "dead-incarnation" | "live" }>
+  candidates: Residue[]
+  gates: Residue[]
+  temporary: Residue[]
 }
 export function inspectionDirectory(input: string): string {
   const directory = realpathSync(input)
@@ -37,34 +39,6 @@ export function inspectionDirectory(input: string): string {
   return directory
 }
 const bytes = (path: string) => protectedBytes(path, true, true).toString("utf8")
-
-function inspectArtifacts(directory: string): Pick<Inspection, "candidates" | "gates"> {
-  const candidates: Inspection["candidates"] = []
-  for (const name of readdirSync(directory).filter((name) => /\.lock.*\.candidate-/.test(name))) {
-    const path = join(directory, name)
-    const stat = lstatSync(path)
-    let owner: unknown
-    try {
-      const raw: unknown = JSON.parse(bytes(stat.isDirectory() ? join(path, "owner.json") : path).split("\n")[0]!)
-      if (raw && typeof raw === "object") owner = (raw as Record<string, unknown>).incarnation
-    } catch (error) {
-      // Malformed/unknown ownership never grants permission to retire a candidate.
-      if (!(error instanceof SyntaxError)) throw error
-    }
-    const incarnation = parseProcessIncarnation(owner)
-    candidates.push({ path: name, verdict: incarnation && probeProcessIncarnation(incarnation) === "dead"
-      ? "dead-incarnation" : "live" })
-  }
-  const gates: Inspection["gates"] = []
-  for (const name of ["deletion-gates", "sdk-process-gates"]) {
-    const path = join(directory, name)
-    if (!existsSync(path)) continue
-    closeSync(ownedFd(path, true, false, true))
-    // Gate scripts do not carry an incarnation. PID/mtime alone must never imply death.
-    for (const file of readdirSync(path)) gates.push({ path: `${name}/${file}`, verdict: "live" })
-  }
-  return { candidates, gates }
-}
 
 export function inspectBookkeeping(input: string): Inspection {
   const directory = inspectionDirectory(input)
@@ -80,7 +54,7 @@ export function inspectBookkeeping(input: string): Inspection {
     let archived = 0
     if (existsSync(root)) {
       closeSync(ownedFd(root, true, false, true))
-      archived = readdirSync(root).filter((name) => name !== transition?.id
+      archived = readdirSync(root).filter((name) => name !== transition?.id && name !== migration?.id
         && /^[a-f0-9-]{36}$/.test(name) && lstatSync(join(root, name)).isDirectory()).length
     }
     const id = migration?.id ?? transition?.id ?? null

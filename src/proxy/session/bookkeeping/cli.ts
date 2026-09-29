@@ -11,6 +11,8 @@ import { protectedBytes, readExportJournal } from "./exportJournal"
 import { BookkeepingBusyError, BookkeepingMaintenanceRequiredError, errorCode } from "./storagePaths"
 import { BookkeepingBarrierReplacedError } from "./barrier"
 import { preflightLegacyMigration } from "./maintenancePreflight"
+import { SessionStoreLockTimeoutError } from "../storeErrors"
+import { SessionLifecycleLockError } from "../lifecycleErrors"
 
 const HELP = `meridian-bookkeeping <inspect|migrate|export-json|recanonicalize|abort-migration>
   --session-dir <directory> [--json] [--writers-stopped]
@@ -25,7 +27,9 @@ Never remove barriers manually. Both *.json.lock files contain a JSON line:
 "instruction":"Stop all writers; use meridian-bookkeeping export-json. Never delete this barrier manually."}
 This is deliberately NOT a legacy canonical pid/incarnation/token lock owner.
 --json includes timings.total_ms and timings.phases (phase and duration_ms).
-Unknown gate incarnations are reported as live, never inferred dead from PID or age.
+Gate files without incarnations and empty session-gc.json.tmp-<pid>-<uuid> files are unknown.
+migrate --writers-stopped archives unknown/dead residues under bookkeeping-cycles/<migration_id>/residue/;
+the attestation includes stopped deletion/SDK children. Live candidates refuse with their path.
 `
 const COMMANDS = ["inspect", "migrate", "export-json", "recanonicalize", "abort-migration"]
 class UsageError extends Error {}
@@ -88,7 +92,8 @@ export async function runBookkeepingCli(args: string[]): Promise<number> {
     record("inspect")
     if (options.command === "inspect") after = before
     else {
-      const active = [...(before?.candidates ?? []), ...(before?.gates ?? [])].find((row) => row.verdict === "live")
+      const active = [...(before?.candidates ?? []), ...(before?.gates ?? [])].find((row) =>
+        row.verdict === "live" || (row.verdict === "unknown" && options.command !== "migrate"))
       if (active && !(options.command === "migrate" && before?.phase === "ready")) {
         throw new BookkeepingMaintenanceRequiredError(`live or unknown candidate/gate: ${active.path}`)
       }
@@ -126,14 +131,15 @@ export async function runBookkeepingCli(args: string[]): Promise<number> {
     if (error instanceof UsageError) code = 2
     else if (error instanceof BookkeepingOwnerMismatchError) code = 6
     else if (error instanceof BookkeepingBarrierReplacedError) code = 5
-    else if (error instanceof BookkeepingBusyError || error instanceof BookkeepingMaintenanceRequiredError
+    else if (error instanceof SessionLifecycleLockError || error instanceof SessionStoreLockTimeoutError
+      || error instanceof BookkeepingMaintenanceRequiredError
       || errorCode(error) === "ENOSPC") {
       try { code = directory && unsafeState(directory) ? 4 : 3 } catch { code = 5 }
     } else code = 5
   } finally { stop(); record("complete") }
   const output = { ...(after ?? before ?? { phase: code === 0 ? "aborted" : "corrupt",
     migration_id: null, cycle_id: null, cycle_number: null, archived_cycles: null,
-    resources: null, mappings: null, sizes: null, barriers: null, candidates: null, gates: null }),
+    resources: null, mappings: null, sizes: null, barriers: null, candidates: null, gates: null, temporary: null }),
     ...(code === 5 ? { phase: "corrupt" } : {}), exit_code: code, result,
     ...(failure ? { error: failure instanceof Error ? failure.message : String(failure) } : {}),
     ...(code === 4 ? { hint: "Do not start legacy writers. Resume migrate / abort-migration / export-json." } : {}),

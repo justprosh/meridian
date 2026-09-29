@@ -59,8 +59,11 @@ export function prepareImport(sidecarRaw: string | undefined, storeRaw: string |
 
 export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: string, digests: string): void {
   for (const resource of plan.resources) {
-    importResource(tx, resource)
+    // Lease INSERT triggers fence runtime edits. Hydration is not an edit; start low enough
+    // for those triggers, then restore the source version before this transaction commits.
+    importResource(tx, { ...resource, rowVersion: 1 })
     for (const lease of Object.values(resource.activeLeases ?? {})) insertResourceLease(tx, resource.key, lease)
+    tx.run("UPDATE resources SET row_version=? WHERE key=?", resource.rowVersion, resource.key)
   }
   // importResource populates only a subset; the source maps, including unused and zero store slots, are authoritative.
   tx.run("DELETE FROM fence_slots")

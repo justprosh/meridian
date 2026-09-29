@@ -20,6 +20,8 @@ import {
 import type { MigrationJournal, SourceName } from "./maintenanceJournal"
 import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 import { archivePreviousCycle } from "./cycles"
+import { archiveResidues, planResidueArchive } from "./residueArchive"
+import type { ArchivedResidue } from "./residueTypes"
 
 export interface MigrationOptions {
   /** Operator attestation, not something inferred from a quiet lease table. */
@@ -27,7 +29,9 @@ export interface MigrationOptions {
   /** Test seam for the storage boundary, not an override for the required space. */
   availableBytes?: (directory: string) => number
 }
-export interface MigrationResult { id: string; phase: "READY"; resources: number; mappings: number }
+export interface MigrationResult {
+  id: string; phase: "READY"; resources: number; mappings: number; residues: ArchivedResidue[]
+}
 
 function ensureSpace(directory: string, bytes: number, options: MigrationOptions): void {
   const fs = statfsSync(directory)
@@ -123,7 +127,7 @@ function importOrResume(directory: string, journal: MigrationJournal, guard: Mai
     if (meta?.migration_id !== journal.id || meta.source_digests_json !== encoded) {
       throw new Error("database migration identity/digests disagree with journal")
     }
-    const result: MigrationResult = { id: journal.id, phase: "READY",
+    const result: MigrationResult = { id: journal.id, phase: "READY", residues: journal.residues ?? [],
       resources: Number(handle.reader.get("SELECT count(*) AS n FROM resources")?.n),
       mappings: Number(handle.reader.get("SELECT count(*) AS n FROM mappings")?.n) }
     if (journal.phase !== "READY") {
@@ -159,6 +163,8 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
     if (!journal && existsSync(join(directory, BOOKKEEPING_FILENAME))) {
       throw new Error("database without migration journal; refuse implicit adoption")
     }
+    const residues = journal ? journal.residues ?? [] : planResidueArchive(directory)
+    if (journal) archiveResidues(directory, journal.id, residues)
     const barriers = () => {
       if (journal && journal.phase !== "PREPARED") return
       const before = sources(directory, journal)
@@ -166,10 +172,11 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
       ensureSpace(directory, before.reduce((n, entry) => n + entry.identity.bytes, 0), options)
       if (!journal) {
         journal = { format: "meridian-bookkeeping-migration", version: 1, targetVersion: 1,
-          id: randomUUID(), phase: "PREPARED", sources: before.map((entry) => entry.identity) }
+          id: randomUUID(), phase: "PREPARED", sources: before.map((entry) => entry.identity), residues }
         saveJournal(directory, journal)
         crashPoint("PREPARED")
       }
+      archiveResidues(directory, journal.id, residues)
       for (const name of SOURCE_NAMES) {
         if (!isOwnBarrier(directory, name, journal.id)) {
           writeDurably(join(directory, name + ".lock"), barrierBytes(journal.id))

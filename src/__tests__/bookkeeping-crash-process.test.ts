@@ -15,6 +15,7 @@ import {
 import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
 import { buildNodeFixture } from "./fixtures/bookkeeping-support"
 import { readExportJournal } from "../proxy/session/bookkeeping/exportJournal"
+import { enrichFixture, richSnapshot } from "./fixtures/bookkeeping-rich-fixture"
 
 for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session-gc.migrated.json",
   "linked:sessions.migrated.json", "moved:sessions.migrated.json", "linked:database", "moved:database",
@@ -24,7 +25,9 @@ for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session
     const directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-cycle-")))
     try {
       seed(directory, 2, 3)
+      enrichFixture(directory)
       const first = await migrateBookkeeping(directory, { writersStopped: true })
+      const expected = richSnapshot(directory)
       const down = exportBookkeepingJson(directory)
       const point = cut.replace("database", `session-bookkeeping.sqlite.exported-${down.id}`)
       child("migrate", directory, `cycle:${point}`)
@@ -32,6 +35,7 @@ for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session
       expect(up.id).not.toBe(first.id)
       expect(up.resources).toBe(first.resources)
       expect(up.mappings).toBe(first.mappings)
+      expect(richSnapshot(directory)).toEqual(expected)
       expect(existsSync(join(directory, "bookkeeping-cycles", first.id,
         "session-bookkeeping-migration.json"))).toBe(true)
       const again = exportBookkeepingJson(directory)
@@ -106,11 +110,14 @@ for (const sidecarVersion of [1, 2]) for (const storeVersion of [1, 3]) {
     const directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-crash-export-")))
     try {
       const { entry, key } = seed(directory, sidecarVersion, storeVersion)
+      enrichFixture(directory)
       await migrateBookkeeping(directory, { writersStopped: true })
+      const expected = richSnapshot(directory)
       child("export", directory, point.startsWith("barrier:") ? point : `export:${point}`)
       expect(() => initializeSessionBookkeeping(directory)).toThrow("export in progress or completed")
       const result = exportBookkeepingJson(directory)
       expect(result.phase).toBe("EXPORTED")
+      expect(result.documents).toEqual(expected.documents)
       const store = parseLegacyStoreForMaintenance(readFileSync(join(directory, "sessions.json"), "utf8"))
       expect(JSON.stringify(store.sessions.entry)).toBe(JSON.stringify(entry))
       expect(store.meta.version).toBe(storeVersion as 1 | 3)
@@ -120,6 +127,8 @@ for (const sidecarVersion of [1, 2]) for (const storeVersion of [1, 3]) {
       expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
       expect(existsSync(join(directory, "sessions.json.lock"))).toBe(false)
       expect(existsSync(join(directory, "session-gc.json.lock"))).toBe(false)
+      await migrateBookkeeping(directory, { writersStopped: true })
+      expect(richSnapshot(directory)).toEqual(expected)
     } finally { rmSync(directory, { recursive: true, force: true }) }
   }, 20000)
 }
