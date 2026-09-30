@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
-import { spawn, spawnSync } from "node:child_process"
+import { spawn } from "node:child_process"
 import { once } from "node:events"
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import ts from "typescript"
+import * as facade from "../proxy/sessionStore"
 import { BookkeepingBusyError, initializeSessionBookkeeping, withBookkeepingWrite }
   from "../proxy/session/bookkeeping/database"
 import type { BookkeepingHandle } from "../proxy/session/bookkeeping/database"
@@ -152,54 +152,38 @@ it("returns typed overload without sleeping when a real child holds BEGIN IMMEDI
   }
 }, 20000)
 
-const baseline = spawnSync("git", ["show", "d0d92c4:src/proxy/sessionStore.ts"], { encoding: "utf8" })
-const contractTest = baseline.status === 0 ? it : it.skip
-if (baseline.status !== 0) console.warn("SKIP ledger syntax comparison: baseline d0d92c4 unavailable")
-contractTest("preserves every existing function signature and JSON body after removing dispatch", () => {
-  const parse = (text: string) => ts.createSourceFile("store.ts", text, ts.ScriptTarget.Latest, true)
-  const old = parse(baseline.stdout)
-  const current = parse(readFileSync("src/proxy/sessionStore.ts", "utf8"))
-  const printer = ts.createPrinter({ removeComments: true })
-  const functions = (file: ts.SourceFile) => new Map(file.statements.filter(ts.isFunctionDeclaration)
-    .map((node) => [node.name!.text, node]))
-  const now = functions(current)
-  for (const [name, previous] of functions(old)) {
-    const next = now.get(name)!
-    expect(next, name).toBeDefined()
-    const signature = (node: ts.FunctionDeclaration, file: ts.SourceFile) =>
-      printer.printNode(ts.EmitHint.Unspecified, ts.factory.createFunctionTypeNode(node.typeParameters,
-        node.parameters, node.type ?? ts.factory.createKeywordTypeNode(ts.SyntaxKind.VoidKeyword)), file)
-    expect(signature(next, current), name).toBe(signature(previous, old))
-    let statements = [...next.body!.statements]
-    if (statements[0]?.getText(current).startsWith("const backend = activeStoreBackend()")) {
-      statements = statements.slice(2)
-    }
-    if (name === "setSessionStoreDir") statements = statements.slice(1)
-    if (name === "getSessionStoreDir") {
-      // Runtime address dispatch is separate from the unchanged legacy default-directory body.
-      // Do not use activeStoreBackend here: address reads are legal even in a direct SQL scope
-      // while the facade is JSON, whereas choosing that JSON backend is deliberately refused.
-      expect(statements[0]?.getText(current)).toBe("const retained = retainedBookkeepingRuntimeDirectory()")
-      expect(statements[1]?.getText(current)).toBe("if (retained) return retained")
-      statements = statements.slice(2)
-    }
-    const body = (rows: readonly ts.Statement[], file: ts.SourceFile) =>
-      printer.printNode(ts.EmitHint.Unspecified, ts.factory.createBlock(rows, true), file)
-    expect(body(statements, current), name).toBe(body(previous.body!.statements, old))
-  }
-  const moved = parse(readFileSync("src/proxy/session/bookkeeping/storeTypes.ts", "utf8"))
-  const declarations = (file: ts.SourceFile) => new Map(file.statements
-    .filter((node): node is ts.InterfaceDeclaration | ts.TypeAliasDeclaration =>
-      ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)).map((node) => [node.name.text, node]))
-  const oldTypes = declarations(old)
-  let matched = 0
-  for (const [name, next] of declarations(moved)) {
-    const previous = oldTypes.get(name)
-    if (!previous) continue
-    const text = (node: ts.Node, file: ts.SourceFile) =>
-      printer.printNode(ts.EmitHint.Unspecified, node, file).replace(/\s+/g, "")
-    expect(text(next, moved), name).toBe(text(previous, old))
-    matched++
-  }
-  expect(matched).toBe(10)
+it("preserves the portable JSON store API, fenced CAS and replacement lineage", () => {
+  setSessionStoreDir(directory)
+  const missing: facade.SharedSessionLookupResult = facade.lookupSharedSessionResult("contract")
+  expect(missing.status).toBe("missing")
+  const locator: facade.TranscriptLocator = { configDir: directory, sessionId: "first" }
+  const first: facade.StoredSessionGeneration | false = facade.storeSharedSession("contract", "first", 2,
+    "lineage", ["human", "assistant"], [null, "assistant-uuid"], undefined, [["block"]], null, null,
+    locator, undefined, null)
+  expect(typeof first).toBe("string")
+  const found: facade.SharedSessionLookupResult = facade.lookupSharedSessionResult("contract")
+  expect(found.status).toBe("found")
+  if (found.status !== "found" || typeof first !== "string") throw new Error("expected mapping")
+  expect(found.generation).toBe(first)
+  expect(found.session.sdkMessageUuids).toEqual([null, "assistant-uuid"])
+  expect(found.session.currentTranscript).toEqual(locator)
+  const before = readFileSync(join(directory, "sessions.json"), "utf8")
+  expect(facade.storeSharedSession("contract", "rejected", 0, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, undefined, null)).toBe(false)
+  expect(readFileSync(join(directory, "sessions.json"), "utf8")).toBe(before)
+  const second = facade.storeSharedSession("contract", "second", 3, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, { configDir: directory, sessionId: "second" }, locator, first)
+  expect(typeof second).toBe("string")
+  expect(second).not.toBe(first)
+  const snapshot: Record<string, facade.StoredSession> = facade.readSessionStoreSnapshot()
+  expect(snapshot.contract?.previousClaudeSessionId).toBe("first")
+  expect(snapshot.contract?.previousTranscript).toEqual(locator)
+  expect(facade.lookupSharedSessionByClaudeId("second")?.claudeSessionId).toBe("second")
+  expect(facade.readSessionTranscriptPins()).toHaveLength(2)
+  expect(facade.evictSharedSession("contract", first)).toBe(false)
+  if (typeof second !== "string") throw new Error("expected replacement")
+  expect(facade.evictSharedSession("contract", second)).toBe(true)
+  expect(facade.lookupSharedSession("contract")).toBeUndefined()
+  expect(facade.lookupSharedSessionResult("contract").status).toBe("missing")
+  expect(facade.readSessionStoreSnapshot()).toEqual({})
 })

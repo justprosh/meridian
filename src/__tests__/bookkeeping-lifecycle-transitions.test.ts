@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
-import { spawn, spawnSync } from "node:child_process"
+import { spawn } from "node:child_process"
 import { once } from "node:events"
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import ts from "typescript"
 import * as facade from "../proxy/sessionLifecycle"
 import * as incarnations from "../proxy/session/processIncarnation"
 import { initializeSessionBookkeeping, withBookkeepingWrite, type BookkeepingHandle }
@@ -267,38 +266,34 @@ it("yields while a real Node child holds BEGIN IMMEDIATE; joined cleanup is retr
   expect(readResourceLease(handle.reader, resource(locator).key, lease.token)).toBeUndefined()
 }, 20000)
 
-it("preserves the accepted GC-budget baseline signatures and every JSON function body after removing only dispatch", () => {
-  // 6706409 is the accepted hub2 full-budget/bounded-handshake fix. Comparing
-  // to the earlier d1a9164 would enforce the intentionally superseded timeout bug.
-  const baseline = spawnSync("git", ["show", "d1a9164:src/proxy/sessionLifecycle.ts"], { encoding: "utf8" })
-  const gcBaseline = spawnSync("git", ["show", "670640982074976b28da342faeab836eb5c12814:src/proxy/sessionLifecycle.ts"], { encoding: "utf8" })
-  expect(baseline.status).toBe(0)
-  expect(gcBaseline.status).toBe(0)
-  const parse = (text: string) => ts.createSourceFile("lifecycle.ts", text, ts.ScriptTarget.Latest, true)
-  const old = parse(baseline.stdout)
-  const acceptedGc = parse(gcBaseline.stdout)
-  const current = parse(readFileSync("src/proxy/sessionLifecycle.ts", "utf8"))
-  const printer = ts.createPrinter({ removeComments: true })
-  const functions = (file: ts.SourceFile) => new Map(file.statements.filter(ts.isFunctionDeclaration)
-    .map((node) => [node.name!.text, node]))
-  const nextFunctions = functions(current)
-  const gcFunctions = functions(acceptedGc)
-  const gcChanges = new Set(["runGc", "attachDeletionExecutor", "deleteWithSdkChild"])
-  for (const [name, original] of functions(old)) {
-    // Only the three functions changed by the accepted GC source commit take
-    // that baseline; retain all earlier SQL extraction invariants elsewhere.
-    const reference = gcChanges.has(name) ? acceptedGc : old
-    const previous = gcChanges.has(name) ? gcFunctions.get(name)! : original
-    const next = nextFunctions.get(name)!
-    expect(next, name).toBeDefined()
-    const signature = (node: ts.FunctionDeclaration, file: ts.SourceFile) => printer.printNode(ts.EmitHint.Unspecified,
-      ts.factory.createFunctionTypeNode(node.typeParameters, node.parameters,
-        node.type ?? ts.factory.createKeywordTypeNode(ts.SyntaxKind.VoidKeyword)), file)
-    expect(signature(next, current), name).toBe(signature(previous, reference))
-    let statements = [...next.body!.statements]
-    if (statements[0]?.getText(current).startsWith("const backend = activeLifecycleBackend()")) statements = statements.slice(2)
-    const body = (rows: readonly ts.Statement[], file: ts.SourceFile) =>
-      printer.printNode(ts.EmitHint.Unspecified, ts.factory.createBlock(rows, true), file)
-    expect(body(statements, current), name).toBe(body(previous.body!.statements, reference))
-  }
+it("preserves the portable JSON publication API, exact generations and callback rollback", async () => {
+  facade.setSessionLifecycleBackendForTest(null)
+  const legacyOptions: facade.SessionLifecycleOptions = { storeDir: join(directory, "legacy"), now: () => 1000,
+    deletionTimeoutMs: 5000, deletionHandshakeTimeoutMs: 3000, runTimeoutMs: 1 }
+  const locator: facade.TranscriptLocator = { configDir: directory, sessionId: "legacy-contract" }
+  const prepared: facade.TranscriptLocator = await facade.prepareForkForPublication(locator, legacyOptions)
+  const sidecarPath = join(legacyOptions.storeDir!, "session-gc.json")
+  const before = readFileSync(sidecarPath, "utf8")
+  const rejected: Promise<false> = facade.publishPinnedTranscript(prepared, () => false as const, legacyOptions)
+  expect(await rejected).toBe(false)
+  expect(readFileSync(sidecarPath, "utf8")).toBe(before)
+  await expect(facade.publishPinnedTranscript(prepared, () => { throw new Error("callback failed") }, legacyOptions))
+    .rejects.toThrow("callback failed")
+  expect(readFileSync(sidecarPath, "utf8")).toBe(before)
+  const published: Promise<"published"> = facade.publishPinnedTranscript(prepared, () => "published" as const, legacyOptions)
+  expect(await published).toBe("published")
+  const key = facade.getTranscriptResourceKey(prepared)
+  const live = JSON.parse(readFileSync(sidecarPath, "utf8")).resources[key]
+  expect(live.state).toBe("live")
+  expect(live.generation).toBe(prepared.lifecycleGeneration)
+  expect(live.activeLeases).toBeUndefined()
+  await expect(facade.commitFork({ ...prepared, lifecycleGeneration: "stale" }, legacyOptions))
+    .rejects.toThrow("stale or missing")
+  const lease: facade.ActiveTranscriptLease = await facade.acquireActiveTranscriptLease([prepared], legacyOptions)
+  expect(lease.resourceKeys).toEqual([key])
+  await facade.releaseActiveTranscriptLease(lease, legacyOptions)
+  const reconciled: facade.ReconcileResult = await facade.reconcile([prepared], legacyOptions)
+  expect(reconciled).toEqual({ preparedRetired: 0, liveRetired: 0, resourcesPinned: 1, deletingRecovered: 0 })
+  await facade.abandonFork(prepared, legacyOptions)
+  expect(JSON.parse(readFileSync(sidecarPath, "utf8")).resources[key].state).toBe("retired")
 })

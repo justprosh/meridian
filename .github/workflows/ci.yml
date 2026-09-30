@@ -14,9 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Contract tests compare accepted historical source, including hub GC fixes.
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
