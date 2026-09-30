@@ -786,7 +786,11 @@ Incarnations proven dead are `dead-incarnation`; `live` requires an OS observati
 Darwin's second-resolution start time cannot prove incarnation equality, but an observed live process
 at that identity still refuses maintenance. Unobservable/malformed identities are `unknown`.
 Gate files do not persist an incarnation, so their verdict is `unknown`, never inferred from PID/age.
-`temporary` lists empty `session-gc.json.tmp-<pid>-<uuid>` files (interrupted legacy atomic writes).
+`temporary` lists `session-gc.json.tmp-<pid>-<uuid>` and `sessions.json.tmp-<pid>-<uuid>` files,
+empty or nonempty, with byte size and SHA256 (interrupted legacy atomic writes).
+A currently live local PID from the filename yields `live` and refuses maintenance; otherwise the verdict
+is `unknown`, not a proof of a dead incarnation. Under `--writers-stopped`, these files are archived
+intact as residue, never discarded because they are temporary or empty.
 `turn-locks/` is outside bookkeeping and is neither listed nor moved.
 An empty directory candidate lacking `owner.json` is `unknown` with `kind: "incomplete-candidate"`,
 not corruption. Its original inode is captured by rename into a fresh UUID name under `residue/`, recorded

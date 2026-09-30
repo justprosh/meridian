@@ -11,6 +11,7 @@ import { join } from "node:path"
 import { initializeSessionBookkeeping } from "../proxy/session/bookkeeping/database"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
 import { seedResidueInventory } from "./fixtures/bookkeeping-residue-inventory"
+import { buildNodeFixture } from "./fixtures/bookkeeping-support"
 
 let directory: string
 beforeAll(() => {
@@ -33,6 +34,45 @@ function success(command: string, flags: string[] = []) {
   expect(result.status, result.stdout + result.stderr).toBe(0)
   return JSON.parse(result.stdout)
 }
+
+it("migrate → export in one Node process completes 50 times without a retained inspection reader", async () => {
+  const build = join(directory, "build")
+  mkdirSync(build, { mode: 0o700 })
+  const bundled = await buildNodeFixture("bookkeeping-cli-cycles.ts", "cycles.mjs", build)
+  expect(bundled.success).toBe(true)
+  const result = spawnSync("node", [join(build, "cycles.mjs"), directory], { encoding: "utf8", timeout: 60000 })
+  expect(result.status, result.stdout + result.stderr).toBe(0)
+  const rows = result.stdout.trim().split("\n").map((line) => JSON.parse(line))
+  expect(rows).toHaveLength(100)
+  expect(rows.every((row) => row.exit_code === 0)).toBe(true)
+}, 65000)
+
+it("an external child read transaction still refuses export with exit 4 and WAL-lock diagnostics", async () => {
+  success("migrate", ["--writers-stopped"])
+  const child = spawn("node", ["--input-type=module", "-e", `
+    import Database from 'libsql';
+    const db = new Database(process.argv[1]);
+    db.exec("INSERT INTO fence_slots VALUES('store','ffff',1)");
+    db.exec('BEGIN');
+    const statement = db.prepare('SELECT * FROM schema_meta'); statement.get();
+    if (!db.inTransaction) throw new Error('reader transaction missing');
+    console.log('ready'); setInterval(() => { void statement; }, 1000);
+  `, join(directory, "session-bookkeeping.sqlite")], { stdio: "pipe" })
+  try {
+    await once(child.stdout!, "data")
+    const refused = cli("export-json")
+    expect(refused.status, refused.stdout + refused.stderr).toBe(4)
+    const error = JSON.parse(refused.stdout).error
+    expect(error).toContain("external database reader/writer holds a WAL lock")
+    expect(error).toContain("holder PID unavailable from SQLite")
+    expect(error).toContain("local handles=1, local transaction=false")
+  } finally {
+    const exited = once(child, "exit")
+    child.kill("SIGKILL")
+    await exited
+  }
+  expect(success("export-json").phase).toBe("exported")
+}, 20000)
 it("packaged CLI completes legacy → ready → exported → ready with stable inspection", () => {
   const names = readdirSync(directory).sort()
   expect(success("inspect").phase).toBe("legacy")
@@ -112,12 +152,12 @@ it("archives the staging residue inventory with an explicit stop/drain attestati
   expect(before.candidates.every((row: { verdict: string }) => row.verdict === "dead-incarnation")).toBe(true)
   expect(before.gates).toHaveLength(15)
   expect(before.gates.every((row: { verdict: string }) => row.verdict === "unknown")).toBe(true)
-  expect(before.temporary).toHaveLength(3)
+  expect(before.temporary).toHaveLength(5)
   expect(before.temporary.every((row: { verdict: string }) => row.verdict === "unknown")).toBe(true)
   const after = success("migrate", ["--writers-stopped"])
   expect(after.phase).toBe("ready")
   expect(after.archived_cycles).toBe(0)
-  expect(after.result.residues).toHaveLength(22)
+  expect(after.result.residues).toHaveLength(24)
   const journal = JSON.parse(readFileSync(join(directory, "session-bookkeeping-migration.json"), "utf8"))
   expect(journal.residues).toEqual(after.result.residues)
   for (const name of names) {
@@ -160,24 +200,37 @@ for (const operation of ["linked", "moved"]) it(`resumes residue ${operation} wi
   expect(cli("migrate", ["--writers-stopped"], cut).signal).toBe("SIGKILL")
   const resumed = success("migrate", ["--writers-stopped"])
   expect(resumed.phase).toBe("ready")
-  expect(resumed.result.residues).toHaveLength(22)
+  expect(resumed.result.residues).toHaveLength(24)
   expect(success("inspect").candidates).toEqual([])
 })
 
-it("archives an unknown candidate only with attestation, and ignores nonempty legacy temporary files", () => {
+it("archives an unknown candidate and nonempty legacy temporary files only with attestation", () => {
   const candidate = "sessions.json.lock.candidate-1-00000000-0000-4000-8000-000000000001"
-  const temporary = "session-gc.json.tmp-1-00000000-0000-4000-8000-000000000002"
+  const temporary = "session-gc.json.tmp-2147483647-00000000-0000-4000-8000-000000000002"
   writeFileSync(join(directory, candidate), "unknown owner", { mode: 0o600 })
   writeFileSync(join(directory, temporary), "not empty", { mode: 0o600 })
   expect(success("inspect").candidates).toEqual([{ path: candidate, verdict: "unknown" }])
-  expect(success("inspect").temporary).toEqual([])
+  expect(success("inspect").temporary).toMatchObject([{ path: temporary, verdict: "unknown", bytes: 9 }])
   expect(cli("migrate").status).toBe(2)
   expect(readFileSync(join(directory, candidate), "utf8")).toBe("unknown owner")
   const after = success("migrate", ["--writers-stopped"])
-  expect(after.result.residues).toHaveLength(1)
+  expect(after.result.residues).toHaveLength(2)
   expect(after.result.residues[0].verdict).toBe("unknown")
-  expect(readFileSync(join(directory, temporary), "utf8")).toBe("not empty")
+  expect(readFileSync(join(directory, "bookkeeping-cycles", after.migration_id, "residue", temporary), "utf8"))
+    .toBe("not empty")
 })
+
+for (const source of ["sessions", "session-gc"]) for (const bytes of ["", "not empty"]) {
+  it(`refuses ${source} temporary residue with a live filename PID (${bytes.length} bytes)`, () => {
+    const name = `${source}.json.tmp-${process.pid}-00000000-0000-4000-8000-000000000002`
+    writeFileSync(join(directory, name), bytes, { mode: 0o600 })
+    expect(success("inspect").temporary).toMatchObject([{ path: name, verdict: "live", bytes: bytes.length }])
+    const refused = cli("migrate", ["--writers-stopped"])
+    expect(refused.status, refused.stdout + refused.stderr).toBe(3)
+    expect(JSON.parse(refused.stdout).error).toContain(name)
+    expect(readFileSync(join(directory, name), "utf8")).toBe(bytes)
+  })
+}
 
 it("inspects and archives an incomplete directory candidate without inventing an owner", () => {
   const name = "sessions.json.lock.candidate-1-00000000-0000-4000-8000-000000000001"

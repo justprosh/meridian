@@ -87,6 +87,15 @@ const statements = [
     mapping_key TEXT NOT NULL, mapping_generation TEXT NOT NULL
   ) STRICT`,
   `CREATE TABLE bookkeeping_counts (kind TEXT PRIMARY KEY NOT NULL, ${integer("value")}) STRICT`,
+  `CREATE TABLE legacy_exports (
+    kind TEXT NOT NULL CHECK(kind IN ('resource','mapping')), key TEXT NOT NULL,
+    projection_digest TEXT NOT NULL CHECK(length(projection_digest)=64),
+    ${json("entry_json", false)}, PRIMARY KEY(kind,key)
+  ) STRICT`,
+  `CREATE TRIGGER resources_delete_export AFTER DELETE ON resources BEGIN
+    DELETE FROM legacy_exports WHERE kind='resource' AND key=OLD.key; END`,
+  `CREATE TRIGGER mappings_delete_export AFTER DELETE ON mappings BEGIN
+    DELETE FROM legacy_exports WHERE kind='mapping' AND key=OLD.key; END`,
   "CREATE INDEX resources_due ON resources(state,coalesce(next_attempt_at,0),updated_at,key)",
   "CREATE INDEX retired_order ON resources(updated_at,key,next_attempt_at) WHERE state='retired'",
   "CREATE INDEX resources_deleted ON resources(updated_at DESC,key) WHERE state='deleted'",

@@ -4,7 +4,8 @@ import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { fileIdentity, verifyFile } from "./exportJournal"
 import { crashPoint, digestBytes } from "./maintenanceJournal"
 import { archiveIncompleteDirectory } from "./residueDirectory"
-import { candidateVerdict, inspectArtifacts } from "./residueInventory"
+import { candidateVerdict, inspectArtifacts, temporaryVerdict } from "./residueInventory"
+import { isLegacyTemporaryName } from "./residueTypes"
 import type { ArchivedResidue } from "./residueTypes"
 import { BookkeepingMaintenanceRequiredError, ownedFd } from "./storagePaths"
 import { retireFile } from "./privateRetirement"
@@ -50,7 +51,8 @@ export function archiveResidues(directory: string, id: string, residues: Archive
     }
     const expected = { name: row.path, digest: row.digest, bytes: row.bytes }
     if (existsSync(source)) {
-      if (row.path.includes(".candidate-") && candidateVerdict(source) === "live") {
+      if (row.path.includes(".candidate-") && candidateVerdict(source) === "live"
+        || isLegacyTemporaryName(row.path) && temporaryVerdict(row.path) === "live") {
         throw new BookkeepingMaintenanceRequiredError(`live residue: ${row.path}`)
       }
       verifyFile(directory, row.path, expected)

@@ -4,7 +4,8 @@ import { dirname, join } from "node:path"
 import { acquireMaintenanceGuard } from "./guard"
 import { openForMaintenance } from "./maintenance"
 import { BOOKKEEPING_FILENAME } from "./connection"
-import { checkpointBookkeepingOffline, withBookkeepingRead } from "./transaction"
+import { withBookkeepingRead } from "./transaction"
+import { truncateOffline } from "./offlineCheckpoint"
 import { snapshotForExport, verifyExportSnapshot } from "./exportSnapshot"
 import {
   crashPoint, digestBytes, readJournal, requireBarriers, SOURCE_NAMES, writeDurably,
@@ -83,10 +84,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
           saveExportJournal(directory, journal, "INSTALLED")
         }
         verifyInstalled(directory, journal)
-        const checkpoint = checkpointBookkeepingOffline(directory, "TRUNCATE")
-        if (checkpoint.busy !== 0 || checkpoint.log !== 0) {
-          throw new BookkeepingMaintenanceRequiredError("export checkpoint busy; stop all database readers")
-        }
+        truncateOffline(directory, "export")
         crashPoint("export:checkpoint")
       } finally { handle.close() }
       crashPoint("export:closed")

@@ -19,7 +19,7 @@ import { validateBookkeepingSchema } from "../../proxy/session/bookkeeping/schem
 import { migrateBookkeeping } from "../../proxy/session/bookkeeping/migration"
 
 const TABLES = ["schema_meta", "resources", "resource_leases", "fence_slots", "mappings", "mapping_history",
-  "mapping_pins", "priority_assignments", "priority_attempts", "priority_rollbacks", "bookkeeping_counts"]
+  "mapping_pins", "priority_assignments", "priority_attempts", "priority_rollbacks", "bookkeeping_counts", "legacy_exports"]
 
 export function enrichFixture(directory: string, sidecarVersion: 1 | 2 = 2): void {
   const sidecar = parseLegacySidecar(readFileSync(join(directory, "session-gc.json"), "utf8"))

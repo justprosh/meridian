@@ -20,6 +20,9 @@ import {
 import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
 import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
 import { validateBookkeepingSchema } from "../proxy/session/bookkeeping/schema"
+import { enrichFixture } from "./fixtures/bookkeeping-rich-fixture"
+import { legacyInput, expectLegacyInput } from "./fixtures/bookkeeping-export-oracle"
+import { inspectBookkeeping } from "../proxy/session/bookkeeping/inspect"
 
 let directory: string
 beforeEach(() => { directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-export-"))) })
@@ -34,6 +37,35 @@ function resource(sessionId = "session") {
   const locator = canonicalizeLocator({ configDir: directory, sessionId })
   return { key: resourceKey(locator), locator, state: "live", createdAt: 1, updatedAt: 2, attempts: 0 }
 }
+
+it("exports the rich legacy input, including entry digests, without leaking SQL columns", async () => {
+  const row = resource()
+  source("session-gc.json", { version: 1, resources: { [row.key]: row } })
+  source("sessions.json", { [STORE_META_KEY]: { version: 3, slots: {}, priorityAssignments: {},
+    priorityAttempts: {}, priorityRollbackMappings: {} }, entry: entry() })
+  enrichFixture(directory)
+  const expected = legacyInput(directory)
+  await migrate()
+  exportBookkeepingJson(directory)
+  expectLegacyInput(directory, expected)
+})
+
+it("never restores raw resource payload after a row-version change, even when fields return to their old values", async () => {
+  const row = resource()
+  source("session-gc.json", { version: 1, resources: { [row.key]: { ...row, extension: "import-only" } } })
+  await migrate()
+  const handle = initializeSessionBookkeeping(directory)
+  try {
+    withBookkeepingWrite(directory, {}, (tx) => {
+      tx.run("UPDATE resources SET state='retired',row_version=row_version+1 WHERE key=?", row.key)
+      tx.run("UPDATE resources SET state='live',row_version=row_version+1 WHERE key=?", row.key)
+    })
+  } finally { handle.close() }
+  exportBookkeepingJson(directory)
+  const exported = JSON.parse(readFileSync(join(directory, "session-gc.json"), "utf8")).resources[row.key]
+  expect(exported).toEqual({ ...row, generation: `r:${row.key}:1` })
+  expect(Object.hasOwn(exported, "rowVersion")).toBe(false)
+})
 
 for (const version of [1, 3] as const) it(`exports current state to store v${version}, not migrated backups`, async () => {
   const row = resource()
@@ -107,7 +139,10 @@ it("refuses export with a shared holder or a live physical-executor incarnation"
     withBookkeepingWrite(directory, {}, (tx) => insertResourceLease(tx, row.key,
       { token: "alive", owner, executor: owner, executorRecoverable: false, createdAt: 1 }))
   } finally { handle.close() }
-  expect(() => exportBookkeepingJson(directory)).toThrow("live or indeterminate")
+  const owner = captureProcessIncarnation()!
+  expect(() => exportBookkeepingJson(directory)).toThrow(/(?:live|indeterminate) process at/)
+  expect(() => exportBookkeepingJson(directory)).toThrow(`${row.key}/lease/alive/owner`)
+  expect(() => exportBookkeepingJson(directory)).toThrow(`pid=${owner.pid} startId=${JSON.stringify(owner.startId)}`)
   expect(existsSync(join(directory, "session-bookkeeping-export.json"))).toBe(false)
 })
 
@@ -176,6 +211,9 @@ it("exports production-size 6400 resources / 2500 mappings / about 38 MB", async
   ])))
   await migrate()
   const start = performance.now()
+  const sizes = inspectBookkeeping(directory).sizes
+  expect(sizes.wal).toBe(0)
+  expect(sizes.main).toBeGreaterThan(37_000_000)
   const result = exportBookkeepingJson(directory)
   const elapsedMs = performance.now() - start
   const bytes = result.documents.reduce((n, doc) => n + doc.bytes, 0)

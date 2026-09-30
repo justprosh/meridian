@@ -9,6 +9,9 @@ import { enrichFixture } from "./fixtures/bookkeeping-rich-fixture"
 import { nestedCodecCases } from "./fixtures/bookkeeping-nested-codec-corpus"
 import type { CodecCase } from "./fixtures/bookkeeping-nested-codec-corpus"
 import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
+import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
+import { exportBookkeepingJson } from "../proxy/session/bookkeeping/exportJson"
+import { legacyInput, expectLegacyInput } from "./fixtures/bookkeeping-export-oracle"
 
 const baseline = spawnSync("git", ["cat-file", "-e", "ccc5ba3^{commit}"], { encoding: "utf8" })
 const reason = baseline.status === 0 ? "" : " — git object ccc5ba3 unavailable (e.g. shallow checkout)"
@@ -108,5 +111,22 @@ differentialTest(`ccc5ba3 codecs and extracted codecs produce identical bytes an
       equal: JSON.stringify(outcomes[index]?.old) === JSON.stringify(outcomes[index]?.current),
     })))
     for (const [index, row] of outcomes.entries()) expect(row.current, JSON.stringify(cases[index])).toEqual(row.old)
+    // Every accepted document runs through storage, not merely through the same serializer twice.
+    for (const [index, row] of cases.entries()) {
+      const cycle = join(root, `roundtrip-${index}`)
+      mkdirSync(cycle, { mode: 0o700 })
+      writeFileSync(join(cycle, "session-gc.json"), row.kind === "sidecar" ? row.raw
+        : readFileSync(join(data, "session-gc.json")), { mode: 0o600 })
+      writeFileSync(join(cycle, "sessions.json"), row.kind === "store" ? row.raw
+        : JSON.stringify({ [STORE_META_KEY]: { version: 1, slots: {} } }), { mode: 0o600 })
+      if (outcomes[index]!.old.error !== undefined) {
+        await expect(migrateBookkeeping(cycle, { writersStopped: true }), row.label ?? row.raw).rejects.toThrow()
+      } else {
+        const original = legacyInput(cycle)
+        await migrateBookkeeping(cycle, { writersStopped: true })
+        exportBookkeepingJson(cycle)
+        expectLegacyInput(cycle, original)
+      }
+    }
   } finally { rmSync(root, { recursive: true, force: true }) }
 }, 60000)

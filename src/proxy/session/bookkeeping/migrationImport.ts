@@ -9,6 +9,7 @@ import { parseLegacySidecar, parseLegacyStoreForMaintenance, emptyStoreDocument 
 import type { SessionGcSidecar, SessionStoreDocument } from "./legacyCodec"
 import type { BookkeepingResource, CanonicalStoredSession, BookkeepingTransaction } from "./types"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
+import { preserveLegacyExport } from "./legacyExport"
 
 export interface ImportPlan {
   sidecar: SessionGcSidecar
@@ -19,8 +20,13 @@ export interface ImportPlan {
 
 export function assertQuiescent(sidecar: SessionGcSidecar): void {
   const requireDead = (owner: ProcessIncarnation | undefined, address: string) => {
-    if (owner && probeProcessIncarnation(owner) !== "dead") {
-      throw new BookkeepingMaintenanceRequiredError(`live or indeterminate process at ${address}; stop all writers`)
+    if (!owner) return
+    const verdict = probeProcessIncarnation(owner)
+    if (verdict !== "dead") {
+      throw new BookkeepingMaintenanceRequiredError(
+        `${verdict === "alive" ? "live" : "indeterminate"} process at ${address}; `
+        + `pid=${owner.pid} startId=${JSON.stringify(owner.startId)}; stop all writers`,
+      )
     }
   }
   for (const [key, resource] of Object.entries(sidecar.resources)) {
@@ -64,6 +70,7 @@ export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: str
     importResource(tx, { ...resource, rowVersion: 1 })
     for (const lease of Object.values(resource.activeLeases ?? {})) insertResourceLease(tx, resource.key, lease)
     tx.run("UPDATE resources SET row_version=? WHERE key=?", resource.rowVersion, resource.key)
+    preserveLegacyExport(tx, "resource", resource.key, plan.sidecar.resources[resource.key]!)
   }
   // importResource populates only a subset; the source maps, including unused and zero store slots, are authoritative.
   tx.run("DELETE FROM fence_slots")
@@ -78,6 +85,8 @@ export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: str
     writeMappingRow(tx, key, canonical)
     if (canonical.generationId === undefined) {
       tx.run("UPDATE mapping_history SET history_json=? WHERE mapping_key=?", original, key)
+    } else {
+      preserveLegacyExport(tx, "mapping", key, plan.store.sessions[key]!)
     }
   }
   const meta = plan.store.meta

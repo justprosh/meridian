@@ -90,7 +90,11 @@ export function inspectBookkeeping(input: string): Inspection {
           Array<{ state: string; n: number }>
         for (const row of counts) resources[row.state] = row.n
         mappings = (db.prepare("SELECT count(*) AS n FROM mappings").get() as { n: number }).n
-      } finally { db.close() }
+      } finally {
+        // libsql close can defer native teardown until statements are collected. End the
+        // snapshot explicitly: an inspection must not leave a read mark behind until GC.
+        try { if (db.inTransaction) db.exec("ROLLBACK") } finally { db.close() }
+      }
     } else {
       if (["ready", "imported"].includes(phase)) throw new Error("committed migration database missing")
       const sidecar = join(directory, "session-gc.json")

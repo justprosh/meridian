@@ -1,7 +1,7 @@
 import { isUuidV4 } from "./uuid"
 
 export type ResidueVerdict = "dead-incarnation" | "live" | "unknown"
-export interface Residue { path: string; verdict: ResidueVerdict; kind?: "incomplete-candidate" }
+export interface Residue { path: string; verdict: ResidueVerdict; kind?: "incomplete-candidate"; digest?: string; bytes?: number }
 export interface ArchivedResidue extends Residue {
   digest: string; bytes: number; dev: number; ino: number; archiveName?: string
 }
@@ -13,7 +13,7 @@ export function isResiduePath(path: string): boolean {
 }
 
 export function isLegacyTemporaryName(path: string): boolean {
-  const prefix = /^session-gc\.json\.tmp-\d+-/.exec(path)?.[0]
+  const prefix = /^(session-gc|sessions)\.json\.tmp-\d+-/.exec(path)?.[0]
   return prefix !== undefined && isUuidV4(path.slice(prefix.length))
 }
 

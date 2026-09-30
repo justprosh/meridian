@@ -13,7 +13,9 @@ export function seedResidueInventory(directory: string): string[] {
   })
   files[`deletion-gates/${uuid(4)}.go`] = "go\n"
   for (let i = 0; i < 14; i++) files[`sdk-process-gates/186548-${uuid(i + 5)}.gate`] = "#!/bin/sh\nexit 0\n"
-  for (let i = 0; i < 3; i++) files[`session-gc.json.tmp-186548-${uuid(i + 19)}`] = ""
+  for (let i = 0; i < 3; i++) files[`session-gc.json.tmp-2147483647-${uuid(i + 19)}`] = ""
+  files[`session-gc.json.tmp-2147483647-${uuid(22)}`] = '{"version":2,"partial":"sidecar"}'
+  files[`sessions.json.tmp-2147483647-${uuid(23)}`] = '{"partial":"store"}'
   for (const name of ["deletion-gates", "sdk-process-gates", "turn-locks"]) {
     mkdirSync(join(directory, name), { mode: 0o700 })
   }

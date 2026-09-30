@@ -35,7 +35,8 @@ function deletionReferences(source: string): string[] {
       && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0]!) && fsModule(node.arguments[0]!.text)
   }
   // Local syntax guard, not a cross-module type/taint proof: aliases hidden behind another module/path,
-  // runtime eval and type laundering through unknown elsewhere remain outside this check. Imports and
+  // runtime eval, computed dynamic-import specifiers, later assignments and type laundering through
+  // unknown elsewhere remain outside this check. Imports and
   // privateNames consumers still require review; these restrictions cover accidental in-directory bypasses.
   let size = -1
   while (size !== fsNames.size + brands.size) {
@@ -86,6 +87,17 @@ function deletionReferences(source: string): string[] {
     if ((ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) && protectedType(node.type)) {
       findings.push("PrivatePath cast outside its generator")
     }
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isPropertyDeclaration(node))
+      && node.type && protectedType(node.type) && node.initializer) {
+      walk(node.initializer, (child) => {
+        if (ts.isAsExpression(child) || ts.isTypeAssertionExpression(child)) {
+          findings.push("PrivatePath annotated initializer contains a cast")
+        }
+      })
+    }
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      && node.arguments[0] && (ts.isStringLiteral(node.arguments[0]) || ts.isNoSubstitutionTemplateLiteral(node.arguments[0]))
+      && fsModule(node.arguments[0].text)) findings.push("dynamic filesystem import")
     if ((ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node)) && protectedType(node)) {
       findings.push("PrivatePath type alias/interface outside its generator")
     }
@@ -133,8 +145,20 @@ for (const snippet of [
   'import type { PrivatePath as P } from "./privateNames"; export { P as Leaked }',
   'import type { PrivatePath as P } from "./privateNames.js"; const p = path as P',
   'const p = path as import("./privateNames.js").SomeAlias',
+  'const p: PrivatePath = path as any',
+  'const p: PrivatePath = path as unknown as any',
+  'const p: PrivatePath = <any>path',
+  'function f(p: PrivatePath = path as any) {}',
+  'function f(p: PrivatePath = path as unknown as any) {}',
+  'class C { p: PrivatePath = path as any }',
+  'class C { p: PrivatePath = path as unknown as any }',
+  'import type { PrivatePath as P } from "./privateNames"; const p: P = path as any',
+  'const io = await import("node:fs"); io[name](path)',
+  'const io = await import("node:fs/promises"); io[name](path)',
+  'const io = await import(`node:fs/promises`)',
 ]) it(`invariant rejects ${snippet}`, () => { expect(deletionReferences(snippet).length).toBeGreaterThan(0) })
 
 it("private wrappers, comments and strings are not direct deletion calls", () => {
   expect(deletionReferences('unlinkPrivate(path); // unlinkSync(path)\nconst note = "rmSync(path)"')).toEqual([])
+  expect(deletionReferences('const p: PrivatePath = generatePrivatePath(); unlinkPrivate(p)')).toEqual([])
 })

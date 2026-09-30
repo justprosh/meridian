@@ -1,10 +1,23 @@
 import { closeSync, existsSync, lstatSync, readdirSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { join } from "node:path"
 import { captureProcessIncarnation, parseProcessIncarnation, probeProcessIncarnation } from "../processIncarnation"
 import { protectedBytes } from "./exportJournal"
 import { errorCode, ownedFd } from "./storagePaths"
 import type { Residue, ResidueVerdict } from "./residueTypes"
 import { isLegacyTemporaryName } from "./residueTypes"
+
+export function temporaryVerdict(name: string): ResidueVerdict {
+  const pid = Number(/\.tmp-(\d+)-/.exec(name)?.[1])
+  if (!isLegacyTemporaryName(name) || !Number.isSafeInteger(pid) || pid <= 0 || pid > 2147483647) return "unknown"
+  try {
+    process.kill(pid, 0)
+    return "live"
+  } catch (error) {
+    // EPERM still observes an existing process. Missing PID is not an incarnation proof.
+    return errorCode(error) === "EPERM" ? "live" : "unknown"
+  }
+}
 
 export function candidateVerdict(path: string): ResidueVerdict {
   const stat = lstatSync(path)
@@ -44,7 +57,10 @@ export function inspectArtifacts(directory: string): { candidates: Residue[]; ga
     for (const file of readdirSync(path)) gates.push({ path: `${name}/${file}`, verdict: "unknown" })
   }
   const temporary: Residue[] = names.filter(isLegacyTemporaryName)
-    .filter((name) => protectedBytes(join(directory, name), true, true).length === 0)
-    .map((path) => ({ path, verdict: "unknown" }))
+    .map((path) => {
+      const bytes = protectedBytes(join(directory, path), true, true)
+      return { path, verdict: temporaryVerdict(path), bytes: bytes.length,
+        digest: createHash("sha256").update(bytes).digest("hex") }
+    })
   return { candidates, gates, temporary }
 }

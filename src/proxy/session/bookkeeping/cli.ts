@@ -27,7 +27,8 @@ Never remove barriers manually. Both *.json.lock files contain a JSON line:
 "instruction":"Stop all writers; use meridian-bookkeeping export-json. Never delete this barrier manually."}
 This is deliberately NOT a legacy canonical pid/incarnation/token lock owner.
 --json includes timings.total_ms and timings.phases (phase and duration_ms).
-Gate files without incarnations and empty session-gc.json.tmp-<pid>-<uuid> files are unknown.
+Gate files without incarnations are unknown. Both documents' .tmp-<pid>-<uuid> files
+are inventoried with bytes/digest, empty or not: a live local PID refuses; otherwise unknown.
 migrate --writers-stopped archives unknown/dead residues under bookkeeping-cycles/<migration_id>/residue/;
 the attestation includes stopped deletion/SDK children. Live candidates refuse with their path.
 `
@@ -94,10 +95,10 @@ export async function runBookkeepingCli(args: string[], afterMigrationPreflightF
     record("inspect")
     if (options.command === "inspect") after = before
     else {
-      const active = [...(before?.candidates ?? []), ...(before?.gates ?? [])].find((row) =>
+      const active = [...(before?.candidates ?? []), ...(before?.gates ?? []), ...(before?.temporary ?? [])].find((row) =>
         row.verdict === "live" || (row.verdict === "unknown" && options.command !== "migrate"))
       if (active && !(options.command === "migrate" && before?.phase === "ready")) {
-        throw new BookkeepingMaintenanceRequiredError(`live or unknown candidate/gate: ${active.path}`)
+        throw new BookkeepingMaintenanceRequiredError(`${active.verdict} candidate/gate/temporary residue: ${active.path}`)
       }
       if (options.command === "export-json" && before && !["ready", "exporting", "exported"].includes(before.phase)) {
         throw new BookkeepingMaintenanceRequiredError("export requires a READY migration journal")

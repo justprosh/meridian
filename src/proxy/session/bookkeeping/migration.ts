@@ -10,6 +10,7 @@ import type { MaintenanceGuardLease } from "./guard"
 import { BOOKKEEPING_FILENAME, createMaintenanceDatabase } from "./connection"
 import { openForMaintenance } from "./maintenance"
 import { withBookkeepingWrite } from "./transaction"
+import { truncateOffline } from "./offlineCheckpoint"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { prepareImport, importPlan, assertQuiescent } from "./migrationImport"
 import { parseLegacySidecar } from "./legacyCodec"
@@ -137,6 +138,10 @@ function importOrResume(directory: string, journal: MigrationJournal, guard: Mai
       saveJournal(directory, journal)
       crashPoint("IMPORTED")
       for (const source of journal.finalSources!) archiveSource(directory, source.path, source.digest, journal.id)
+      truncateOffline(directory, "migration")
+      crashPoint("migration:checkpoint")
+      handle.close()
+      crashPoint("migration:closed")
       journal.phase = "READY"
       saveJournal(directory, journal)
       crashPoint("READY")

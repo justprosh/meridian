@@ -1,6 +1,6 @@
 /** Full-document hydration belongs only to explicit offline maintenance. */
 import { readMapping } from "./mappings"
-import { readResource, readResourceLease } from "./resources"
+import { legacyExport, resourceProjection } from "./legacyExport"
 import {
   parseLegacySidecar, parseLegacyStoreForMaintenance, serializeLegacySidecar, serializeLegacyStore,
 } from "./legacyCodec"
@@ -21,12 +21,7 @@ export function snapshotForExport(reader: BookkeepingReader): ExportSnapshot {
   ).map((row) => [String(row.slot), Number(row.counter)]))
   const resources = Object.fromEntries(reader.all("SELECT key FROM resources ORDER BY key").map((row) => {
     const key = String(row.key)
-    const resource = readResource(reader, key)!
-    const leases = reader.all("SELECT token FROM resource_leases WHERE resource_key=? ORDER BY token", key)
-    if (leases.length) resource.activeLeases = Object.fromEntries(leases.map((lease) => [
-      String(lease.token), readResourceLease(reader, key, String(lease.token))!,
-    ]))
-    return [key, resource]
+    return [key, legacyExport(reader, "resource", key, resourceProjection(reader, key))]
   }))
   const sidecar: SessionGcSidecar = { version: 2, meta: { fenceSlots: slots("lifecycle") }, resources }
   const version = reader.get("SELECT store_meta_version FROM schema_meta")?.store_meta_version
@@ -62,7 +57,7 @@ export function snapshotForExport(reader: BookkeepingReader): ExportSnapshot {
   } else throw new Error("unsupported store metadata version")
   const store: SessionStoreDocument = { meta,
     sessions: Object.fromEntries(reader.all("SELECT key FROM mappings ORDER BY key")
-      .map((row) => [String(row.key), readMapping(reader, String(row.key))!])),
+      .map((row) => [String(row.key), legacyExport(reader, "mapping", String(row.key), readMapping(reader, String(row.key))!)])),
   }
   const result = { sidecar: serializeLegacySidecar(sidecar), store: serializeLegacyStore(store),
     resources: Object.keys(resources).length, mappings: Object.keys(store.sessions).length }
