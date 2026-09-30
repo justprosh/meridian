@@ -42,7 +42,7 @@ function ownRuntime(handle: BookkeepingHandle): BookkeepingHandle {
   if (!runtime) {
     installSessionStoreBackend(sqliteSessionStoreBackend)
     installSessionLifecycleBackend(sqliteLifecycleBackend)
-    runtime = { directory, refs: 0, releaseIdentity: retainBookkeepingRuntimeIdentity() }
+    runtime = { directory, refs: 0, releaseIdentity: retainBookkeepingRuntimeIdentity(directory) }
   }
   runtime.refs++
   let closed = false
@@ -92,7 +92,8 @@ export function retainProxyBookkeeping(): BookkeepingHandle | undefined {
 /** Whole synchronous store operation is admitted asynchronously; its nested writes join this scope. */
 export function admitSessionStoreWrite<T>(operation: () => T, options: BookkeepingWriteOptions = {}): Promise<T> {
   if (!activeStoreBackend()) return Promise.resolve().then(operation)
-  return withBookkeepingWriteAsync(getSessionStoreDir(), { ...options, scope: "store" }, operation)
+  const directory = runtime?.directory ?? getSessionStoreDir()
+  return withBookkeepingWriteAsync(directory, { ...options, scope: "store" }, operation)
 }
 
 export function checkpointProxyBookkeeping(): void {

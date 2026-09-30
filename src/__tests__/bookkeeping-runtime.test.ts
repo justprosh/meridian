@@ -1,5 +1,7 @@
-import { afterEach, beforeEach, expect, it } from "bun:test"
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawn } from "node:child_process"
@@ -12,7 +14,12 @@ import { initializeSessionBookkeeping, type BookkeepingHandle } from "../proxy/s
 import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
 import { activeStoreBackend } from "../proxy/session/bookkeeping/storeBackend"
 import { activeLifecycleBackend } from "../proxy/session/bookkeeping/lifecycleBackend"
-import { setSessionStoreDir, storeSharedSession, lookupSharedSession, readSessionTranscriptPins } from "../proxy/sessionStore"
+import { setSessionStoreDir, storeSharedSession, lookupSharedSession, readSessionTranscriptPins,
+  lookupSharedSessionResult, lookupPriorityAssignmentResult, storeSharedSessionAndPriorityAssignment,
+  rollbackSharedSessionAndPriorityAssignment } from "../proxy/sessionStore"
+import { resourceKey } from "../proxy/session/bookkeeping/locator"
+import { registerLiveTranscript, runGc } from "../proxy/sessionLifecycle"
+import { connectionFor } from "../proxy/session/bookkeeping/connection"
 
 let directory: string
 const handles: BookkeepingHandle[] = []
@@ -83,6 +90,81 @@ it("refuses corrupt SQLite rather than creating JSON or a fresh database", async
   await expect(initializeProxyBookkeeping()).rejects.toThrow()
   expect(existsSync(join(directory, "sessions.json"))).toBe(false)
   expect(readFileSync(join(directory, "session-bookkeeping.sqlite"), "utf8")).toBe("not sqlite")
+})
+
+it("migration priority rollback inside production admission preserves both canonical pins and GC protection", async () => {
+  const real = join(directory, "real"), alias = join(directory, "alias")
+  mkdirSync(real)
+  symlinkSync(real, alias)
+  const registeredOld = await registerLiveTranscript({ configDir: alias, sessionId: "old" }, { storeDir: directory })
+  const registeredPrior = await registerLiveTranscript({ configDir: alias, sessionId: "prior" }, { storeDir: directory })
+  const old = { ...registeredOld, configDir: alias }
+  const prior = { ...registeredPrior, configDir: alias }
+  const entry = { claudeSessionId: "old", createdAt: 1, lastUsedAt: 2, messageCount: 1,
+    currentTranscript: old, previousClaudeSessionId: "prior", previousTranscript: prior }
+  writeFileSync(join(directory, "sessions.json"), JSON.stringify({ key: entry }), { mode: 0o600 })
+  await migrateBookkeeping(directory, { writersStopped: true })
+  const handle = await initializeProxyBookkeeping()
+  if (!handle) throw new Error("SQL startup missing")
+  handles.push(handle)
+  const raw = handle.reader.get("SELECT history_json FROM mapping_history WHERE mapping_key='key'")?.history_json
+  expect(JSON.parse(String(raw))).toEqual(entry)
+  const mapping = lookupSharedSessionResult("key"), route = lookupPriorityAssignmentResult("route")
+  if (mapping.status === "error" || !mapping.generation || route.status === "error") throw new Error("lookup failed")
+  const publication = await admitSessionStoreWrite(() => storeSharedSessionAndPriorityAssignment({
+    key: "key", claudeSessionId: "new", messageCount: 2, expectedMappingGeneration: mapping.generation!,
+    lineageHash: "new-lineage", messageHashes: [], messageBlockHashes: [],
+    priority: { routeKey: "route", profileId: "profile", lastHumanTurnDigest: "a".repeat(43),
+      lastHumanTurnIssuedAt: 1, expectedAssignmentGeneration: route.generation },
+  }))
+  if (!publication) throw new Error("publication failed")
+  const rolledBack = await admitSessionStoreWrite(() => rollbackSharedSessionAndPriorityAssignment({
+    key: "key", routeKey: "route", expectedMappingGeneration: publication.mappingGeneration,
+    expectedAssignmentGeneration: publication.assignmentGeneration,
+    previousMapping: publication.previousMapping, previousAssignment: publication.previousAssignment,
+  }))
+  expect(rolledBack).not.toBe(false)
+  const canonical = realpathSync(real)
+  expect(handle.reader.all("SELECT slot,resource_key,generation FROM mapping_pins WHERE mapping_key='key' ORDER BY slot"))
+    .toEqual([{ slot: "current", resource_key: resourceKey({ ...old, configDir: canonical }), generation: old.lifecycleGeneration ?? null },
+      { slot: "previous", resource_key: resourceKey({ ...prior, configDir: canonical }), generation: prior.lifecycleGeneration ?? null }])
+  let deletedOld = false
+  await runGc([], { storeDir: directory, retiredGraceMs: 0, deleter: async locator => {
+    if (locator.sessionId === "old") deletedOld = true
+  } })
+  expect(deletedOld).toBe(false)
+  expect(handle.reader.get("SELECT state FROM resources WHERE key=?", resourceKey({ ...old, configDir: canonical }))?.state)
+    .toBe("live")
+})
+
+it("default directory addressing performs no filesystem discovery inside production store admission", async () => {
+  setSessionStoreDir(null)
+  const env = [process.env.MERIDIAN_SESSION_DIR, process.env.CLAUDE_PROXY_SESSION_DIR]
+  delete process.env.MERIDIAN_SESSION_DIR
+  delete process.env.CLAUDE_PROXY_SESSION_DIR
+  const home = spyOn(os, "homedir").mockReturnValue(directory)
+  let exists: ReturnType<typeof spyOn> | undefined
+  try {
+    const handle = await initializeProxyBookkeeping()
+    if (!handle) throw new Error("SQL startup missing")
+    handles.push(handle)
+    const resolved = join(directory, ".cache", "meridian")
+    const original = fs.existsSync
+    const accesses: string[] = []
+    exists = spyOn(fs, "existsSync").mockImplementation(path => {
+      if (connectionFor(resolved).scope === "write") accesses.push(String(path))
+      return original(path)
+    })
+    expect(await admitSessionStoreWrite(() => storeSharedSession("default", "sdk"))).not.toBe(false)
+    expect(accesses).toEqual([])
+  } finally {
+    exists?.mockRestore()
+    home.mockRestore()
+    for (const [index, key] of ["MERIDIAN_SESSION_DIR", "CLAUDE_PROXY_SESSION_DIR"].entries()) {
+      if (env[index] === undefined) delete process.env[key]
+      else process.env[key] = env[index]
+    }
+  }
 })
 
 it("pays a large limit reduction in bounded pre-listen pages without hydrating a full store", async () => {

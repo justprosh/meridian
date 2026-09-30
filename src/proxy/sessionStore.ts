@@ -69,6 +69,7 @@ import type { TranscriptLocator, StoredSession } from "./session/bookkeeping/typ
 export type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 import { activeStoreBackend } from "./session/bookkeeping/storeBackend"
 import { assertBookkeepingIdentityChangeAllowed } from "./session/bookkeeping/storeIdentity"
+import { retainedBookkeepingRuntimeDirectory } from "./session/bookkeeping/runtimeIdentity"
 export { setSessionStoreBackendForTest } from "./session/bookkeeping/storeBackend"
 import type {
   SharedSessionLookupResult, PriorityAssignmentLookupResult, PriorityAttemptTurn, PriorityAttemptClaim,
@@ -555,7 +556,8 @@ export function setSessionStoreDir(dir: string | null, _opts?: { skipLocking?: b
 
 /** Return the directory containing the cross-process session store. */
 export function getSessionStoreDir(): string {
-  return sessionDirOverride
+  return retainedBookkeepingRuntimeDirectory()
+    || sessionDirOverride
     || process.env.MERIDIAN_SESSION_DIR
     || process.env.CLAUDE_PROXY_SESSION_DIR
     || getDefaultCacheDir()

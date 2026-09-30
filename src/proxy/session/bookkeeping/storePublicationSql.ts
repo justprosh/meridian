@@ -115,7 +115,9 @@ export function storeSharedSessionAndPriorityAssignment(directory: string,
     const published = readPriorityAssignment(tx, route)
     if (published.status === "error") throw published.error
     return { mappingGeneration, assignmentGeneration: published.generation,
-      previousMapping: raw ? structuredClone(raw) : null,
+      // Rollback joins the outer SQL admission and cannot resolve aliases there.
+      // Snapshot both persisted canonical locators without rewriting imported raw history/CAS bytes.
+      previousMapping: existing ? structuredClone(existing) : null,
       previousAssignment: existingAssignment ? structuredClone(existingAssignment) : null }
   })
 }
