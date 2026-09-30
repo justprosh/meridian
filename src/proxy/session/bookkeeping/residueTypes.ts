@@ -1,0 +1,37 @@
+import { isUuidV4 } from "./uuid"
+
+export type ResidueVerdict = "dead-incarnation" | "live" | "unknown"
+export interface Residue { path: string; verdict: ResidueVerdict; kind?: "incomplete-candidate"; digest?: string; bytes?: number }
+export interface ArchivedResidue extends Residue {
+  digest: string; bytes: number; dev: number; ino: number; archiveName?: string
+}
+
+export function isResiduePath(path: string): boolean {
+  return /^(session-gc|sessions)\.json\.lock[^/]*\.candidate-[^/]+$/.test(path)
+    || /^(deletion-gates|sdk-process-gates)\/[^/]+$/.test(path) && !path.endsWith("/..")
+    || isLegacyTemporaryName(path)
+}
+
+export function isLegacyTemporaryName(path: string): boolean {
+  const prefix = /^(session-gc|sessions)\.json\.tmp-\d+-/.exec(path)?.[0]
+  return prefix !== undefined && isUuidV4(path.slice(prefix.length))
+}
+
+function validArchiveSuffix(value: string): boolean {
+  return isUuidV4(value.slice(0, 36)) && value[36] === "-" && isUuidV4(value.slice(37))
+}
+export function validResidues(value: unknown): value is ArchivedResidue[] {
+  return Array.isArray(value) && new Set(value.map((row) => row?.path)).size === value.length
+    && value.every((entry: unknown) => {
+      if (!entry || typeof entry !== "object") return false
+      const row = entry as Record<string, unknown>
+      return typeof row.path === "string" && isResiduePath(row.path) && !row.path.endsWith("/.")
+        && ["dead-incarnation", "unknown"].includes(String(row.verdict))
+        && (row.kind === undefined || row.kind === "incomplete-candidate" && row.verdict === "unknown")
+        && (row.archiveName === undefined || row.kind === "incomplete-candidate"
+          && typeof row.archiveName === "string" && row.archiveName.startsWith(`${row.path}.residue.releasing-`)
+          && validArchiveSuffix(row.archiveName.slice(`${row.path}.residue.releasing-`.length)))
+        && typeof row.digest === "string" && /^[a-f0-9]{64}$/.test(row.digest)
+        && [row.bytes, row.dev, row.ino].every((v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0)
+    })
+}
