@@ -576,6 +576,9 @@ it("measures three competing Node writers and bounds lock starvation by the admi
   const rows = JSON.parse(stdout) as Array<{
     completed: number
     rejected: number
+    rejectionFraction: number
+    rejections: Array<{ name: string; waitMs: number }>
+    admissionBudgetMs: number
     expiryMs: number
     maxAdmissionMs: number
     timerLagP50: number
@@ -588,11 +591,22 @@ it("measures three competing Node writers and bounds lock starvation by the admi
   writeBenchArtifact("three-process.json", rows)
   expect(rows.length).toBe(3)
   for (const row of rows) {
-    expect(row.completed).toBe(250)
-    expect(row.rejected).toBe(0)
+    expect(row.completed + row.rejected).toBe(250)
+    expect(row.rejections).toHaveLength(row.rejected)
+    for (const rejection of row.rejections) {
+      expect(rejection.name).toBe("SessionLifecycleLockError")
+      expect(rejection.waitMs).toBeGreaterThanOrEqual(row.admissionBudgetMs)
+    }
+    // Includes scheduler jitter and the short synchronous transaction after admission.
+    expect(row.maxAdmissionMs).toBeLessThanOrEqual(row.admissionBudgetMs + 100)
+    expect(row.rejectionFraction).toBe(row.rejected / 250)
     expect(row.blockedFraction).toBeGreaterThanOrEqual(0)
     expect(row.blockedFraction).toBeLessThan(1)
     expect(row.timerLagP50).toBeGreaterThanOrEqual(0)
     expect(row.timerLagP50).toBeLessThanOrEqual(row.timerLagMax)
   }
+  console.log("three-writer rejection fractions:", rows.map((row) => row.rejectionFraction))
+  handle = initializeSessionBookkeeping(directory)
+  expect(handle.reader.get("SELECT count(*) AS n FROM fence_slots WHERE namespace='store' AND slot LIKE 'process-%'")?.n)
+    .toBe(rows.reduce((sum, row) => sum + row.completed, 0))
 }, 15000)

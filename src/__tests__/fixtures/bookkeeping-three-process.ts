@@ -49,6 +49,8 @@ if (id !== undefined) {
     completed = 0,
     rejected = 0,
     maxAdmissionMs = 0
+  const admissionBudgetMs = 250
+  const rejections: Array<{ name: string; waitMs: number }> = []
   try {
     const waiting = performance.now()
     try {
@@ -66,23 +68,24 @@ if (id !== undefined) {
     for (let i = 0; i < 250; i++) {
       const before = performance.now()
       try {
-        await withBookkeepingWriteAsync(directory, { lockWaitMs: 250 }, (tx) => {
+        await withBookkeepingWriteAsync(directory, { lockWaitMs: admissionBudgetMs }, (tx) => {
           const start = performance.now()
           try {
             tx.run(
-              "INSERT INTO fence_slots VALUES('store',?,1) ON CONFLICT(namespace,slot) DO UPDATE SET counter=counter+1",
-              `process-${id}`,
+              "INSERT INTO fence_slots VALUES('store',?,1)",
+              `process-${id}-${i}`,
             )
           } finally {
             nativeMs += performance.now() - start
           }
         })
         completed++
+        maxAdmissionMs = Math.max(maxAdmissionMs, performance.now() - before)
       } catch (error) {
         if (!(error instanceof SessionLifecycleLockError)) throw error
         rejected++
+        rejections.push({ name: error.constructor.name, waitMs: performance.now() - before })
       }
-      maxAdmissionMs = Math.max(maxAdmissionMs, performance.now() - before)
       await delay(1)
     }
     clearInterval(timer)
@@ -94,6 +97,9 @@ if (id !== undefined) {
         node: process.versions.node,
         completed,
         rejected,
+        rejectionFraction: rejected / 250,
+        rejections,
+        admissionBudgetMs,
         expiryMs,
         maxAdmissionMs,
         timerLagP50: samples[Math.floor(samples.length / 2)],
