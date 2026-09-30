@@ -121,3 +121,18 @@ it.each(["before", "after", "busy"] as const)("fails closed on publication COMMI
   }
   expect(existsSync(join(directory, "sessions.json"))).toBe(false)
 })
+
+it.each(["before", "after", "busy"] as const)("streaming publication COMMIT %s remains typed and preserves uncertain authority", async (failure) => {
+  fault = failure
+  const response = await request(true)
+  const text = await response.text()
+  expect(text).toContain("overloaded_error")
+  expect(text).not.toContain('"type":"api_error"')
+  expect(fault).toBeUndefined()
+  await proxy?.sweepSessionGc?.()
+  expect(Object.keys(readSessionStoreSnapshot())).toHaveLength(failure === "after" ? 1 : 0)
+  if (failure === "after") {
+    expect(observer.reader.get("SELECT count(*) AS n FROM mapping_pins")?.n).toBe(1)
+    expect(observer.reader.get("SELECT state FROM resources")?.state).toBe("live")
+  }
+})

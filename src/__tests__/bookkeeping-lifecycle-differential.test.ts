@@ -99,8 +99,8 @@ it("compares lifecycle results, errors and observed ledger after every JSON/SQLi
     await run("hung fence repeated GC", () => lifecycle.runGc(store.readSessionTranscriptPins(), {
       ...options, deleter: async () => { throw new Error("must not retry") },
     }))
-    // Accepted 4c deviation: an admitted deletion gets its full timeout, rather than
-    // the remaining sweep budget (.evidence/design/sqlite-bookkeeping.md §5).
+    // Both backends give an admitted deletion its full timeout (6706409);
+    // the sweep deadline only prevents beginning the next claim.
     now++ // Keep this tombstone newer than the bound's tie-break candidates.
     const budgetTarget = await lifecycle.prepareFork(locator("full-budget"), options)
     await lifecycle.abandonFork(budgetTarget, options)
@@ -108,12 +108,10 @@ it("compares lifecycle results, errors and observed ledger after every JSON/SQLi
       ...options, runTimeoutMs: 20, deletionTimeoutMs: 500,
       deleter: async () => { await new Promise(resolve => setTimeout(resolve, 60)) },
     })
-    expect(budget).toEqual(sqlite
-      ? { deleted: 1, notFound: 0, failed: 0, deferred: 2 }
-      : { deleted: 0, notFound: 0, failed: 0, deferred: 4 })
+    expect(budget).toEqual({ deleted: 1, notFound: 0, failed: 0, deferred: 2 })
     const budgetState = observeLifecycleLedger(directory, sqlite).state
     expect(budgetState.resources[lifecycle.getTranscriptResourceKey(budgetTarget)]?.state)
-      .toBe(sqlite ? "deleted" : "deleting")
+      .toBe("deleted")
     return results
   }
   try {

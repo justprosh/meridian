@@ -1466,9 +1466,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // Headers are already sent; an unexpected dispatch failure can only
           // surface as a stream error frame.
           if (!isCancelled()) {
+            const classified = classifyBookkeepingFailure(error, error instanceof Error ? error.message : String(error))
             await enqueue(errorFrame({
               type: "error",
-              error: { type: "api_error", message: error instanceof Error ? error.message : String(error) },
+              error: { type: classified.type, message: classified.message,
+                ...retryAfterBodyFields(retryAfterSeconds({ status: classified.status })) },
             }))
           }
         } finally {
@@ -1801,6 +1803,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           if (error instanceof BookkeepingCommitUncertainError) {
             uncertainPublications.add(getTranscriptResourceKey(locator))
             requestMeta.retainSessionTurnFence?.()
+            // Uncertain durable authority is also a no-replay barrier, even when
+            // only keepalives reached the client before the publication fault.
+            if (options.priorityAttemptExposure) {
+              options.priorityAttemptExposure.committed = true
+              options.priorityAttemptExposure.reason ??= "publication_commit_uncertain"
+            }
           }
           throw error
         }
