@@ -15,7 +15,12 @@ const baselineArgument = process.argv.indexOf("--baseline-package")
 const baselineSpec = baselineArgument >= 0 ? resolve(process.argv[baselineArgument + 1]) : "@rynfar/meridian@1.78.0"
 const root = mkdtempSync(join(tmpdir(), "meridian-packaged-bookkeeping-"))
 const children = []
-const env = { ...process.env, MERIDIAN_CREDENTIALS_READONLY: "1", MERIDIAN_NO_UPDATE_CHECK: "1" }
+const home = join(root, "home")
+mkdirSync(home, { mode: 0o700 })
+const env = {
+  PATH: process.env.PATH, HOME: home, TMPDIR: root, SystemRoot: process.env.SystemRoot,
+  MERIDIAN_CREDENTIALS_READONLY: "1", MERIDIAN_NO_UPDATE_CHECK: "1", MERIDIAN_SESSION_GC_INTERVAL_MS: "0",
+}
 function run(command, args, cwd, expected = 0) {
   const result = spawnSync(command, args, { cwd, env, encoding: "utf8", timeout: 120_000 })
   assert.equal(result.status, expected, `${command}: ${result.stderr}\n${result.stdout}`)
@@ -71,6 +76,7 @@ try {
   const legacy = await start(baseline, directory, "json")
   await usage(legacy.url, 200)
   await stop(legacy.child)
+  await assert.rejects(start(candidate, directory, "sqlite"), /offline migration/)
   run(process.execPath, [cli, "migrate", "--session-dir", directory, "--writers-stopped", "--json"], root)
   const first = await start(candidate, directory, "sqlite")
   const second = await start(candidate, directory, "sqlite")
