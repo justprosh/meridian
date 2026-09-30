@@ -26,6 +26,8 @@ import { canonicalizeLocator, resourceKey } from "./session/bookkeeping/locator"
 import type { TranscriptLocator, TranscriptResource } from "./session/bookkeeping/types"
 export type { TranscriptLocator, TranscriptResourceState } from "./session/bookkeeping/types"
 import { lifecycleLockQueue } from "./session/lifecycleLockQueue"
+import { activeLifecycleBackend } from "./session/bookkeeping/lifecycleBackend"
+export { setSessionLifecycleBackendForTest } from "./session/bookkeeping/lifecycleBackend"
 import {
   SessionLifecycleError,
   SessionLifecycleLockError,
@@ -163,6 +165,8 @@ export async function acquireActiveTranscriptLease(
   locators: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<ActiveTranscriptLease> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.acquireActiveTranscriptLease(locators, options)
   const normalized = [...new Map(
     locators.map(canonicalizeTranscriptLocator).map((locator) => [getTranscriptResourceKey(locator), locator]),
   ).entries()]
@@ -200,6 +204,8 @@ export async function attachActiveTranscriptExecutor(
   options: SessionLifecycleOptions = {},
   executorRecoverable = true,
 ): Promise<void> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.attachActiveTranscriptExecutor(lease, executor, options, executorRecoverable)
   const parsedExecutor = parseProcessIncarnation(executor)
   if (!parsedExecutor) throw new TypeError("invalid active transcript executor incarnation")
   await withSidecarLock(options, async (paths) => {
@@ -220,6 +226,8 @@ export async function releaseActiveTranscriptLease(
   lease: ActiveTranscriptLease,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.releaseActiveTranscriptLease(lease, options)
   await withSidecarLock(options, async (paths) => {
     const sidecar = await readSidecar(paths.sidecar)
     let changed = false
@@ -250,6 +258,8 @@ export async function releaseJoinedTranscriptLease(
   lease: ActiveTranscriptLease,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.releaseJoinedTranscriptLease(lease, options)
   try {
     await releaseActiveTranscriptLease(lease, options)
   } catch (error) {
@@ -275,6 +285,8 @@ export async function prepareFork(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.prepareFork(locator, options)
   return prepareForkIntent(locator, options)
 }
 
@@ -287,6 +299,8 @@ export async function prepareForkForPublication(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.prepareForkForPublication(locator, options)
   const owner = captureProcessIncarnation()
   if (!owner) throw new SessionLifecycleError("cannot capture publication owner incarnation")
   return prepareForkIntent(locator, options, owner)
@@ -343,6 +357,8 @@ export async function ensureTranscriptJournaled(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.ensureTranscriptJournaled(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
@@ -384,6 +400,8 @@ export async function registerLiveTranscript(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<TranscriptLocator> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.registerLiveTranscript(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
@@ -434,6 +452,8 @@ export async function commitFork(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.commitFork(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   await withSidecarLock(options, async (paths) => {
@@ -468,6 +488,8 @@ export async function publishPinnedTranscript<T extends boolean | string>(
   publish: () => T,
   options: SessionLifecycleOptions = {},
 ): Promise<T> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.publishPinnedTranscript(locator, publish, options)
   return updatePinnedTranscript(locator, publish, options, false)
 }
 
@@ -481,6 +503,8 @@ export async function attachPinnedTranscript<T extends boolean | string>(
   publish: () => T,
   options: SessionLifecycleOptions = {},
 ): Promise<T> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.attachPinnedTranscript(locator, publish, options)
   return updatePinnedTranscript(locator, publish, options, true)
 }
 
@@ -561,6 +585,8 @@ export async function abandonFork(
   locator: TranscriptLocator,
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.abandonFork(locator, options)
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   await withSidecarLock(options, async (paths) => {
@@ -592,6 +618,8 @@ export async function reconcile(
   pins: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<ReconcileResult> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.reconcile(pins, options)
   // Validate caller pins before waiting for the lock. The authoritative pin
   // provider is refreshed again while the lifecycle lock is held.
   indexPins(pins)
@@ -709,6 +737,8 @@ export async function runGc(
   pins: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<GcResult> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.runGc(pins, options)
   await retryDeferredLeaseReleases(options)
   await reconcile(pins, options)
   let currentPins = indexPins(pins)
