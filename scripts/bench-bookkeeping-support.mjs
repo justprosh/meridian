@@ -41,8 +41,8 @@ export function seed(root,N,M,lifecycle,{persist=true}={}) {
     sessions[`bench-${i}`]=mapping(i,locators[i % (N-Math.min(1000,Math.floor(N/2)))]);
   }
   if(persist) {
-    writeFileSync(join(root,'session-gc.json'),JSON.stringify(sidecar));
-    writeFileSync(join(root,'sessions.json'),JSON.stringify(sessions));
+    writeFileSync(join(root,'session-gc.json'),JSON.stringify(sidecar),{mode:0o600});
+    writeFileSync(join(root,'sessions.json'),JSON.stringify(sessions),{mode:0o600});
   }
   return {locators,configDir,projectDir,sidecar,sessions,
     sizes:{sidecar:Buffer.byteLength(JSON.stringify(sidecar)),store:Buffer.byteLength(JSON.stringify(sessions)),

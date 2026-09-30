@@ -44,10 +44,18 @@ export function writeReport(report, evidence, synopsis) {
       builds: Object.fromEntries(Object.entries(report.environment.builds).map(([key, build]) =>
         [key, { backend: build.backend, version: build.version, sdk: build.sdk, compiler: build.compiler,
           sha: build.sha, sourceDirty: build.sourceDirty, lockSha256: build.lockSha256 }])) },
-      results: report.results.map(({ timeline, errors, error, ...r }) => ({ ...r,
-        error: error ? 'Worker failed; see artifact log' : undefined, errorCount: errors?.length ?? 0 })),
+      results: report.results.map(({ timeline, errors, error, gcErrors, before, after, ...r }) => ({ ...r,
+        before: sanitizedProjection(before), after: sanitizedProjection(after),
+        error: error ? 'Worker failed; see artifact log' : undefined, errorCount: errors?.length ?? 0,
+        gcErrorCount: gcErrors?.length ?? 0 })),
       artifacts: { hashes: sums, archiveUrl: null, retention: null } };
     writeFileSync(join(synopsis, 'synopsis.json'), JSON.stringify(sanitized, null, 2));
     writeFileSync(join(synopsis, 'synopsis.md'), markdown);
   }
+}
+
+function sanitizedProjection(value) {
+  if (!value) return value;
+  const { errors, ...rest } = value;
+  return { ...rest, errorCount: Object.values(errors ?? {}).reduce((a, b) => a + b, 0) };
 }

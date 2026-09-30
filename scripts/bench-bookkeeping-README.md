@@ -15,7 +15,7 @@ node scripts/bench-session-bookkeeping.mjs --backend json --package-root . \
   --matrix N=2000,M=2500,K=5 --rounds 1 \
   --synopsis docs/maintenance/evidence/sqlite-bookkeeping
 
-# Future paired acceptance run; currently SQLite deliberately refuses (see below).
+# Paired evidence run: requires candidate production activation (no test seams).
 node scripts/bench-session-bookkeeping.mjs --backend json --package-root /path/to/baseline \
   --compare-root /path/to/feature --soak-minutes 10 \
   --synopsis docs/maintenance/evidence/sqlite-bookkeeping
@@ -29,11 +29,14 @@ node scripts/bench-session-bookkeeping.mjs --backend json --package-root . \
 `--backend sqlite --package-root /path/to/feature` selects SQLite alone;
 `--compare-root` adds the opposite backend. Roots are source package checkouts with
 their own installed dependencies. The driver separately compiles the transitive
-public-export closure of each root into a fresh immutable JS artifact, using that
-root's TypeScript and node_modules. It does **not** import live TS in timed workers.
+public-export closure of each root into a fresh immutable JS artifact, using Bun's
+canonical Node-target/splitting/external flags and isolated copies of dependencies.
+It does **not** import live TS in timed workers or borrow changing node_modules.
 Each build records exact git SHA, dirty flag, source and emitted-JS SHA256, lockfile
 SHA256, package/SDK/compiler versions. This is a built internal-API benchmark,
-**not** the separate npm-tarball/package-install acceptance test.
+**not** the separate npm-tarball/package-install acceptance test. Emitted modules
+and their hashes are recorded as well as the source closure. The external SDK
+version must match between the independently pinned baseline and candidate.
 
 The loader only resolves extensionless imports/erases types for the exploratory
 microbenchmark; it never patches source functions. Timing private functions via
@@ -59,8 +62,8 @@ backend and repetition: 12 additional paired points. Soak uses closed-loop turns
 until the wall duration expires, then joins in-flight turns and drains GC. It is
 reported in a separate section with throughput, p95/p99, due backlog endpoints,
 timestamped GC deferred counts, RSS/filesize timeline, and runtime metrics. JSON
-has no WAL; SQLite WAL/checkpoint metrics remain blocked with the adapter.
-No ten-minute soak or full matrix was executed in this hardening work.
+has no WAL; SQLite reads back WAL/FULL pragmas and records file sizes plus a final
+PASSIVE checkpoint. No ten-minute soak or full matrix is inferred from tests.
 
 The driver has no silent global time-budget cutoff. `--point-timeout-ms` defaults
 to soak duration + 300000 ms. SIGINT/SIGTERM, timeout, missing worker output,
@@ -141,37 +144,25 @@ deleted current resources, checks mapping count/history bytes, and proves resour
 row growth by at least the successful turn count. Assertions cover observed
 schedule, **not** arbitrary ABA or crash/deletion interleavings.
 
-SQLite intentionally fails early with a named interface gap, never benchmarks
-the still-JSON facade under a SQLite label. Current engine exports are checked:
+SQLite uses the real offline `migrateBookkeeping(...,{writersStopped:true})` on
+the same synthetic legacy fixture, outside timing. Its one atomic import preserves
+fences/history/store metadata (including the actual NUL meta key) through the
+canonical codec. Production L/S/cache exports must then access that SQLite. No
+backend test setter is called. A still-legacy facade encounters permanent barriers
+and fails; JSON authority appearing after migration also fails. Read-only SQL
+inspection uses `withBookkeepingRead` and the implementation's `readResource`.
 
-- `database`: initializeSessionBookkeeping / Async, withBookkeepingWriteAsync,
-  withBookkeepingRead (and closeSessionBookkeeping for the eventual handle).
-- `resourceImport`: importResource(tx, resource).
-- `mappings`: readSessionTranscriptPins(reader).
-- Current `insertMapping(tx,key,entry)` is explicitly a fixture insertion that
-  increments slots, **not** a fence-preserving legacy importer. Do not substitute
-  it silently for the remaining migration contract.
+Native BEGIN/COMMIT and critical-section metrics are observed through the existing
+initialization `executeTransaction` option, forwarding `native.exec(sql)` exactly
+once. Counts cover successful write transactions only. Admission wait and busy
+attempts remain **null** until a production observer exists: no AST rewriting,
+alternate SQL implementation or guessed counts. This observation gap blocks full
+acceptance. Pragmas are read back and checked before timing.
 
-Required continuation after portions 2–5:
-1. Supply a checked fixture/import API accepting the in-memory seed
-   (`seed(...,{persist:false})`). Canonicalize locators outside the transaction.
-2. Initialize the registry before serving and import resource/lease/fence,
-   mapping/history/pin/priority state in **one** withBookkeepingWriteAsync
-   transaction, outside the measured window. No N per-row commits, no temporary
-   JSON authority, no bypass of migrated-directory barriers.
-3. Bind activated lifecycle/store/cache exports to that same directory/handle.
-   Provide entries/lookup/pins and aggregate inspector via withBookkeepingRead;
-   never read SQLite as JSON or materialize its backing file.
-4. Supply explicit production test seams for actual transaction counts/admission
-   timings and busy attempts; observer callbacks must not change transaction
-   boundaries. Read back WAL/FULL/foreign_keys/busy_timeout=0/wal_autocheckpoint=0
-   pragmas; report PASSIVE frames separately from physical WAL bytes.
-5. Replace the deliberate refusal with this adapter; exercise equivalence,
-   counts/history, and negatives before any performance claim.
-
-Private transaction/queue metrics are currently **null**, not invented zeroes
-or inferred “10 lifecycle/2 store writes”. This missing observation blocks full
-§8 acceptance. Neither a null nor a microbenchmark estimate is PR evidence.
+GC service/intake ratio includes final drain in the deletion measurement (a favorable
+bound) and uses an explicitly reported 20% margin. It is synthetic-only: a passed
+stub cannot establish real SDK deletion throughput or release #213. A failed soak
+ratio falsifies even the faster simulated deletion path and must be reported.
 
 ## Metrics and PR gates
 
@@ -216,6 +207,25 @@ and markdown** suitable for committing. Paths/stacks/raw logs/timelines are not
 copied into it. The synopsis explicitly distinguishes requested coverage from
 full acceptance and carries artifact hashes with archiveUrl/retention **null**
 until uploaded. `.evidence/` alone is not durable PR evidence.
+
+## Isolated Linux runner and private archive
+
+Do not SSH or start work on a provisioning host until its owner explicitly says
+ready. The runner has no remote commands and never accesses the old live VPS:
+
+```sh
+bash scripts/bench-bookkeeping-linux.sh /path/baseline BASELINE_SHA \
+  /path/candidate CANDIDATE_SHA /path/private-evidence
+node scripts/bench-bookkeeping-archive.mjs /path/private-evidence/run-...
+```
+
+Node22, ext4, exact clean source revisions and an exclusive measurement-directory
+lock are required. The parent must also serialize this window against full tests;
+the local directory lock cannot detect unrelated host load. Archives include
+synthetic result files, emitted modules, build/lock manifests and hashes, but no
+node_modules or production install tarball. No upload is performed. Archive URL
+and retention remain null pending an explicit durable storage decision; do not
+claim durable evidence merely because a local tar.gz exists.
 
 `bench-sqlite-alternative.mjs` remains exploratory only; no production-like claim
 depends on it. Its JSON GC timing is now honestly named whole-pass timing,

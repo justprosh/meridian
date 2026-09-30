@@ -35,8 +35,9 @@ async function workload(c, adapter, root, evidence) {
     S.getStoredSessionGeneration(sample, 'bench-0'))) throw Error('seed store validation failed');
   const before = adapter.inspect(), sizesBefore = adapter.sizes();
   const errors = [], overheads = [], latencies = [], sdkElapsed = [], gcRuns = [], gcErrors = [], timeline = [];
+  adapter.resetMetrics?.();
   const loop = armedLoopProbe();
-  let gcRunning, attempted = 0;
+  let gcRunning, attempted = 0, elapsed;
   // Synthetic deletion target: no transcript content, credentials, or real SDK invocation.
   const sdkStub = join(root, 'gc-stub.mjs');
   writeFileSync(sdkStub, 'export async function deleteSession(){await new Promise(r=>setTimeout(r,2000));}\n');
@@ -47,7 +48,7 @@ async function workload(c, adapter, root, evidence) {
       x => gcRuns.push({ ...x, ms: performance.now() - started }),
       e => gcErrors.push(e.message)).finally(() => { gcRunning = undefined; });
   };
-  const started = performance.now();
+  const measuredAt = new Date().toISOString(), started = performance.now();
   // No full-store scans on a sampling timer: those would change the measured workload.
   const sampleTimeline = () => timeline.push({ ms: performance.now() - started,
     rss: process.memoryUsage().rss, sizes: adapter.sizes(), gcRunning: !!gcRunning,
@@ -105,7 +106,6 @@ async function workload(c, adapter, root, evidence) {
       active.delete(chat);
     }
   }
-  let elapsed;
   try {
     await Promise.all(Array.from({ length: c.K }, (_, chat) => (async () => {
       for (let i = 0; c.mode === 'soak' ? performance.now() - started < c.soakMs : i < c.rounds; i++) {
@@ -120,16 +120,29 @@ async function workload(c, adapter, root, evidence) {
   const loopMetrics = await loop.stop();
   sampleTimeline();
   adapter.assert(expected);
+  const transactionMetrics = adapter.metrics();
+  const checkpoint = adapter.checkpoint?.() ?? null;
   const after = adapter.inspect();
   if (after.mappingRows !== c.M || after.historyBytes <= 0
     || after.resourceRows < before.resourceRows + overheads.length) {
     throw Error('State counts/history proof failed');
   }
-  const result = { ...c, complete: !errors.length && !gcErrors.length && !gcRuns.some(r => r.failed > 0),
+  const drainedAt = performance.now() - started;
+  const removed = gcRuns.reduce((n, r) => n + r.deleted + r.notFound, 0);
+  const gcService = { syntheticSdk: true, deletionDelayMs: 2000, passes: gcRuns.length,
+    removed, intake: overheads.length, measurementMs: elapsed, drainIncludedMs: drainedAt,
+    removalsPerSecond: removed / (drainedAt / 1000), intakePerSecond: overheads.length / (elapsed / 1000),
+    // Drain counts cannot prove production service; failure with a faster SDK stub is a falsifier.
+    removalToIntakeRatio: removed / (drainedAt / 1000) / (overheads.length / (elapsed / 1000)),
+    margin: 1.2, sufficientWithMargin: c.gc && removed / (drainedAt / 1000) >= 1.2 * overheads.length / (elapsed / 1000),
+    scope: 'synthetic deletion service; real SDK import/delete cost and open-arrival bound not established' };
+  const result = { ...c, measuredAt, finishedAt: new Date().toISOString(),
+    complete: !errors.length && !gcErrors.length && !gcRuns.some(r => r.failed > 0),
     ok: overheads.length, attempted, errors,
     failed: errors.length, overhead: summary(overheads), latency: summary(latencies), sdkElapsed: summary(sdkElapsed),
     elapsedMs: elapsed, throughput: overheads.length / (elapsed / 1000), loop: loopMetrics,
-    before, after, sizesBefore, sizesAfter: adapter.sizes(), timeline, metrics: adapter.metrics(), gcRuns, gcErrors,
+    before, after, sizesBefore, sizesAfter: adapter.sizes(), timeline,
+    metrics: { ...transactionMetrics, checkpoint }, gcRuns, gcErrors, gcService,
     assertions: { expectedMappings: expected.size, lostMappings: 0, observedAba: 0, unsafeDeletion: 0 },
     measurementWindow: 'latency/throughput exclude final GC drain; loop/timeline include drain' };
   writeFileSync(join(evidence, `${c.id}.json`), JSON.stringify(result, null, 2));

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, relative } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { seed, summary } from './bench-bookkeeping-support.mjs';
 import { plan, completeness } from './bench-bookkeeping-plan.mjs';
@@ -9,6 +9,7 @@ import { armedLoopProbe } from './bench-bookkeeping-metrics.mjs';
 import { requireFunctions, openAdapter } from './bench-bookkeeping-adapter.mjs';
 import { buildArtifact } from './bench-bookkeeping-build.mjs';
 import { renderReport } from './bench-bookkeeping-report.mjs';
+import './bench-bookkeeping-acceptance.test.mjs';
 
 const evidence = resolve('.evidence/bench-harden/tests');
 mkdirSync(evidence, { recursive: true });
@@ -77,23 +78,24 @@ test('adapter refuses missing public exports rather than falling back', () => {
   requireFunctions({ importResource() {} }, ['importResource'], 'SQLite importer');
 });
 
-test('SQLite adapter explicitly refuses unimplemented importer even with current engine exports', async () => {
+test('SQLite adapter refuses missing canonical migration/inspection APIs without a seam fallback', async () => {
   const root = mkdtempSync(join(evidence, 'sqlite-interface-'));
   const files = {
     sessionLifecycle: 'export const version = 1;',
     sessionStore: 'export function setSessionStoreDir() {}',
     'session/cache': 'export function storeSession() {}',
     'session/sdkProcessGate': 'export function createSdkProcessGate() {}',
-    'session/bookkeeping/database': ['initializeSessionBookkeeping', 'initializeSessionBookkeepingAsync',
-      'withBookkeepingWriteAsync', 'withBookkeepingRead'].map(n => `export function ${n}() {}`).join('\n'),
-    'session/bookkeeping/resourceImport': 'export function importResource() {}',
-    'session/bookkeeping/mappings': 'export function readSessionTranscriptPins() {}',
+    'session/bookkeeping/database': ['initializeSessionBookkeeping',
+      'withBookkeepingRead'].map(n => `export function ${n}() {}`).join('\n'),
+    'session/bookkeeping/migration': 'export function migrateBookkeeping() {}',
+    'session/bookkeeping/resources': 'export function readResource() {}',
+    'session/bookkeeping/mappings': 'export function readMapping() {}',
   };
   try {
     mkdirSync(join(root, 'src/proxy/session/bookkeeping'), { recursive: true });
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     for (const [file, source] of Object.entries(files)) writeFileSync(join(root, `src/proxy/${file}.js`), source);
-    await assert.rejects(openAdapter(root, 'sqlite', root), /portion 2.*atomic fixture importer/);
+    await assert.rejects(openAdapter(root, 'sqlite', root), /SQLite engine.*checkpointBookkeeping/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -102,8 +104,9 @@ test('independent JSON artifact and public adapter validate seed, pins and a rea
   try {
     const artifact = join(root, 'artifact'), fixture = join(root, 'fixture');
     mkdirSync(fixture);
-    const built = buildArtifact(resolve('.'), artifact, 'json');
+    const built = buildArtifact(resolve('.'), relative(process.cwd(), artifact), 'json');
     assert.ok(built.files.length > 3);
+    assert.ok(built.emitted.length > 3);
     const adapterUrl = new URL('./bench-bookkeeping-adapter.mjs', import.meta.url).href;
     const script = `import assert from 'node:assert/strict';
       process.env.MERIDIAN_TELEMETRY_PERSIST='0';

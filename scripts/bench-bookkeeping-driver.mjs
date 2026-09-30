@@ -6,6 +6,7 @@ import os from 'node:os';
 import { buildArtifact } from './bench-bookkeeping-build.mjs';
 import { plan, completeness } from './bench-bookkeeping-plan.mjs';
 import { writeReport } from './bench-bookkeeping-report.mjs';
+import { acceptance } from './bench-bookkeeping-acceptance.mjs';
 
 export async function driver(argv) {
   const flags = new Map();
@@ -52,7 +53,7 @@ export async function driver(argv) {
     cpu: os.cpus()[0]?.model, logicalCpus: os.cpus().length, totalMemory: os.totalmem(),
     loadStart: os.loadavg(), fs: { type: fs.type, blockSize: fs.bsize }, date: new Date().toISOString(), builds,
     plan: { matrix: matrix ?? 'full', repeats, rounds: rounds ?? 'default', soakMinutes },
-    pragmas: 'Backend runtime projection; JSON not applicable; SQLite unavailable until adapter activation' };
+    pragmas: 'Backend runtime readback; JSON not applicable; SQLite WAL/FULL checked before timing' };
   writeFileSync(join(evidence, 'environment.json'), JSON.stringify(environment, null, 2));
   writeFileSync(join(evidence, 'plan.json'), JSON.stringify(planned, null, 2));
   const scripts = dirname(fileURLToPath(import.meta.url)), results = [];
@@ -89,12 +90,8 @@ export async function driver(argv) {
   }
   const coverage = completeness(planned, results);
   environment.loadEnd = os.loadavg();
-  const report = { environment, coverage, results, interrupted,
-    acceptance: { status: 'NOT_ESTABLISHED', reasons: [
-      'Requires both backends, full matrix >=3 repeats, 10-minute matched soaks and Linux/ext4 FULL evidence',
-      'Semantic/fault suites are independent gates; this workload does not prove all ABA/deletion schedules',
-      'Queue/critical-section/BEGIN/COMMIT metrics require explicit production test seams, currently unavailable',
-    ] } };
+   const report = { environment, coverage, results, interrupted,
+     acceptance: acceptance(environment, coverage, results) };
   writeReport(report, evidence, flags.get('synopsis') && resolve(flags.get('synopsis')));
   console.log(`Artifacts: ${evidence}\nCoverage: ${coverage.completed}/${coverage.planned}`);
   process.exitCode = coverage.complete ? 0 : 1;

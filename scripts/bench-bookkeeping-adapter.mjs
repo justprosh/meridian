@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { seed } from './bench-bookkeeping-support.mjs';
 import { projection } from './bench-bookkeeping-metrics.mjs';
+import { sqliteAdapter } from './bench-bookkeeping-sqlite.mjs';
 
 export function requireFunctions(module, names, boundary) {
   const missing = names.filter(name => typeof module[name] !== 'function');
@@ -17,19 +18,7 @@ export async function openAdapter(artifact, backend, root) {
   const { createSdkProcessGate } = await load('session/sdkProcessGate');
   S.setSessionStoreDir(root);
   if (backend === 'sqlite') {
-    const db = await load('session/bookkeeping/database');
-    const importer = await load('session/bookkeeping/resourceImport');
-    const mappings = await load('session/bookkeeping/mappings');
-    requireFunctions(db, ['initializeSessionBookkeeping', 'initializeSessionBookkeepingAsync',
-      'withBookkeepingWriteAsync', 'withBookkeepingRead'], 'SQLite engine');
-    requireFunctions(importer, ['importResource'], 'SQLite importer');
-    requireFunctions(mappings, ['readSessionTranscriptPins'], 'SQLite pins');
-    // insertMapping currently allocates new slots; it is NOT a fence-preserving import.
-    // Never quietly seed JSON or exercise still-legacy lifecycle facades as SQLite.
-    throw Error('SQLite adapter not ready: portion 2 must supply atomic fixture importer preserving '
-      + 'mappings/history/fence slots, public inspector and activated SQLite lifecycle/store facade. '
-      + 'Required: seedFixture(handle, fixture) in ONE transaction outside timing; '
-      + 'inspect()/pins()/metrics()/close(). Existing insertMapping is not that importer.');
+    return sqliteAdapter(artifact, root, { L, S, storeSession, createSdkProcessGate });
   }
   const snapshot = () => S.readSessionStoreSnapshot();
   const resources = () => Object.values(JSON.parse(readFileSync(join(root, 'session-gc.json'), 'utf8')).resources);
@@ -37,7 +26,7 @@ export async function openAdapter(artifact, backend, root) {
     [name, existsSync(join(root, name)) ? statSync(join(root, name)).size : 0]));
   return { L, S, storeSession, createSdkProcessGate,
     seed: (N, M) => seed(root, N, M, L),
-    lookup: key => snapshot()[key],
+    lookup: key => S.lookupSharedSession(key),
     entries: () => Object.entries(snapshot()),
     pins: () => Object.values(snapshot()).flatMap(m => [m.currentTranscript, m.previousTranscript].filter(Boolean)),
     inspect: () => projection(resources(), Object.values(snapshot())),
