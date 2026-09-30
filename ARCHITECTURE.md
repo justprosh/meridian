@@ -193,6 +193,7 @@ src/
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
+│   ├── sseFailureSniff.ts     ← SSE framing/classification and bounded priority stream transport (leaf)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
 │   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
 │   ├── updateCheck.ts         ← Cached npm registry lookup for the newest published version
@@ -276,7 +277,7 @@ server.ts (HTTP layer)
 
 2. **`session/cache.ts` owns all mutable session state.** No other module should create or manage LRU caches for sessions.
 
-3. **`errors.ts`, `retryAfter.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts` and `retryAfter.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` instead.
+3. **`errors.ts`, `retryAfter.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts` and `retryAfter.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
 
 4. **`server.ts` is the only module that imports from Hono** or touches HTTP concerns.
 
@@ -387,6 +388,33 @@ it as a real `Retry-After` header; SSE turns carry it as `error.retry_after` in
 the error frame, because a stream's headers went out with `message_start` long
 before the failure existed. Under priority routing the wait names the *pool's*
 earliest opening, not the last account tried.
+
+**Failover runs inside the client-facing stream.** Under priority routing a
+streaming request returns an outer SSE response immediately and the candidate
+loop runs inside it: content-free keepalives (`: ping` comments — the service
+emits one every 15s — and forwarded `event: ping` frames) reach the client
+while an account is still deciding, so the hub's response-header deadline
+never waits on an account verdict (`streamPriorityDispatch`, framing in
+`sseFailureSniff.ts`). An account-failover `event: error` before any real
+frame suppresses that account and starts the next candidate — never on a
+cancelled request, and the outer cancellation reaches the active attempt even
+before its first meaningful frame. The first real frame (`message_start` or
+any other) relays byte-exact; a stream a client is already consuming is never
+yanked. An exposure-committed attempt relays its error instead of failing
+over, and a pool exhausted after headers emits one coherent SSE error frame,
+because the HTTP status can no longer be rewritten. Non-stream dispatch keeps
+the awaited status-code sniffer (`sniffAccountFailure`).
+
+The relay's outer queue applies byte-based backpressure (64 KiB plus at most
+one 16-KiB write), with keepalive timers skipping full queues. This does not
+change the SDK producer's existing buffering. Cancellation aborts the shared
+request link even while the next inner response is being prepared; a reader
+registered after cancellation is cancelled immediately. Suppressed readers
+are discarded before awaiting their completion. Incomplete EOF bytes are
+preserved, and undecoded UTF-8 bytes cannot be mistaken for an empty prelude.
+An incomplete prelude reaching 64 KiB conservatively ends sniffing and relays
+the attempt unchanged, preventing unbounded frame buffering without allowing
+cross-account replay after those bytes have been exposed.
 
 **A `[1m]` bench is scoped to whatever actually failed.** Extra Usage exhaustion
 is an entitlement fact about the account, so it benches the whole profile. A
