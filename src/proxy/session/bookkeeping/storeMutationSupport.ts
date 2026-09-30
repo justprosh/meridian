@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { connectionFor, checkParameters } from "./connection"
 import { canonicalizeLocator, persistedCanonicalLocator, validateLocator } from "./locator"
 import { mappingDigest, MAPPING_OBJECT_ORDER } from "./mappingMetadata"
+import { observedPublicationLocator } from "./publicationLocators"
 import type { BookkeepingReader, BookkeepingTransaction, CanonicalStoredSession, StoredSession,
   CanonicalTranscriptLocator, TranscriptLocator } from "./types"
 
@@ -27,8 +28,9 @@ export function prepareStoreLocator(directory: string, locator: TranscriptLocato
   }
   if (sessionId !== undefined && locator.sessionId !== sessionId)
     throw new Error("currentTranscript.sessionId must match claudeSessionId")
+  const observed = observedPublicationLocator(directory, locator)
   return connectionFor(directory).scope
-    ? persistedCanonicalLocator(locator) : canonicalizeLocator(locator)
+    ? persistedCanonicalLocator(observed) : canonicalizeLocator(locator)
 }
 
 /** Read canonical projection columns even for imported entries whose raw history preserves an alias. */
