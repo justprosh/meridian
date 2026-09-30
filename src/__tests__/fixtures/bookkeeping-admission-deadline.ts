@@ -19,6 +19,8 @@ if (process.argv[2] === "blocker") {
   process.send?.("locked")
 } else {
   const directory = process.argv[2]!
+  const count = Number(process.argv[3] ?? 50)
+  if (!Number.isSafeInteger(count) || count <= 0) throw new RangeError(`invalid sample count: ${process.argv[3]}`)
   const handle = await initializeSessionBookkeepingAsync(directory)
   const child = fork(fileURLToPath(import.meta.url), ["blocker", handle.path], {
     stdio: ["ignore", "ignore", "pipe", "ipc"],
@@ -35,11 +37,11 @@ if (process.argv[2] === "blocker") {
     locked.reject(new Error(`blocker exited before readiness: ${code}: ${stderr}`))
     resolve(code)
   }))
-  const watchdog = setTimeout(() => child.kill("SIGKILL"), 12_000)
+  const watchdog = setTimeout(() => child.kill("SIGKILL"), 2_000 + count * 200)
   try {
     await locked.promise
     const samples: AdmissionHeartbeat[] = []
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < count; i++) {
       const sample = await measureAdmissionHeartbeat(80, async () => {
         await assert.rejects(withBookkeepingWriteAsync(directory, { lockWaitMs: 80, lockRetryMs: 5 }, () => {
           throw new Error("child-held BEGIN IMMEDIATE must not admit")

@@ -35,10 +35,26 @@ interface Scope {
 let active: Scope | undefined
 
 type AdmissionWait = (ms: number, signal: AbortSignal) => Promise<void>
+export class BookkeepingAdmissionSeamError extends Error {
+  constructor(readonly reason: "admission-started" | "already-installed") {
+    super(`bookkeeping admission wait seam refused: ${reason}`)
+  }
+}
 let admissionWaitForTest: AdmissionWait | undefined
-/** Negative-control seam: production always uses the abortable asynchronous timer. */
+let admissionWaitInstalled = false
+let admissionStarted = false
+/** Internal negative-control seam, not part of the package's public API: production always uses the
+ * abortable asynchronous timer. Installable once per process and only before its first async admission,
+ * so it can never change the waits of a process that already admitted work; clearing is always allowed. */
 export function setBookkeepingAdmissionWaitForTest(wait: AdmissionWait | undefined): void {
   if (active) throw new SessionLifecycleReentrancyError("cannot change admission wait inside a transaction")
+  if (wait === undefined) {
+    admissionWaitForTest = undefined
+    return
+  }
+  if (admissionStarted) throw new BookkeepingAdmissionSeamError("admission-started")
+  if (admissionWaitInstalled) throw new BookkeepingAdmissionSeamError("already-installed")
+  admissionWaitInstalled = true
   admissionWaitForTest = wait
 }
 
@@ -231,6 +247,7 @@ export function withBookkeepingWriteAsync<T>(
   const connection = addressed(directory)
   if (active)
     throw new SessionLifecycleReentrancyError("async admission inside synchronous bookkeeping callback")
+  admissionStarted = true
   const budget = options.lockWaitMs ?? getBookkeepingLockWaitMs(),
     retry = options.lockRetryMs ?? 25
   if (!Number.isSafeInteger(budget) || budget < 0 || !Number.isSafeInteger(retry) || retry <= 0) {

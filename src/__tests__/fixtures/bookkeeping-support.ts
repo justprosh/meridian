@@ -1,8 +1,9 @@
 import { mkdirSync, writeFileSync, symlinkSync } from "node:fs"
 import { join, resolve } from "node:path"
 
+/** Acceptance output wins over the development artifact directory when both are set. */
 export function writeBenchArtifact(name: string, value: unknown): void {
-  const directory = process.env.BOOKKEEPING_BENCH_ARTIFACTS
+  const directory = process.env.BOOKKEEPING_ACCEPTANCE_OUT || process.env.BOOKKEEPING_BENCH_ARTIFACTS
   if (!directory) return
   mkdirSync(directory, { recursive: true })
   writeFileSync(join(directory, name), JSON.stringify(value, null, 2) + "\n")

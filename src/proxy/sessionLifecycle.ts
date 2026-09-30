@@ -916,13 +916,15 @@ class DeletionStillRunningError extends Error {}
 /** The SDK reported the transcript already gone: there is nothing left to delete. */
 class TranscriptAlreadyAbsentError extends Error {}
 
-/** Internal deletion runtime shared with the test-only SQL lifecycle phase. */
-export const sessionDeletionRuntime = {
+/** @internal Bridge for the SQL deletion phase (bookkeeping/lifecycleDeletionSql,
+ * lifecycleReconcileSql) into the one deletion runtime; not part of the package API.
+ * Frozen so that neither a consumer nor a test can swap a member under the JSON path. */
+export const sessionDeletionRuntime = Object.freeze({
   processGroupIsEmpty,
   deleteWithSdkChild, awaitCustomDeleter, isNotFoundError, DeletionStillRunningError,
   maxDeletes: DEFAULT_MAX_DELETES, timeoutMs: DEFAULT_DELETE_TIMEOUT_MS,
   retryBaseMs: DEFAULT_RETRY_BASE_MS, retryMaxMs: DEFAULT_RETRY_MAX_MS,
-}
+})
 
 async function awaitCustomDeleter(deletion: Promise<void>, timeoutMs: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined

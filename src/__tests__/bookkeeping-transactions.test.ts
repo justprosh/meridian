@@ -548,12 +548,14 @@ it("rolls back a leftover transaction on close and releases the file to another 
   handle = initializeSessionBookkeeping(directory)
 })
 
-it("never expires 50 Node admission budgets early while a child holds BEGIN IMMEDIATE", async () => {
+// One run carries the whole required sample count (measured ~12.4 s of a 40 s test budget).
+const ADMISSION_DEADLINE_SAMPLES = 150
+it(`never expires ${ADMISSION_DEADLINE_SAMPLES} Node admission budgets early while a child holds BEGIN IMMEDIATE`, async () => {
   handle.close()
   const build = await buildNodeFixture("bookkeeping-admission-deadline.ts", "deadline.mjs", directory)
   expect(build.success).toBe(true)
-  const child = spawnSync("node", [join(directory, "deadline.mjs"), directory], {
-    encoding: "utf8", timeout: 15_000,
+  const child = spawnSync("node", [join(directory, "deadline.mjs"), directory, String(ADMISSION_DEADLINE_SAMPLES)], {
+    encoding: "utf8", timeout: 35_000,
   })
   expect({ status: child.status, stderr: child.stderr, error: child.error }).toEqual({
     status: 0, stderr: "", error: undefined,
@@ -561,9 +563,9 @@ it("never expires 50 Node admission budgets early while a child holds BEGIN IMME
   const evidence = JSON.parse(child.stdout) as { node: string; samples: AdmissionHeartbeat[] }
   writeBenchArtifact("admission-deadline.json", evidence)
   expect(Number(evidence.node.split(".")[0])).toBeGreaterThanOrEqual(22)
-  expect(evidence.samples).toHaveLength(50)
+  expect(evidence.samples).toHaveLength(ADMISSION_DEADLINE_SAMPLES)
   for (const sample of evidence.samples) assertAdmissionDeadline(sample)
-}, 20_000)
+}, 40_000)
 
 it("measures three competing Node writers and bounds lock starvation by the admission budget", async () => {
   handle.close()

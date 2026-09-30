@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
+import { spawn } from "node:child_process"
+import { once } from "node:events"
 import { mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -201,16 +203,23 @@ it("recovers dead pre-handshake owner but cannot rescue an in-flight deleting pi
 })
 
 it("a surviving process group prevents recovery even after the executor died", async () => {
+  if (process.platform === "win32") return // Recovery skips the POSIX process-group probe on win32.
   const locator = seed("a", "retired")
   const claim = await claimDeletion([], options)
-  await attachDeletionExecutor(resourceKey(locator), claim!.deletionToken!, incarnations.captureProcessIncarnation()!, process.pid, options)
+  // A real detached group leader: the frozen deletion runtime probes it, nothing is mocked there.
+  const group = spawn("sleep", ["30"], { detached: true, stdio: "ignore" })
   const dead = spyOn(incarnations, "processIncarnationIsDead").mockReturnValue(true)
-  const group = spyOn(facade.sessionDeletionRuntime, "processGroupIsEmpty").mockReturnValue(false)
   try {
+    await attachDeletionExecutor(resourceKey(locator), claim!.deletionToken!, incarnations.captureProcessIncarnation()!, group.pid!, options)
     expect((await facade.reconcile([], options)).deletingRecovered).toBe(0)
-    group.mockReturnValue(true)
+    const exited = once(group, "exit")
+    group.kill("SIGKILL")
+    await exited
     expect((await facade.reconcile([], options)).deletingRecovered).toBe(1)
-  } finally { dead.mockRestore(); group.mockRestore() }
+  } finally {
+    dead.mockRestore()
+    if (group.exitCode === null && group.signalCode === null) group.kill("SIGKILL")
+  }
 })
 
 it("deleted pins fail closed; caller NUL and invalid options fail before mutation", async () => {
