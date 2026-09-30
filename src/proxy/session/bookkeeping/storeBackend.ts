@@ -45,6 +45,11 @@ export function activeStoreBackend(): SessionStoreBackend | undefined {
 
 /** Explicit fixture/embedder test seam only. There is deliberately no environment-based activation. */
 export function setSessionStoreBackendForTest(backend: SessionStoreBackend | null): void {
+  installSessionStoreBackend(backend)
+}
+
+/** Production installs the complete backend after READY initialization. */
+export function installSessionStoreBackend(backend: SessionStoreBackend | null): void {
   assertBookkeepingIdentityChangeAllowed()
   selected = backend ?? undefined
 }

@@ -34,6 +34,10 @@ export class SessionLifecyclePortionNotImplementedError extends Error {
 }
 
 let selected: SessionLifecycleBackend | undefined
+/** Production accepts only the complete lifecycle port, after READY initialization. */
+export function installSessionLifecycleBackend(backend: SessionLifecycleBackend | null): void {
+  setSessionLifecycleBackendForTest(backend)
+}
 export function activeLifecycleBackend(): SessionLifecycleBackend | undefined {
   if (!selected) assertLegacyStoreAccessAllowed()
   return selected

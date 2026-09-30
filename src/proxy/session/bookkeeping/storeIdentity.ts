@@ -1,8 +1,10 @@
 // Kept independent of connection.ts: importing the JSON facade must not load a native SQL backend.
+import { assertBookkeepingRuntimeIdentityChangeAllowed } from "./runtimeIdentity"
 let scopes = 0
 
 export function assertBookkeepingIdentityChangeAllowed(): void {
   if (scopes) throw new Error("cannot change session store identity during a bookkeeping transaction")
+  assertBookkeepingRuntimeIdentityChangeAllowed()
 }
 
 export function assertLegacyStoreAccessAllowed(): void {

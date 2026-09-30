@@ -1070,3 +1070,85 @@ $env:ANTHROPIC_API_KEY = "x" # Use your Meridian API key if protection is enable
 
 Then follow the [setup instructions for your client](agents.md). The desktop app
 is currently a Mac preview; it is not required for Windows headless use.
+# SQLite session bookkeeping
+
+Set `MERIDIAN_BOOKKEEPING=sqlite` to explicitly use SQLite for both transcript
+lifecycle and cross-proxy session mappings. The default is `json` for existing
+installations. `MERIDIAN_SESSION_DIR` selects the shared private directory.
+Once a directory contains SQLite or active maintenance journals, JSON startup
+refuses it rather than creating a second authority. Never remove lock barriers
+by hand.
+
+SQLite uses `session-bookkeeping.sqlite`, WAL, `synchronous=FULL`, foreign keys,
+`busy_timeout=0` and disabled automatic checkpoints. Use a local filesystem
+with working SQLite locks: Linux ext2/3/4, xfs, btrfs or tmpfs; macOS APFS/HFS.
+An unverified filesystem requires the explicit
+`BOOKKEEPING_ALLOW_UNVERIFIED_FS=1` escape hatch, not an assumed safety claim.
+The directory must belong to the service uid with mode 0700; database, journal,
+WAL and SHM files are private (0600). Corruption, incompatible schema, path
+identity drift or incomplete maintenance prevents startup, without salvage or
+JSON fallback. Windows migration/crash behavior needs separate platform evidence.
+
+## Explicit migration and rollback
+
+Stop and drain **every** proxy and its SDK/deletion children first. A missing
+lock file is not proof that a writer stopped. Back up the whole directory,
+including journals and WAL, and provide sufficient free space (the deployment
+helper requires at least max(1 GiB, six times the directory size)). Then run:
+
+```sh
+meridian-bookkeeping inspect --session-dir /private/session-dir --json
+meridian-bookkeeping migrate --session-dir /private/session-dir --writers-stopped --json
+MERIDIAN_BOOKKEEPING=sqlite MERIDIAN_SESSION_DIR=/private/session-dir meridian
+```
+
+Starting the server or calling initialization is **not** permission to import
+legacy JSON. Fresh empty directories bootstrap READY atomically; legacy
+directories require the explicit migration command. Migration preserves source
+JSON backups and installs permanent barriers on both legacy lock names. Inspect
+phases are `legacy`, `prepared`, `barriers`, `imported`, `ready`, `exporting`,
+`exported` and `corrupt`. CLI exits: 0 success, 2 usage, 3 refusal before barriers,
+4 refusal after barriers/export, 5 corrupt/foreign authority, 6 wrong uid.
+An interrupted transition is resumed with its explicit maintenance command.
+
+To return to a legacy binary, stop/drain all writers again, then run the new
+package's command **before replacing the package**:
+
+```sh
+meridian-bookkeeping export-json --session-dir /private/session-dir --json
+```
+
+Use the freshly exported JSON, never the original migrated backups: those omit
+all later publications and fence advances. Do not start an old binary until
+export completes and its barriers have been released. Retain the cycle/archive
+files for recovery. A corrupt database requires an operator's restore decision,
+not automatic rollback.
+
+## Admission and embedding
+
+The SQLite async admission budget is the maximum of
+`MERIDIAN_SESSION_GC_LOCK_WAIT_MS` (default 2000 ms) and
+`MERIDIAN_SESSION_LOCK_TIMEOUT_MS` (default 10000 ms). The latter is the legacy
+store-lock setting, now a compatibility synonym in the common budget; corresponding
+`CLAUDE_PROXY_*` aliases remain accepted. Explicit library `lockWaitMs=0` means
+one BEGIN attempt, not a blocking retry. `lockRetryMs` controls asynchronous
+retry timing. Legacy `lockStaleMs` cannot recover SQLite locks. An exhausted
+budget gives typed overload; HTTP server paths answer 503, not an SDK timeout.
+Synchronous library writers outside admission can immediately throw typed busy.
+
+`startProxyServer` handles initialization and owned shutdown. For synchronous
+embedders:
+
+```js
+const handle = await initializeProxyBookkeeping()
+const proxy = createProxyServer(config)
+// Serve proxy.app.fetch, then stop admissions and drain outstanding requests.
+proxy.beginDrain?.()
+await proxy.closeBackend?.()
+handle?.close()
+```
+
+Keep the directory/backend fixed for the lifetime of these owners. Closing one
+proxy never closes another owner's connection. Unknown COMMIT outcomes are not
+replayed and do not authorize retiring a possibly published transcript. Periodic
+GC performs a PASSIVE checkpoint; physical WAL shrinking is an offline operation.

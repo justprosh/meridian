@@ -326,6 +326,38 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 
 ## Session Management
 
+### SQLite bookkeeping boundary
+
+`MERIDIAN_BOOKKEEPING=sqlite` explicitly selects the shared row-based backend
+for both lifecycle and session mappings. JSON remains the default for legacy
+installations; a SQLite directory never falls back to JSON. One database per
+session directory stores resources, full-incarnation leases, generation fences,
+mapping histories/pins and priority publication state. Histories are loaded for
+addressed lookups, not GC pin collection.
+
+`startProxyServer` awaits READY initialization before binding. Synchronous
+`createProxyServer` requires an initialized handle; embedders call the exported
+`initializeProxyBookkeeping` first and close both the returned handle and the
+proxy's `closeBackend` after draining. Handles are reference-counted and the
+maintenance guard remains shared until the last owner closes. Backend/directory
+changes while a SQLite runtime is owned are rejected.
+
+Standalone synchronous cache/store operations retain their signatures. Server
+mutation roots enter asynchronous admission around the complete operation;
+nested store writes join the same transaction. Lifecycle publication promotes
+the resource and publishes its mapping/pins/priority state in one COMMIT. Its
+callback is synchronous and performs no SDK, filesystem or process probes.
+Cache and priority-memory changes are commit hooks; server publication flags
+are set only after the awaited durable publication returns. Unknown COMMIT
+outcomes retain the turn fence and never authorize abandonment of that fork.
+
+Native SQLite `busy_timeout=0` prevents synchronous lock waits. A bounded local
+FIFO retries BEGIN asynchronously, while SQLite serializes different processes.
+Read scopes use one snapshot and bypass in-memory authority. Maintenance uses
+bounded pages and PASSIVE checkpoints; explicit offline commands own migration,
+export and TRUNCATE. See [configuration](docs/configuration.md#sqlite-session-bookkeeping)
+and the runtime/COMMIT integration tests for the executable contract (graph #202–207).
+
 Sessions map an agent's conversation ID to a Claude SDK session ID. Two caches work in tandem:
 
 - **Session cache**: keyed by agent header (`x-opencode-session`)

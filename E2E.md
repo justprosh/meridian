@@ -6815,3 +6815,30 @@ disk 1,400-resource / 800-pin / 24-registration test in
 The [sanitized #1152 Linux evidence](docs/maintenance/evidence/1152-opencode-admission.json)
 records the matching baseline, six-client pass, disk contention and four E41
 results without publishing credentials or raw transcripts.
+# Packaged SQLite bookkeeping gate
+
+For a SQLite candidate, build and pack the final tree, then install both artifacts
+through the canonical smoke (Node 22):
+
+```sh
+npm run build
+npm pack --json
+node scripts/e2e-session-bookkeeping-packaged.mjs \
+  --package ./rynfar-meridian-<candidate>.tgz \
+  --baseline-package /path/to/independently-built-json-baseline.tgz
+node scripts/e2e-libsql-package.mjs ./rynfar-meridian-<candidate>.tgz
+```
+
+The bookkeeping smoke imports no `src/` modules: independently installed packages
+serve seeded context usage over HTTP, two Node processes share one SQLite
+directory, live owners refuse export, one owner's close preserves the other,
+restart retains mappings, explicit export restores a JSON baseline read, and a
+fresh directory initializes without migration. The baseline tarball is explicit
+because registry 1.78.0 has the known bundled-libsql import defect; a failed old
+import is not a successful rollback test.
+
+This gate exercises storage and server integration, **not** real model/SDK turns.
+It does not replace the affected-flow chain/parallel, stream/non-stream, resume,
+Linux admission or deletion-child platform scenarios below. Run the same final
+package smoke on Linux before claiming Linux delivery. Node/OS/architecture,
+artifact digests, baseline identity and exit codes belong in the durable evidence.
