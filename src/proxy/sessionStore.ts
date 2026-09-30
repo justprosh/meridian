@@ -4,7 +4,7 @@ import {
 } from "./session/bookkeeping/legacyCodec"
 import type {
   StoredSessionGeneration, DurablePriorityAssignment, PriorityAssignmentGeneration,
-  DurablePriorityAttempt, SessionStoreMeta, SessionStoreDocument,
+  SessionStoreMeta, SessionStoreDocument,
 } from "./session/bookkeeping/legacyCodec"
 export { getStoredSessionGeneration, parseStoreDocument, serializeLegacyStore } from "./session/bookkeeping/legacyCodec"
 export type {
@@ -67,6 +67,21 @@ import {
 
 import type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 export type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
+import { activeStoreBackend } from "./session/bookkeeping/storeBackend"
+import { assertBookkeepingIdentityChangeAllowed } from "./session/bookkeeping/storeIdentity"
+export { setSessionStoreBackendForTest } from "./session/bookkeeping/storeBackend"
+import type {
+  SharedSessionLookupResult, PriorityAssignmentLookupResult, PriorityAttemptTurn, PriorityAttemptClaim,
+  SharedSessionAndPriorityAssignmentOptions, SharedSessionAndPriorityAssignmentResult,
+  FinalizeSharedSessionAndPriorityAssignmentOptions, RollbackSharedSessionAndPriorityAssignmentOptions,
+  RollbackSharedSessionAndPriorityAssignmentResult,
+} from "./session/bookkeeping/storeTypes"
+export type {
+  SharedSessionLookupResult, PriorityAssignmentLookupResult, PriorityAttemptTurn, PriorityAttemptClaim,
+  SharedSessionPriorityPublication, SharedSessionAndPriorityAssignmentOptions, SharedSessionAndPriorityAssignmentResult,
+  FinalizeSharedSessionAndPriorityAssignmentOptions, RollbackSharedSessionAndPriorityAssignmentOptions,
+  RollbackSharedSessionAndPriorityAssignmentResult,
+} from "./session/bookkeeping/storeTypes"
 
 function keySlot(key: string): string {
   // At most 65,536 counters are persisted. A collision can reject safe work,
@@ -534,6 +549,7 @@ let sessionDirOverride: string | null = null
  *  Pass null to clear. For testing only. The legacy options parameter remains
  *  accepted for compatibility, but transactions are always locked. */
 export function setSessionStoreDir(dir: string | null, _opts?: { skipLocking?: boolean }): void {
+  assertBookkeepingIdentityChangeAllowed()
   sessionDirOverride = dir
 }
 
@@ -653,7 +669,17 @@ function readStoreStrict(path: string): Record<string, StoredSession> {
 /** Read a strict, coherent snapshot for maintenance tasks such as session GC.
  *  Unlike lookup helpers, malformed JSON and I/O errors are propagated. */
 export function readSessionStoreSnapshot(): Record<string, StoredSession> {
+  const backend = activeStoreBackend()
+  if (backend) return backend.readSessionStoreSnapshot(getSessionStoreDir())
   return readStoreStrict(getStorePath())
+}
+
+/** Locator-only API; the SQLite backend must not hydrate history to supply durable pins. */
+export function readSessionTranscriptPins(): TranscriptLocator[] {
+  const backend = activeStoreBackend()
+  if (backend) return backend.readSessionTranscriptPins(getSessionStoreDir())
+  return Object.values(readSessionStoreSnapshot()).flatMap((session) =>
+    [session.currentTranscript, session.previousTranscript].flatMap((locator) => locator ? [{ ...locator }] : []))
 }
 
 /** Capture exact durable generations for one adapter session across profile keys. */
@@ -661,6 +687,8 @@ export function readSessionStoreGenerationSnapshot(
   adapterSessionId: string,
   profileIds: readonly string[] = [],
 ): Record<string, StoredSessionGeneration> {
+  const backend = activeStoreBackend()
+  if (backend) return backend.readSessionStoreGenerationSnapshot(getSessionStoreDir(), adapterSessionId, profileIds)
   const document = readStoreDocumentCached(getStorePath())
   const keys = new Set(Object.keys(document.sessions).filter((key) =>
     key === adapterSessionId || key.endsWith(`:${adapterSessionId}`)))
@@ -748,13 +776,10 @@ function hasLegacyUserDenialBoundary(session: StoredSession): boolean {
   return typeof legacy === "string" && legacy.length > 0 && !session.passthroughToolCallAssistantUuid
 }
 
-export type SharedSessionLookupResult =
-  | { status: "found"; session: StoredSession; generation?: StoredSessionGeneration }
-  | { status: "missing"; existing?: StoredSession; generation?: StoredSessionGeneration }
-  | { status: "error"; error: Error }
-
 /** Distinguish an authoritative absence from a transient/corrupt read. */
 export function lookupSharedSessionResult(key: string): SharedSessionLookupResult {
+  const backend = activeStoreBackend()
+  if (backend) return backend.lookupSharedSessionResult(getSessionStoreDir(), key)
   try {
     const document = readStoreDocumentCached(getStorePath())
     const session = document.sessions[key]
@@ -777,18 +802,10 @@ export function lookupSharedSession(key: string): StoredSession | undefined {
   return result.status === "found" ? result.session : undefined
 }
 
-export type PriorityAssignmentLookupResult =
-  | {
-      status: "found"
-      assignment: DurablePriorityAssignment
-      generation: PriorityAssignmentGeneration
-      attempt?: DurablePriorityAttempt
-    }
-  | { status: "missing"; generation: PriorityAssignmentGeneration; attempt?: DurablePriorityAttempt }
-  | { status: "error"; error: Error }
-
 /** Read one exact durable route. V1 documents authoritatively contain none. */
 export function lookupPriorityAssignmentResult(routeKey: string): PriorityAssignmentLookupResult {
+  const backend = activeStoreBackend()
+  if (backend) return backend.lookupPriorityAssignmentResult(getSessionStoreDir(), routeKey)
   try {
     const document = readStoreDocumentCached(getStorePath())
     const assignment = document.meta.version === PRIORITY_STORE_META_VERSION
@@ -809,6 +826,8 @@ export function lookupPriorityAssignmentResult(routeKey: string): PriorityAssign
 }
 
 export function lookupSharedSessionByClaudeIdResult(claudeSessionId: string): SharedSessionLookupResult {
+  const backend = activeStoreBackend()
+  if (backend) return backend.lookupSharedSessionByClaudeIdResult(getSessionStoreDir(), claudeSessionId)
   try {
     const document = readStoreDocumentCached(getStorePath())
     let newest: StoredSession | undefined
@@ -871,6 +890,10 @@ export function storeSharedSession(
   sourceTranscript?: TranscriptLocator,
   expectedGeneration?: StoredSessionGeneration | null,
 ): StoredSessionGeneration | false {
+  const backend = activeStoreBackend()
+  if (backend) return backend.storeSharedSession(getSessionStoreDir(), key, claudeSessionId, messageCount,
+    lineageHash, messageHashes, sdkMessageUuids, contextUsage, messageBlockHashes, passthroughToolCallAssistantUuid,
+    passthroughToolCallIds, currentTranscript, sourceTranscript, expectedGeneration)
   if (currentTranscript !== undefined) {
     validateTranscriptLocator(currentTranscript, claudeSessionId)
   }
@@ -975,15 +998,6 @@ export function storeSharedSession(
   return storedGeneration
 }
 
-export interface PriorityAttemptTurn {
-  turnId: string
-  issuedAt: number
-}
-
-export interface PriorityAttemptClaim {
-  ownerToken: string
-}
-
 function validatePriorityAttemptTurn(turn: PriorityAttemptTurn | undefined): void {
   if (!turn) return
   if (!/^[A-Za-z0-9_-]{43}$/.test(turn.turnId)
@@ -1003,6 +1017,8 @@ export function claimPriorityAttempt(options: {
   expectedAssignmentGeneration: PriorityAssignmentGeneration
   turn?: PriorityAttemptTurn
 }): PriorityAttemptClaim | false {
+  const backend = activeStoreBackend()
+  if (backend) return backend.claimPriorityAttempt(getSessionStoreDir(), options)
   if (!options.routeKey || options.routeKey.length > 512) {
     throw new Error("priority attempt requires a bounded route key")
   }
@@ -1110,48 +1126,16 @@ function settlePriorityAttempt(
 
 /** Release an unexposed attempt; an older blocker remains intact. */
 export function releasePriorityAttempt(routeKey: string, ownerToken: string): boolean {
+  const backend = activeStoreBackend()
+  if (backend) return backend.releasePriorityAttempt(getSessionStoreDir(), routeKey, ownerToken)
   return settlePriorityAttempt(routeKey, ownerToken, "release")
 }
 
 /** Persist exposure before returning an account-shaped error or cancellation. */
 export function blockPriorityAttempt(routeKey: string, ownerToken: string): boolean {
+  const backend = activeStoreBackend()
+  if (backend) return backend.blockPriorityAttempt(getSessionStoreDir(), routeKey, ownerToken)
   return settlePriorityAttempt(routeKey, ownerToken, "block")
-}
-
-export interface SharedSessionPriorityPublication {
-  routeKey: string
-  profileId: string
-  lastHumanTurnDigest: string
-  lastHumanTurnIssuedAt: number
-  expectedAssignmentGeneration: PriorityAssignmentGeneration
-}
-
-export interface SharedSessionAndPriorityAssignmentOptions {
-  key: string
-  claudeSessionId: string
-  messageCount: number
-  lineageHash: string
-  messageHashes: string[]
-  sdkMessageUuids?: Array<string | null>
-  contextUsage?: TokenUsage
-  messageBlockHashes: string[][]
-  passthroughToolCallAssistantUuid?: string | null
-  passthroughToolCallIds?: string[] | null
-  currentTranscript?: TranscriptLocator
-  sourceTranscript?: TranscriptLocator
-  expectedMappingGeneration: StoredSessionGeneration
-  /** Original routed mapping retained across chained publications for rollback. */
-  rollbackMappingKey?: string
-  /** Exact pre-SDK durable claim cleared only by this winning publication. */
-  attemptOwnerToken?: string
-  priority: SharedSessionPriorityPublication
-}
-
-export interface SharedSessionAndPriorityAssignmentResult {
-  mappingGeneration: StoredSessionGeneration
-  assignmentGeneration: PriorityAssignmentGeneration
-  previousMapping: StoredSession | null
-  previousAssignment: DurablePriorityAssignment | null
 }
 
 function validatePriorityPublicationInput(options: SharedSessionAndPriorityAssignmentOptions): void {
@@ -1195,6 +1179,8 @@ function validatePriorityPublicationInput(options: SharedSessionAndPriorityAssig
 export function storeSharedSessionAndPriorityAssignment(
   options: SharedSessionAndPriorityAssignmentOptions,
 ): SharedSessionAndPriorityAssignmentResult | false {
+  const backend = activeStoreBackend()
+  if (backend) return backend.storeSharedSessionAndPriorityAssignment(getSessionStoreDir(), options)
   validatePriorityPublicationInput(options)
   let result: SharedSessionAndPriorityAssignmentResult | false = false
   mutateStore((document) => {
@@ -1368,15 +1354,6 @@ export function storeSharedSessionAndPriorityAssignment(
   return result
 }
 
-export interface FinalizeSharedSessionAndPriorityAssignmentOptions {
-  key: string
-  routeKey: string
-  expectedMappingGeneration: StoredSessionGeneration
-  expectedAssignmentGeneration: PriorityAssignmentGeneration
-  rollbackMappingKey?: string
-  attemptOwnerToken?: string
-}
-
 /**
  * Make a successful publication irrevocable and prune its rollback backlog.
  * Exact route+mapping CAS prevents a late finalizer from touching newer work.
@@ -1384,6 +1361,8 @@ export interface FinalizeSharedSessionAndPriorityAssignmentOptions {
 export function finalizeSharedSessionAndPriorityAssignment(
   options: FinalizeSharedSessionAndPriorityAssignmentOptions,
 ): boolean {
+  const backend = activeStoreBackend()
+  if (backend) return backend.finalizeSharedSessionAndPriorityAssignment(getSessionStoreDir(), options)
   let finalized = false
   mutateStore((document) => {
     if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
@@ -1434,27 +1413,12 @@ export function finalizeSharedSessionAndPriorityAssignment(
   return finalized
 }
 
-export interface RollbackSharedSessionAndPriorityAssignmentOptions {
-  key: string
-  routeKey: string
-  expectedMappingGeneration: StoredSessionGeneration
-  expectedAssignmentGeneration: PriorityAssignmentGeneration
-  previousMapping: StoredSession | null
-  previousAssignment: DurablePriorityAssignment | null
-  attemptOwnerToken?: string
-}
-
-export interface RollbackSharedSessionAndPriorityAssignmentResult {
-  mappingGeneration: StoredSessionGeneration
-  assignmentGeneration: PriorityAssignmentGeneration
-  restoredMapping: StoredSession | null
-  restoredAssignment: DurablePriorityAssignment | null
-}
-
 /** Restore the exact pre-request authorities after a canceled late publication. */
 export function rollbackSharedSessionAndPriorityAssignment(
   options: RollbackSharedSessionAndPriorityAssignmentOptions,
 ): RollbackSharedSessionAndPriorityAssignmentResult | false {
+  const backend = activeStoreBackend()
+  if (backend) return backend.rollbackSharedSessionAndPriorityAssignment(getSessionStoreDir(), options)
   let result: RollbackSharedSessionAndPriorityAssignmentResult | false = false
   mutateStore((document) => {
     if (document.meta.version !== PRIORITY_STORE_META_VERSION) return false
@@ -1543,6 +1507,9 @@ export function attachSharedTranscriptLocator(
   locator: TranscriptLocator,
   expectedGeneration?: StoredSessionGeneration,
 ): StoredSessionGeneration | false {
+  const backend = activeStoreBackend()
+  if (backend) return backend.attachSharedTranscriptLocator(getSessionStoreDir(), key,
+    expectedClaudeSessionId, locator, expectedGeneration)
   validateTranscriptLocator(locator, expectedClaudeSessionId)
   let attachedGeneration: StoredSessionGeneration | false = false
   mutateStore(({ sessions: store, meta }) => {
@@ -1582,6 +1549,8 @@ export function evictSharedSession(
   key: string,
   expectedGeneration?: StoredSessionGeneration,
 ): boolean {
+  const backend = activeStoreBackend()
+  if (backend) return backend.evictSharedSession(getSessionStoreDir(), key, expectedGeneration)
   let evicted = false
   mutateStore(({ sessions: store, meta }) => {
     const existing = store[key]
@@ -1609,6 +1578,8 @@ export function lookupSessionRecovery(key: string): {
   lastUsedAt: number
   messageCount: number
 } | undefined {
+  const backend = activeStoreBackend()
+  if (backend) return backend.lookupSessionRecovery(getSessionStoreDir(), key)
   const store = readStore()
   const session = store[key]
   if (!session) return undefined
@@ -1631,6 +1602,8 @@ export function listStoredSessions(): Array<{
   lastUsedAt: number
   messageCount: number
 }> {
+  const backend = activeStoreBackend()
+  if (backend) return backend.listStoredSessions(getSessionStoreDir())
   const store = readStore()
   return Object.entries(store).map(([key, session]) => ({
     key,
@@ -1643,6 +1616,8 @@ export function listStoredSessions(): Array<{
 }
 
 export function clearSharedSessions(): void {
+  const backend = activeStoreBackend()
+  if (backend) return backend.clearSharedSessions(getSessionStoreDir())
   mutateStore(({ sessions: store, meta }) => {
     for (const key of Object.keys(store)) {
       delete store[key]

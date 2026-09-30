@@ -19,6 +19,7 @@ import {
 } from "./connection"
 import type { Connection } from "./connection"
 import type { BookkeepingReader, BookkeepingTransaction, BookkeepingWriteOptions, SqlRow } from "./types"
+import { enterBookkeepingIdentityScope } from "./storeIdentity"
 
 export class BookkeepingCommitUncertainError extends Error {
   readonly committed = "unknown"
@@ -152,6 +153,7 @@ function runStarted<T>(
   const scope = scopeFor(connection, read ? "read" : (options.scope ?? "lifecycle"))
   active = scope
   connection.scope = read ? "read" : "write"
+  const leaveIdentityScope = enterBookkeepingIdentityScope()
   let result: T
   try {
     result = synchronous(() => callback(scope.tx))
@@ -169,6 +171,7 @@ function runStarted<T>(
   } finally {
     active = undefined
     connection.scope = undefined
+    leaveIdentityScope()
   }
   const errors: unknown[] = []
   for (const hook of scope.hooks.splice(0)) {
