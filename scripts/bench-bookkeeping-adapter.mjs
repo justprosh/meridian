@@ -29,7 +29,7 @@ export async function openAdapter(artifact, backend, root) {
     lookup: key => S.lookupSharedSession(key),
     entries: () => Object.entries(snapshot()),
     pins: () => Object.values(snapshot()).flatMap(m => [m.currentTranscript, m.previousTranscript].filter(Boolean)),
-    inspect: () => projection(resources(), Object.values(snapshot())),
+    inspect: () => projection(resources(), Object.values(snapshot())), resources,
     sizes,
     // No private-function instrumentation: unavailable means null, never a fabricated zero.
     metrics: () => ({ begin: null, commit: null, queueWaitMs: null, criticalSectionMs: null,

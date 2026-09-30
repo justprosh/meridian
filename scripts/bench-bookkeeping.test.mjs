@@ -9,8 +9,10 @@ import { armedLoopProbe } from './bench-bookkeeping-metrics.mjs';
 import { requireFunctions, openAdapter } from './bench-bookkeeping-adapter.mjs';
 import { buildArtifact } from './bench-bookkeeping-build.mjs';
 import { renderReport } from './bench-bookkeeping-report.mjs';
+import { runPoint } from './bench-bookkeeping-point.mjs';
 import './bench-bookkeeping-acceptance.test.mjs';
 import './bench-bookkeeping-cleanup.test.mjs';
+import './bench-bookkeeping-review.test.mjs';
 
 const evidence = resolve('.evidence/bench-harden/tests');
 mkdirSync(evidence, { recursive: true });
@@ -101,7 +103,7 @@ test('SQLite adapter refuses missing canonical migration/inspection APIs without
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('independent JSON artifact and public adapter validate seed, pins and a real lease', () => {
+test('canonical JSON artifact: lease, 257 deletions/default pruning and production-gated timeout JOIN', async () => {
   const root = mkdtempSync(join(evidence, 'json-adapter-'));
   try {
     const artifact = join(root, 'artifact'), fixture = join(root, 'fixture');
@@ -121,10 +123,32 @@ test('independent JSON artifact and public adapter validate seed, pins and a rea
       await a.L.releaseActiveTranscriptLease(lease,opts);
       assert.equal(a.inspect().mappingRows,100); assert.equal(before.resourceRows,200);
       assert.equal(a.pins().length,100); assert.ok(before.historyBytes>0);
-      a.assert(new Map(a.entries().map(([k,m])=>[k,m.currentTranscript]))); a.close();`;
+       a.assert(new Map(a.entries().map(([k,m])=>[k,m.currentTranscript])));
+       // Exercise canonical pruning, not a new pruning implementation. Custom deleter only in this regression.
+       const initial=a.seed(600,100);const rows=a.resources();const removed=new Set();
+       const gc=await a.L.runGc(a.pins(),{...opts,retiredGraceMs:0,maxDeletesPerRun:257,
+         deleter:async l=>removed.add(a.L.getTranscriptResourceKey(l))});
+       assert.equal(gc.deleted,257);assert.equal(gc.failed,0);
+       const {conservation}=await import(${JSON.stringify(new URL('./bench-bookkeeping-conservation.mjs', import.meta.url).href)});
+       const proof=conservation(rows,new Set(),a.resources(),gc.deleted,removed);
+       assert.equal(proof.pruned,1);assert.equal(a.resources().filter(r=>r.state==='deleted').length,256);
+       a.assert(new Map(a.entries().map(([k,m])=>[k,m.currentTranscript])));a.close();`;
     const result = spawnSync(process.execPath, ['--loader', resolve('scripts/bench-ts-loader.mjs'),
       '--input-type=module', '-e', script], { encoding: 'utf8', timeout: 30000 });
     assert.equal(result.status, 0, result.stderr);
+    const executorFile = join(root, 'executor.json');
+    const gateScript = `import {writeFileSync} from 'node:fs';
+      const {cancellation}=await import(${JSON.stringify(new URL('./bench-bookkeeping-cancellation.mjs', import.meta.url).href)});
+      const {createSdkProcessGate}=await import(${JSON.stringify(new URL(`file://${join(artifact, 'src/proxy/session/sdkProcessGate.js')}`).href)});
+      const cancel=cancellation();const gate=await createSdkProcessGate(${JSON.stringify(join(root, 'timeout-gate'))},async e=>writeFileSync(${JSON.stringify(executorFile)},JSON.stringify(e)));
+      cancel.gate(gate);const child=gate.spawnClaudeCodeProcess({command:process.execPath,args:['-e','setTimeout(()=>{},60000)'],env:process.env,cwd:${JSON.stringify(root)},signal:cancel.signal});
+      await new Promise(r=>{child.once('close',r);child.once('error',r)});
+      const joined=await gate.closeAndJoin();cancel.joined(gate,joined);await cancel.finish();`;
+    const timeout = await runPoint(['--input-type=module', '-e', gateScript], { timeoutMs: 2000, joinTimeoutMs: 15000 });
+    assert.equal(timeout.joined, true, timeout.log);assert.equal(timeout.stopMatrix, true);
+    assert.equal(timeout.timedOut, true);
+    const executor = JSON.parse(readFileSync(executorFile, 'utf8'));
+    assert.throws(() => process.kill(executor.pid, 0), /ESRCH/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

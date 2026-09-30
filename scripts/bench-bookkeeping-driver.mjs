@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, mkdtempSync, statfsSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { runPoint } from './bench-bookkeeping-point.mjs';
 import os from 'node:os';
 import { buildArtifact } from './bench-bookkeeping-build.mjs';
 import { plan, completeness } from './bench-bookkeeping-plan.mjs';
@@ -62,33 +62,27 @@ export async function driver(argv) {
   writeFileSync(join(evidence, 'environment.json'), JSON.stringify(environment, null, 2));
   writeFileSync(join(evidence, 'plan.json'), JSON.stringify(planned, null, 2));
   const scripts = dirname(fileURLToPath(import.meta.url)), results = [];
-  let interrupted = false, current;
-  const interrupt = () => { interrupted = true; current?.kill('SIGTERM'); };
+  let interrupted = false;
+  const cancellation = new AbortController();
+  const interrupt = () => { interrupted = true; cancellation.abort(); };
   process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
   const forced = flags.has('interrupt-after-ms') ? setTimeout(interrupt, positive('interrupt-after-ms')) : undefined;
   try {
     for (const c of planned) {
       if (interrupted) break;
       if (buildErrors[c.backend]) { results.push({ ...c, error: buildErrors[c.backend] }); continue; }
-      current = spawn(process.execPath, ['--loader', join(scripts, 'bench-ts-loader.mjs'),
+      const point = await runPoint(['--loader', join(scripts, 'bench-ts-loader.mjs'),
         join(scripts, 'bench-session-bookkeeping.mjs'), '--case', JSON.stringify(c),
-        '--artifact', artifacts[c.backend], '--evidence', evidence], { stdio: ['ignore', 'pipe', 'pipe'] });
-      let log = '';
-      current.stdout.on('data', chunk => { log += chunk; });
-      current.stderr.on('data', chunk => { log += chunk; });
-      const timeout = setTimeout(() => current?.kill('SIGTERM'),
-        positive('point-timeout-ms', (c.soakMs ?? 0) + 300000));
-      const code = await new Promise(resolveExit => {
-        current.once('error', error => { log += error.message; });
-        current.once('close', resolveExit);
-      });
-      clearTimeout(timeout); current = undefined;
+        '--artifact', artifacts[c.backend], '--evidence', evidence], {
+        timeoutMs: positive('point-timeout-ms', (c.soakMs ?? 0) + 300000), signal: cancellation.signal });
+      const { code, log, joined, timedOut } = point;
       writeFileSync(join(evidence, `${c.id}.log`), log);
-      if (code === 0) {
+      if (code === 0 && joined && !timedOut) {
         try { results.push(JSON.parse(readFileSync(join(evidence, `${c.id}.json`), 'utf8'))); }
         catch (error) { results.push({ ...c, error: `Missing/invalid result: ${error.message}` }); }
-      } else results.push({ ...c, error: `worker exit ${code}` });
-      console.log(`${c.id}: ${code === 0 ? 'completed' : `FAIL ${code}`}`);
+      } else results.push({ ...c, error: `worker exit ${code}; joined=${joined}; timedOut=${timedOut}`, complete: false });
+      console.log(`${c.id}: ${code === 0 && joined && !timedOut ? 'completed' : `FAIL ${code}; joined=${joined}; timeout=${timedOut}`}`);
+      if (point.stopMatrix) { interrupted = true; break; }
     }
   } finally {
     clearTimeout(forced); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);

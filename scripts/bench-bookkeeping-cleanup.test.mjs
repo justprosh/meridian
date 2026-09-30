@@ -11,10 +11,10 @@ test('unjoined writer is not released and failed fixture fences are retained', (
   const root = mkdtempSync(join(evidence, 'unjoined-control-'));
   const artifact = join(root, 'artifact'), output = join(root, 'output'), marker = join(root, 'wrong-release');
   const modules = {
-    sessionLifecycle: `import {createHash} from 'node:crypto';import {writeFileSync} from 'node:fs';
+    sessionLifecycle: `import {createHash} from 'node:crypto';import {writeFileSync,readFileSync} from 'node:fs';import {join} from 'node:path';
       export const getTranscriptResourceKey=l=>createHash('sha256').update(l.sessionId).digest('hex');
       export async function ensureTranscriptJournaled(){};export async function registerLiveTranscript(){};
-      export async function prepareForkForPublication(){};export async function attachActiveTranscriptExecutor(){};
+      export async function prepareForkForPublication(l,o){const p=join(o.storeDir,'session-gc.json'),s=JSON.parse(readFileSync(p,'utf8'));const k=getTranscriptResourceKey(l);s.resources[k]={key:k,locator:l,state:'prepared',generation:'test'};writeFileSync(p,JSON.stringify(s))};export async function attachActiveTranscriptExecutor(){};
       export async function attachPinnedTranscript(l,cb){return cb()};
       export async function acquireActiveTranscriptLease(){return 'lease'};
       export async function releaseJoinedTranscriptLease(){writeFileSync(${JSON.stringify(marker)},'unsafe')};`,

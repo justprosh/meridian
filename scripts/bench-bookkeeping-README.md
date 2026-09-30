@@ -80,6 +80,16 @@ The per-turn path is resumed, non-streaming, managed-fork, non-priority. Both
 backends must execute this same orchestration, with real lifecycle/store/cache
 exports and harmless gated Node children. Baseline anchors at `022d37a`:
 
+**Version confound:** `022d37a` (hub.1) clips an already-claimed deletion to the
+remaining pass deadline; deployed hub.2 `47b6e51` and the SQLite collector on
+`c08b456` give it the full deletion timeout. GC-on hub.1/SQLite ratios are therefore
+**combined version comparisons, never storage-only gains**. An 8-delete workload
+does not erase that confound. Build manifests, machine comparisons and sanitized
+synopses record each backend's actual policy/version (SQL reads its collector,
+not the legacy JSON path). Targeted hub.2 K20/K40 GC controls are required before
+interpreting GC-on gains with matched policy; even those do not isolate every
+other code-version delta. GC-off points are labelled separately.
+
 |Step|server.ts|Public calls|
 |---|---|---|
 |Mapping/generation|2518–2530|adapter lookup, getStoredSessionGeneration|
@@ -94,7 +104,7 @@ exports and harmless gated Node children. Baseline anchors at `022d37a`:
 |Pins|768–783|adapter pins plus active source/target pins|
 
 Each active conversation has a distinct source, and sequential turns. Not
-modeled: priority, rollback, streaming, cancellation, inference semaphore,
+modeled in performance points: priority, rollback, streaming, inference semaphore,
 network, multiprocess contention or the outer per-conversation coordinator.
 This workload does not replace the semantic/fault suites.
 
@@ -114,6 +124,11 @@ observed filesystem codec is explicitly pinned to SDK0.2.141; another SDK is ref
 until its installed codec is read. Current and previous mapping pins must remain on
 disk; removed files must equal committed deletions, with zero notFound substitutions.
 Both backends use identical physical fixtures. The Linux runner selects real SDK.
+The stress cadence (8 deletes/10s) is not the production default (16 deletes/60s).
+Each result separately reports production maxDeletes/cadence's ideal service
+ceiling against measured intake and the explicit 20% margin. This ceiling assumes
+instant deletes/no retries, so passing it is not production stability evidence;
+falling below intake falsifies stability even if the faster stress collector passes.
 There is no deliberate failure injection in the performance matrix. A failed
 deletion invalidates the point. The 8-delete bound leaves headroom beneath the
 pass deadline; the old 16×2s exceeded a 30s pass even before bookkeeping overhead.
@@ -148,8 +163,24 @@ read-only sidecar projection (legacy lifecycle has no public resource inspector)
 Workload/tests never parse its files directly. Inspection preserves all mapping
 keys, compares final published IDs and lifecycle generations, refuses deleting/
 deleted current resources, checks mapping count/history bytes, and proves resource
-row growth by at least the successful turn count. Assertions cover observed
+resource conservation over initial keys, all prepared targets, surviving rows,
+committed deletions and observed missing/pruned keys. In real SDK mode every pruned
+key must also have a physically removed file. Default production tombstone pruning
+stays enabled; 257 deletions with 256 surviving tombstones is a regression case.
+Assertions cover observed
 schedule, **not** arbitrary ABA or crash/deletion interleavings.
+
+Timeout/interrupt aborts the signal passed to every production model gate, stops
+new turns/GC passes, and awaits gate closeAndJoin plus the in-flight production
+GC promise (whose deletion runtime owns and joins its children). Workers emit a
+positive IPC JOIN receipt only with no unknown gate/deleting-resource fence.
+The driver stops the whole matrix on any timeout/interrupt or missing JOIN receipt,
+even after a cooperative JOIN; it never proceeds on worker exit alone. A stalled
+worker is killed only by its recorded PID after the join deadline: this is NOT
+child-termination proof, the matrix remains stopped and fixtures remain private.
+No generic process-name kills. Failed/unjoined fixtures are retained and excluded
+from sanitized archives. Focused tests exercise a 60-second production-gated child,
+timeout cancellation, OS process absence, and missing-JOIN refusal.
 
 SQLite uses the real offline `migrateBookkeeping(...,{writersStopped:true})` on
 the same synthetic legacy fixture, outside timing. Its one atomic import preserves

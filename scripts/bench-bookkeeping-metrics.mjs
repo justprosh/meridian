@@ -45,10 +45,15 @@ export function projection(resources, mappings) {
     states, errors, dueCount, oldestDueMs };
 }
 
-export function deletionService(gcRuns, intake, elapsedMs, drainMs, { gc, realSdk }) {
+export function deletionService(gcRuns, intake, elapsedMs, drainMs, { gc, realSdk, policy }) {
   const removed = gcRuns.reduce((n, r) => n + r.deleted + r.notFound, 0);
   const removalRate = removed / (drainMs / 1000), intakeRate = intake / (elapsedMs / 1000);
   return { syntheticSdk: !realSdk, deletionDelayMs: realSdk ? null : 2000, passes: gcRuns.length,
+    benchmarkPolicy: { cadenceMs: 10000, maxDeletes: 8, runTimeoutMs: 30000, deletionTimeoutMs: 30000 },
+    productionCadence: policy ? { ...policy, upperBoundPerSecond: policy.maxDeletes / (policy.cadenceMs / 1000),
+      upperBoundToIntakeRatio: intake > 0 ? policy.maxDeletes / (policy.cadenceMs / 1000) / intakeRate : null,
+      sufficientWithMargin: gc && intake > 0 && policy.maxDeletes / (policy.cadenceMs / 1000) >= 1.2 * intakeRate,
+      scope: 'ideal ceiling assuming instant deletes, no retries or pass overlap; NOT measured production stability' } : null,
     removed, intake, measurementMs: elapsedMs, drainIncludedMs: drainMs,
     removalsPerSecond: removalRate, intakePerSecond: intakeRate,
     removalToIntakeRatio: intake > 0 ? removalRate / intakeRate : null,

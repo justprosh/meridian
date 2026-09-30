@@ -1,3 +1,4 @@
+import { comparisonScope } from './bench-bookkeeping-policy.mjs';
 // Measured thresholds and external evidence are separate gates. Never promote a smoke.
 export function acceptance(environment, coverage, results) {
   const reasons = [], comparisons = [];
@@ -9,13 +10,17 @@ export function acceptance(environment, coverage, results) {
   if (!builds.json || !builds.sqlite) reasons.push('Both pinned backends required');
   if (Object.values(builds).some(b => b.sourceDirty)) reasons.push('Dirty source build is not accepted');
   if (builds.json && builds.sqlite && builds.json.sdk !== builds.sqlite.sdk) reasons.push('SDK versions differ');
+  if (builds.json && builds.sqlite && builds.json.cli !== builds.sqlite.cli) reasons.push('Installed CLI versions differ');
   for (const candidate of results.filter(r => r.backend === 'sqlite' && r.complete)) {
     const baseline = results.find(r => r.backend === 'json' && r.complete &&
       ['N', 'M', 'K', 'mode', 'gc', 'repeat'].every(key => r[key] === candidate[key]));
     if (!baseline) { reasons.push(`Missing paired baseline for ${candidate.id}`); continue; }
     if (candidate.N >= 6400 && [20, 40].includes(candidate.K)) {
       const ratio = baseline.overhead.p95 / candidate.overhead.p95;
-      comparisons.push({ id: candidate.id, p95OverheadSpeedup: ratio,
+      comparisons.push({ id: candidate.id,
+        scope: comparisonScope(builds.json?.gcPolicy, builds.sqlite?.gcPolicy, candidate.gc),
+        baselinePolicy: builds.json?.gcPolicy ?? null, candidatePolicy: builds.sqlite?.gcPolicy ?? null,
+        p95OverheadSpeedup: ratio,
         p95TurnSpeedup: baseline.latency.p95 / candidate.latency.p95 });
       if (!(ratio >= 2)) reasons.push(`p95 overhead <2x improvement: ${candidate.id}`);
       if (!(baseline.latency.p95 / candidate.latency.p95 >= 2)) reasons.push(`p95 full turn <2x improvement: ${candidate.id}`);
@@ -28,6 +33,9 @@ export function acceptance(environment, coverage, results) {
     if (candidate.mode === 'soak' && candidate.gc && !candidate.gcService?.sufficientWithMargin) {
       reasons.push(`Deletion service below intake + margin (#213): ${candidate.id}`);
     }
+    if (candidate.mode === 'soak' && candidate.gc && !candidate.gcService?.productionCadence?.sufficientWithMargin) {
+      reasons.push(`Production cadence/maxDeletes upper bound below intake + margin (#213): ${candidate.id}`);
+    }
     if (candidate.gc && environment.plan.gcSdk === 'real' && !(candidate.sdkFilesystem?.removedFiles > 0)) {
       reasons.push(`Real SDK physical deletion not established: ${candidate.id}`);
     }
@@ -38,5 +46,7 @@ export function acceptance(environment, coverage, results) {
   else reasons.push('Real SDK deletion uses synthetic physical transcripts; open-arrival bound is an independent gate');
   reasons.push('Canonical npm-package, semantic/fault/platform suites are independent gates',
     'Immutable artifact archive URL and retention not recorded');
-  return { status: 'NOT_ESTABLISHED', reasons: [...new Set(reasons)], comparisons };
+  return { status: 'NOT_ESTABLISHED', reasons: [...new Set(reasons)], comparisons,
+    comparisonScope: { gcOn: comparisonScope(builds.json?.gcPolicy, builds.sqlite?.gcPolicy, true),
+      gcOff: comparisonScope(builds.json?.gcPolicy, builds.sqlite?.gcPolicy, false) } };
 }

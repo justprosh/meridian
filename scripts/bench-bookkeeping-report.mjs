@@ -7,6 +7,13 @@ export function renderReport(report) {
     `Coverage: ${report.coverage.completed}/${report.coverage.planned}; ${report.coverage.complete ? 'COMPLETE' : 'FAIL'}`,
     `PR acceptance: ${report.acceptance.status}`, '', ...report.coverage.issues, '',
     ...report.acceptance.reasons.map(reason => `- ${reason}`)];
+  lines.push('', '## GC policy / comparison scope');
+  if (report.acceptance.comparisonScope) lines.push(`- GC-on: ${report.acceptance.comparisonScope.gcOn}`,
+    `- GC-off: ${report.acceptance.comparisonScope.gcOff}`);
+  for (const [name, b] of Object.entries(report.environment?.builds ?? {})) {
+    lines.push(`- ${name}: ${b.sha}; version ${b.version}; GC policy ${JSON.stringify(b.gcPolicy ?? null)}`);
+  }
+  for (const c of report.acceptance.comparisons ?? []) lines.push(`- ${c.id}: ${c.scope}`);
   for (const soak of [false, true]) {
     lines.push('', soak ? '## Soak (K=20, matched GC)' : '## Matrix', '',
       '|Point|Status|turns|p95/p99 overhead ms|turn/s|GC due before/after|history bytes before/after|',
@@ -42,8 +49,9 @@ export function writeReport(report, evidence, synopsis) {
     mkdirSync(synopsis, { recursive: true });
     const sanitized = { ...report, environment: { ...report.environment,
       builds: Object.fromEntries(Object.entries(report.environment.builds).map(([key, build]) =>
-        [key, { backend: build.backend, version: build.version, sdk: build.sdk, compiler: build.compiler,
-          sha: build.sha, sourceDirty: build.sourceDirty, lockSha256: build.lockSha256 }])) },
+        [key, { backend: build.backend, version: build.version, sdk: build.sdk, cli: build.cli,
+          cliSpawned: build.cliSpawned, modelSimulation: build.modelSimulation, compiler: build.compiler,
+          gcPolicy: build.gcPolicy, sha: build.sha, sourceDirty: build.sourceDirty, lockSha256: build.lockSha256 }])) },
       results: report.results.map(({ timeline, errors, error, gcErrors, before, after, ...r }) => ({ ...r,
         before: sanitizedProjection(before), after: sanitizedProjection(after),
         error: error ? 'Worker failed; see artifact log' : undefined, errorCount: errors?.length ?? 0,

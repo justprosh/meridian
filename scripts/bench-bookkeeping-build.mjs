@@ -4,6 +4,7 @@ import { dirname, join, resolve, relative } from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { hash } from './bench-bookkeeping-support.mjs';
+import { gcPolicy } from './bench-bookkeeping-policy.mjs';
 
 export function buildArtifact(packageRoot, output, backend) {
   packageRoot = resolve(packageRoot);
@@ -54,7 +55,13 @@ export function buildArtifact(packageRoot, output, backend) {
   writeFileSync(join(output, 'package.json'), JSON.stringify({ ...pkg, scripts: {}, type: 'module' }, null, 2));
   const sdk = JSON.parse(readFileSync(join(dirname(require.resolve('@anthropic-ai/claude-agent-sdk')),
     'package.json'), 'utf8')).version;
-  const manifest = { backend, version: pkg.version, sdk, compiler: `bun ${execFileSync('bun', ['--version'], {encoding:'utf8'}).trim()}`,
+  const cli = JSON.parse(readFileSync(join(packageRoot, 'node_modules/@anthropic-ai/claude-code/package.json'), 'utf8')).version;
+  const manifest = { backend, version: pkg.version, sdk, cli, cliSpawned: false,
+    gcPolicy: gcPolicy(readFileSync(join(packageRoot, 'src/proxy/sessionLifecycle.ts'), 'utf8'),
+      readFileSync(join(packageRoot, 'src/proxy/server.ts'), 'utf8'), pkg.version,
+      backend === 'sqlite' ? readFileSync(join(packageRoot, 'src/proxy/session/bookkeeping/lifecycleDeletionSql.ts'), 'utf8') : undefined),
+    modelSimulation: 'gated Node timer, no inference/quota',
+    compiler: `bun ${execFileSync('bun', ['--version'], {encoding:'utf8'}).trim()}`,
     buildScope: 'canonical Bun flags, internal production API entrypoints; independent npm gate required',
     emitted, buildArgs: args.map(a => a === output ? '<artifact>' : a === packageRoot ? '<package-root>'
       : a.startsWith(packageRoot + '/') ? relative(packageRoot, a) : a),

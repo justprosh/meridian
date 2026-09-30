@@ -25,6 +25,10 @@ export function sdkTranscriptFixture(fixture) {
     message: { role: 'user', content: 'Synthetic benchmark transcript; no inference performed. '.repeat(300) } }) + '\n';
   for (const locator of fixture.locators) writeFileSync(pathFor(locator), bytes(locator), { mode: 0o600 });
   return {
+    removedKeys(keyFor) {
+      return new Set([...paths].filter(([, path]) => !existsSync(path))
+        .map(([sessionId]) => keyFor({ sessionId, configDir: fixture.configDir, projectDir: fixture.projectDir })));
+    },
     childProgram(locator, delay) {
       return `const fs=require('node:fs');setTimeout(()=>fs.writeFileSync(${JSON.stringify(pathFor(locator))},`
         + `${JSON.stringify(bytes(locator))},{mode:0o600}),${delay});`;

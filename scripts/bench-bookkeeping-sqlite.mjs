@@ -85,7 +85,7 @@ export async function sqliteAdapter(artifact, root, common) {
     lookup: key => S.lookupSharedSession(key),
     entries: () => Object.entries(snapshot()),
     pins: () => S.readSessionTranscriptPins(),
-    inspect: () => { noLegacy(); return projection(rows(), Object.values(snapshot())); },
+    inspect: () => { noLegacy(); return projection(rows(), Object.values(snapshot())); }, resources: rows,
     sizes: () => Object.fromEntries(['session-bookkeeping.sqlite', 'session-bookkeeping.sqlite-wal',
       'session-bookkeeping.sqlite-shm'].map(name => [name, existsSync(join(root, name)) ? statSync(join(root, name)).size : 0])),
     resetMetrics: () => { transactions = []; pending = undefined; beginAttempts = 0; busyAttempts = 0; },
