@@ -34,6 +34,14 @@ interface Scope {
 }
 let active: Scope | undefined
 
+type AdmissionWait = (ms: number, signal: AbortSignal) => Promise<void>
+let admissionWaitForTest: AdmissionWait | undefined
+/** Negative-control seam: production always uses the abortable asynchronous timer. */
+export function setBookkeepingAdmissionWaitForTest(wait: AdmissionWait | undefined): void {
+  if (active) throw new SessionLifecycleReentrancyError("cannot change admission wait inside a transaction")
+  admissionWaitForTest = wait
+}
+
 function synchronous<T>(callback: () => T): T {
   const value = callback()
   if (
@@ -250,9 +258,9 @@ export function withBookkeepingWriteAsync<T>(
           const left = budget - (performance.now() - started)
           if (left <= 0) throw timeout
           try {
-            await delay(Math.min(left, retry * (0.75 + Math.random() * 0.5)), undefined, {
-              signal: controller.signal,
-            })
+            const waitMs = Math.min(left, retry * (0.75 + Math.random() * 0.5))
+            if (admissionWaitForTest) await admissionWaitForTest(waitMs, controller.signal)
+            else await delay(waitMs, undefined, { signal: controller.signal })
           } catch (error) {
             if (controller.signal.aborted) throw controller.signal.reason
             throw error

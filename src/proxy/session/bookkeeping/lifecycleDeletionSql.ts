@@ -111,7 +111,7 @@ export async function finishDeletion(key: string, token: string, failure: unknow
   })
 }
 
-/** Internal post-sweep phase; does NOT reconcile. Public SQL runGc remains unavailable until 4d.
+/** Internal post-sweep phase; does NOT reconcile. lifecycleGcSql composes the public SQL runGc.
  * Retries deferred releases; callers must already have reconciled resources/dead leases.
  * The run deadline gates the next claim, not the full timeout of an already-claimed deletion. */
 export async function runDeletionPhase(pins: readonly TranscriptLocator[],

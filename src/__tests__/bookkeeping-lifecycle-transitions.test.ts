@@ -16,6 +16,8 @@ import { canonicalizeLocator } from "../proxy/session/bookkeeping/locator"
 import { activeLifecycleBackend, lifecycleBackendMethods, SessionLifecyclePortionNotImplementedError }
   from "../proxy/session/bookkeeping/lifecycleBackend"
 import { sqliteLifecycleLeases, retryDeferredLeaseReleases } from "../proxy/session/bookkeeping/lifecycleLeasesSql"
+import { setBookkeepingAdmissionWaitForTest } from "../proxy/session/bookkeeping/transaction"
+import { assertAdmissionHeartbeat, measureAdmissionHeartbeat } from "./fixtures/bookkeeping-heartbeat"
 import type { ActiveTranscriptLeaseRecord, TranscriptLocator, TranscriptResourceState }
   from "../proxy/session/bookkeeping/types"
 import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
@@ -245,15 +247,22 @@ it("yields while a real Node child holds BEGIN IMMEDIATE; joined cleanup is retr
     await Promise.race([once(child, "message"), once(child, "exit").then(([code]) => {
       throw new Error(`holder exited: ${code}: ${stderr}`)
     })])
-    let timerDuringWait = false
-    const start = performance.now()
-    const timer = setTimeout(() => { timerDuringWait = true }, 10)
-    try {
+    const sample = await measureAdmissionHeartbeat(80, async () => {
       await expect(facade.releaseActiveTranscriptLease(lease, { ...options, lockWaitMs: 80, lockRetryMs: 5 }))
         .rejects.toBeInstanceOf(facade.SessionLifecycleLockError)
-      expect(timerDuringWait).toBe(true)
-      writeBenchArtifact("lifecycle-contention.json", { elapsedMs: performance.now() - start, timerDuringWait })
-    } finally { clearTimeout(timer) }
+    })
+    assertAdmissionHeartbeat(sample)
+    writeBenchArtifact("lifecycle-contention.json", sample)
+    setBookkeepingAdmissionWaitForTest(async (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) })
+    try {
+      const blocked = await measureAdmissionHeartbeat(80, async () => {
+        await expect(facade.releaseActiveTranscriptLease(lease, { ...options, lockWaitMs: 80, lockRetryMs: 5 }))
+          .rejects.toBeInstanceOf(facade.SessionLifecycleLockError)
+      })
+      expect(blocked.elapsedMs).toBeGreaterThanOrEqual(80)
+      expect(() => assertAdmissionHeartbeat(blocked)).toThrow("timer starved")
+      writeBenchArtifact("lifecycle-contention-negative-control.json", blocked)
+    } finally { setBookkeepingAdmissionWaitForTest(undefined) }
     await facade.releaseJoinedTranscriptLease(lease, { ...options, lockWaitMs: 0 })
     expect(readResourceLease(handle.reader, resource(locator).key, lease.token)).toBeDefined()
   } finally {

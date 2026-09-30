@@ -918,6 +918,7 @@ class TranscriptAlreadyAbsentError extends Error {}
 
 /** Internal deletion runtime shared with the test-only SQL lifecycle phase. */
 export const sessionDeletionRuntime = {
+  processGroupIsEmpty,
   deleteWithSdkChild, awaitCustomDeleter, isNotFoundError, DeletionStillRunningError,
   maxDeletes: DEFAULT_MAX_DELETES, timeoutMs: DEFAULT_DELETE_TIMEOUT_MS,
   retryBaseMs: DEFAULT_RETRY_BASE_MS, retryMaxMs: DEFAULT_RETRY_MAX_MS,

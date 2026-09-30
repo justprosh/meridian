@@ -8,6 +8,7 @@ import {
   withBookkeepingWriteAsync,
 } from "../../proxy/session/bookkeeping/database"
 import { SessionLifecycleLockError } from "../../proxy/session/lifecycleErrors"
+import { measureAdmissionHeartbeat } from "./bookkeeping-heartbeat"
 
 const directory = process.argv[2]!
 const id = process.argv[3]
@@ -52,16 +53,17 @@ if (id !== undefined) {
   const admissionBudgetMs = 250
   const rejections: Array<{ name: string; waitMs: number }> = []
   try {
-    const waiting = performance.now()
-    try {
-      await withBookkeepingWriteAsync(directory, { lockWaitMs: 60 }, () => {
-        throw new Error("held database must not admit")
-      })
-      throw new Error("expected admission expiry")
-    } catch (error) {
-      if (!(error instanceof SessionLifecycleLockError)) throw error
-      expiryMs = performance.now() - waiting
-    }
+    const heartbeat = await measureAdmissionHeartbeat(80, async () => {
+      try {
+        await withBookkeepingWriteAsync(directory, { lockWaitMs: 80, lockRetryMs: 5 }, () => {
+          throw new Error("held database must not admit")
+        })
+        throw new Error("expected admission expiry")
+      } catch (error) {
+        if (!(error instanceof SessionLifecycleLockError)) throw error
+      }
+    })
+    expiryMs = heartbeat.elapsedMs
     const released = new Promise<void>((resolve) => process.once("message", () => resolve()))
     process.send?.("expired")
     await released
@@ -101,6 +103,7 @@ if (id !== undefined) {
         rejections,
         admissionBudgetMs,
         expiryMs,
+        heartbeat,
         maxAdmissionMs,
         timerLagP50: samples[Math.floor(samples.length / 2)],
         timerLagMax: samples.at(-1),

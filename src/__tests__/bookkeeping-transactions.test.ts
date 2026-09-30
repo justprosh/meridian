@@ -24,6 +24,7 @@ import { tmpdir } from "node:os"
 import { buildNodeFixture, writeBenchArtifact } from "./fixtures/bookkeeping-support"
 import { SessionLifecycleLockError, SessionLifecycleReentrancyError } from "../proxy/session/lifecycleErrors"
 import type { BookkeepingTransaction } from "../proxy/session/bookkeeping/types"
+import { assertAdmissionHeartbeat, type AdmissionHeartbeat } from "./fixtures/bookkeeping-heartbeat"
 
 let directory: string
 let handle: BookkeepingHandle
@@ -580,6 +581,7 @@ it("measures three competing Node writers and bounds lock starvation by the admi
     rejections: Array<{ name: string; waitMs: number }>
     admissionBudgetMs: number
     expiryMs: number
+    heartbeat: AdmissionHeartbeat
     maxAdmissionMs: number
     timerLagP50: number
     timerLagMax: number
@@ -600,10 +602,7 @@ it("measures three competing Node writers and bounds lock starvation by the admi
     // Includes scheduler jitter and the short synchronous transaction after admission.
     expect(row.maxAdmissionMs).toBeLessThanOrEqual(row.admissionBudgetMs + 100)
     expect(row.rejectionFraction).toBe(row.rejected / 250)
-    expect(row.blockedFraction).toBeGreaterThanOrEqual(0)
-    expect(row.blockedFraction).toBeLessThan(1)
-    expect(row.timerLagP50).toBeGreaterThanOrEqual(0)
-    expect(row.timerLagP50).toBeLessThanOrEqual(row.timerLagMax)
+    assertAdmissionHeartbeat(row.heartbeat)
   }
   console.log("three-writer rejection fractions:", rows.map((row) => row.rejectionFraction))
   handle = initializeSessionBookkeeping(directory)

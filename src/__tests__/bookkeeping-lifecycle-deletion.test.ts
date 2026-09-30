@@ -56,7 +56,7 @@ function lease(locator: TranscriptLocator) {
   return { token: "lease", resourceKeys: [resourceKey(locator)] }
 }
 
-it("does not masquerade as public SQL runGc before the real reconcile exists", async () => {
+it("an explicitly empty partial backend still refuses public runGc rather than falling through to JSON", async () => {
   facade.setSessionLifecycleBackendForTest({}, lifecycleBackendMethods)
   await expect(facade.runGc([], options)).rejects.toBeInstanceOf(SessionLifecyclePortionNotImplementedError)
 })
