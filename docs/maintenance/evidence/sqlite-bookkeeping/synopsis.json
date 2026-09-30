@@ -1,0 +1,1654 @@
+{
+  "environment": {
+    "node": "v22.15.1",
+    "platform": "darwin",
+    "release": "25.6.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Max",
+    "logicalCpus": 16,
+    "totalMemory": 68719476736,
+    "loadStart": [
+      10.55810546875,
+      11.62255859375,
+      15.861328125
+    ],
+    "fs": {
+      "type": 26,
+      "blockSize": 4096
+    },
+    "date": "2026-09-29T21:33:54.186Z",
+    "builds": {
+      "json": {
+        "backend": "json",
+        "version": "1.78.0-hub.1",
+        "sdk": "0.2.141",
+        "compiler": "5.9.3",
+        "sha": "022d37accb4aa6be57b55945840c0d4319d336b3",
+        "sourceDirty": true,
+        "lockSha256": "8d66d0684baa3f2e23977b6cc42abacb3ddd8d5aec6903dedd28694487dee658"
+      }
+    },
+    "plan": {
+      "matrix": {
+        "N": 2000,
+        "M": 2500,
+        "K": 5
+      },
+      "repeats": 3,
+      "rounds": 1,
+      "soakMinutes": 0
+    },
+    "pragmas": "Backend runtime projection; JSON not applicable; SQLite unavailable until adapter activation",
+    "loadEnd": [
+      5.38671875,
+      9.044921875,
+      14.1455078125
+    ]
+  },
+  "coverage": {
+    "complete": true,
+    "planned": 12,
+    "completed": 12,
+    "issues": []
+  },
+  "results": [
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "burst",
+      "gc": false,
+      "backend": "json",
+      "repeat": 0,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-burst-gc0-r0",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1787.8320830000002,
+        "p95": 1971.0141249999997,
+        "p99": 1971.0141249999997,
+        "max": 2113.858292,
+        "mean": 1768.1883999999998
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3787.8320830000002,
+        "p95": 3971.0141249999997,
+        "p99": 3971.0141249999997,
+        "max": 4113.858292,
+        "mean": 3768.1884
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2037.719458,
+        "p95": 2040.690542,
+        "p99": 2040.690542,
+        "max": 2048.548667,
+        "mean": 2039.5492083999998
+      },
+      "elapsedMs": 4114.604958,
+      "throughput": 1.2151834868809293,
+      "loop": {
+        "timerLagMs": {
+          "n": 258,
+          "p50": 1.407416000000012,
+          "p95": 6.729374999999891,
+          "p99": 118.92270799999983,
+          "max": 132.42762500000003,
+          "mean": 5.999605810077508
+        },
+        "histogramMs": {
+          "p50": 11.427839,
+          "p95": 16.736255,
+          "p99": 128.974847,
+          "max": 141.426687
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 392
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 4573
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210844,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213856,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "burst",
+      "gc": true,
+      "backend": "json",
+      "repeat": 0,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-burst-gc1-r0",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1895.1190830000005,
+        "p95": 2054.022,
+        "p99": 2054.022,
+        "max": 2238.0924590000004,
+        "mean": 1867.3120582000004
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3895.1190830000005,
+        "p95": 4054.022,
+        "p99": 4054.022,
+        "max": 4238.092459,
+        "mean": 3867.3120582
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2040.3887909999999,
+        "p95": 2040.979417,
+        "p99": 2040.979417,
+        "max": 2120.577625,
+        "mean": 2053.5076916
+      },
+      "elapsedMs": 4239.609666,
+      "throughput": 1.1793538542234276,
+      "loop": {
+        "timerLagMs": {
+          "n": 1442,
+          "p50": 2.0114579999990383,
+          "p95": 2.2926669999997102,
+          "p99": 13.300750000000335,
+          "max": 143.2876670000005,
+          "mean": 2.4682139036061272
+        },
+        "histogramMs": {
+          "p50": 12.025855,
+          "p95": 12.345343,
+          "p99": 23.429119,
+          "max": 153.354239
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 346
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 992,
+          "deleted": 8
+        },
+        "errors": {},
+        "dueCount": 992,
+        "oldestDueMs": 18366
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210727,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213748,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [
+        {
+          "deleted": 8,
+          "notFound": 0,
+          "failed": 0,
+          "deferred": 992,
+          "ms": 17955.604291
+        }
+      ],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "steady",
+      "gc": false,
+      "backend": "json",
+      "repeat": 0,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-steady-gc0-r0",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1904.9761250000001,
+        "p95": 2055.3889169999998,
+        "p99": 2055.3889169999998,
+        "max": 2193.3947500000004,
+        "mean": 1871.1177750000002
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3904.976125,
+        "p95": 4055.3889169999998,
+        "p99": 4055.3889169999998,
+        "max": 4193.39475,
+        "mean": 3871.117775
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2055.9098339999996,
+        "p95": 2089.2209170000006,
+        "p99": 2089.2209170000006,
+        "max": 2123.1337919999996,
+        "mean": 2070.7260918
+      },
+      "elapsedMs": 4193.971292,
+      "throughput": 1.1921874643103778,
+      "loop": {
+        "timerLagMs": {
+          "n": 262,
+          "p50": 1.956666000000041,
+          "p95": 6.784500000000662,
+          "p99": 124.25816700000007,
+          "max": 136.96958299999994,
+          "mean": 6.064434942748121
+        },
+        "histogramMs": {
+          "p50": 11.960319,
+          "p95": 16.924671,
+          "p99": 134.348799,
+          "max": 147.062783
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 374
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 4632
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210898,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213919,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "steady",
+      "gc": true,
+      "backend": "json",
+      "repeat": 0,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-steady-gc1-r0",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1894.6663750000002,
+        "p95": 2055.983292,
+        "p99": 2055.983292,
+        "max": 2196.570125,
+        "mean": 1856.0988252000002
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3894.6663750000002,
+        "p95": 4055.983292,
+        "p99": 4055.983292,
+        "max": 4196.570125,
+        "mean": 3856.0988251999997
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2040.951333,
+        "p95": 2041.616166,
+        "p99": 2041.616166,
+        "max": 2049.610416,
+        "mean": 2038.4534079999999
+      },
+      "elapsedMs": 4198.154875,
+      "throughput": 1.1909994149513123,
+      "loop": {
+        "timerLagMs": {
+          "n": 1437,
+          "p50": 2.0291250000009313,
+          "p95": 2.293499999999767,
+          "p99": 13.258208999999624,
+          "max": 125.42000000000007,
+          "mean": 2.4268307731384775
+        },
+        "histogramMs": {
+          "p50": 12.034047,
+          "p95": 12.287999,
+          "p99": 23.494655,
+          "max": 135.528447
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 341
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 992,
+          "deleted": 8
+        },
+        "errors": {},
+        "dueCount": 992,
+        "oldestDueMs": 18241
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210808,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213829,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [
+        {
+          "deleted": 8,
+          "notFound": 0,
+          "failed": 0,
+          "deferred": 992,
+          "ms": 17832.2165
+        }
+      ],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "burst",
+      "gc": false,
+      "backend": "json",
+      "repeat": 1,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-burst-gc0-r1",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1765.0881250000002,
+        "p95": 1915.2220410000004,
+        "p99": 1915.2220410000004,
+        "max": 2052.786041,
+        "mean": 1729.1298078
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3765.088125,
+        "p95": 3915.2220410000004,
+        "p99": 3915.2220410000004,
+        "max": 4052.786041,
+        "mean": 3729.1298078
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2040.510583,
+        "p95": 2044.6336250000002,
+        "p99": 2044.6336250000002,
+        "max": 2131.8122080000003,
+        "mean": 2058.1493748000003
+      },
+      "elapsedMs": 4053.4752919999996,
+      "throughput": 1.2335094307514531,
+      "loop": {
+        "timerLagMs": {
+          "n": 259,
+          "p50": 1.54950000000008,
+          "p95": 7.397457999999915,
+          "p99": 113.57362499999999,
+          "max": 123.42491700000005,
+          "mean": 5.715763355212342
+        },
+        "histogramMs": {
+          "p50": 11.575295,
+          "p95": 17.367039,
+          "p99": 123.600895,
+          "max": 133.431295
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 338
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 4459
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210790,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213811,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "burst",
+      "gc": true,
+      "backend": "json",
+      "repeat": 1,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-burst-gc1-r1",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1903.475625,
+        "p95": 2058.0362080000004,
+        "p99": 2058.0362080000004,
+        "max": 2196.4742909999995,
+        "mean": 1868.0852748000002
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3903.475625,
+        "p95": 4058.0362080000004,
+        "p99": 4058.0362080000004,
+        "max": 4196.4742909999995,
+        "mean": 3868.0852747999998
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2040.588958,
+        "p95": 2045.070417,
+        "p99": 2045.070417,
+        "max": 2138.47375,
+        "mean": 2058.3629332
+      },
+      "elapsedMs": 4197.9495830000005,
+      "throughput": 1.191057658302515,
+      "loop": {
+        "timerLagMs": {
+          "n": 1444,
+          "p50": 1.7817080000004353,
+          "p95": 2.2971670000001723,
+          "p99": 13.213999999999942,
+          "max": 130.26420899999994,
+          "mean": 2.3826090436287926
+        },
+        "histogramMs": {
+          "p50": 11.788287,
+          "p95": 12.296191,
+          "p99": 23.543807,
+          "max": 140.378111
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 344
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "deleted": 8,
+          "retired": 992
+        },
+        "errors": {},
+        "dueCount": 992,
+        "oldestDueMs": 18268
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210835,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213847,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [
+        {
+          "deleted": 8,
+          "notFound": 0,
+          "failed": 0,
+          "deferred": 992,
+          "ms": 17859.79375
+        }
+      ],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "steady",
+      "gc": false,
+      "backend": "json",
+      "repeat": 1,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-steady-gc0-r1",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 2326.760708,
+        "p95": 2549.2875830000003,
+        "p99": 2549.2875830000003,
+        "max": 2764.3519160000005,
+        "mean": 2294.9014331999997
+      },
+      "latency": {
+        "n": 5,
+        "p50": 4326.760708,
+        "p95": 4549.287583,
+        "p99": 4549.287583,
+        "max": 4764.3519160000005,
+        "mean": 4294.9014332
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2038.2748749999998,
+        "p95": 2042.6562500000002,
+        "p99": 2042.6562500000002,
+        "max": 2042.818625,
+        "mean": 2037.1800584
+      },
+      "elapsedMs": 4765.098459000001,
+      "throughput": 1.0492962617711148,
+      "loop": {
+        "timerLagMs": {
+          "n": 298,
+          "p50": 1.3803330000000642,
+          "p95": 4.850207999999839,
+          "p99": 145.28137499999957,
+          "max": 165.23416700000053,
+          "mean": 6.040509523489922
+        },
+        "histogramMs": {
+          "p50": 11.386879,
+          "p95": 14.852095,
+          "p99": 155.320319,
+          "max": 175.243263
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 431
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 5263
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210763,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213784,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "steady",
+      "gc": true,
+      "backend": "json",
+      "repeat": 1,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-steady-gc1-r1",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 2098.8952499999996,
+        "p95": 2248.1075419999997,
+        "p99": 2248.1075419999997,
+        "max": 2388.5093750000005,
+        "mean": 2055.3212502
+      },
+      "latency": {
+        "n": 5,
+        "p50": 4098.89525,
+        "p95": 4248.107542,
+        "p99": 4248.107542,
+        "max": 4388.509375000001,
+        "mean": 4055.3212502
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2048.6869169999995,
+        "p95": 2128.6452089999993,
+        "p99": 2128.6452089999993,
+        "max": 2165.568208,
+        "mean": 2085.3283752
+      },
+      "elapsedMs": 4390.004709000001,
+      "throughput": 1.1389509422961301,
+      "loop": {
+        "timerLagMs": {
+          "n": 1445,
+          "p50": 2.0347079999992275,
+          "p95": 2.0980000000017753,
+          "p99": 9.794624999998632,
+          "max": 146.4860839999999,
+          "mean": 2.4635634865052007
+        },
+        "histogramMs": {
+          "p50": 12.042239,
+          "p95": 12.099583,
+          "p99": 19.873791,
+          "max": 156.499967
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 371
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 992,
+          "deleted": 8
+        },
+        "errors": {},
+        "dueCount": 992,
+        "oldestDueMs": 18417
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210880,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213901,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [
+        {
+          "deleted": 8,
+          "notFound": 0,
+          "failed": 0,
+          "deferred": 992,
+          "ms": 17982.382209000003
+        }
+      ],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "burst",
+      "gc": false,
+      "backend": "json",
+      "repeat": 2,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-burst-gc0-r2",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1893.2488749999998,
+        "p95": 2079.889083,
+        "p99": 2079.889083,
+        "max": 2254.9436669999996,
+        "mean": 1854.0093332000001
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3893.2488749999998,
+        "p95": 4079.889083,
+        "p99": 4079.889083,
+        "max": 4254.943667,
+        "mean": 3854.0093332000006
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2040.9449160000001,
+        "p95": 2042.151916,
+        "p99": 2042.151916,
+        "max": 2042.9053330000002,
+        "mean": 2038.2587498
+      },
+      "elapsedMs": 4255.672584,
+      "throughput": 1.1749024158480703,
+      "loop": {
+        "timerLagMs": {
+          "n": 271,
+          "p50": 0.9677910000000338,
+          "p95": 5.074249999999893,
+          "p99": 131.07808399999976,
+          "max": 143.68491600000016,
+          "mean": 5.809802597785978
+        },
+        "histogramMs": {
+          "p50": 10.960895,
+          "p95": 15.081471,
+          "p99": 141.164543,
+          "max": 153.747455
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 352
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 4676
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210862,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213874,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "burst",
+      "gc": true,
+      "backend": "json",
+      "repeat": 2,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-burst-gc1-r2",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 2674.996583,
+        "p95": 2865.3507090000003,
+        "p99": 2865.3507090000003,
+        "max": 3029.225792,
+        "mean": 2661.2709334
+      },
+      "latency": {
+        "n": 5,
+        "p50": 4674.996583,
+        "p95": 4865.350709,
+        "p99": 4865.350709,
+        "max": 5029.225792,
+        "mean": 4661.270933400001
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2073.4488749999996,
+        "p95": 2084.946667,
+        "p99": 2084.946667,
+        "max": 2158.781709,
+        "mean": 2081.4827586
+      },
+      "elapsedMs": 5031.66675,
+      "throughput": 0.9937065088819723,
+      "loop": {
+        "timerLagMs": {
+          "n": 1482,
+          "p50": 1.4497919999994338,
+          "p95": 2.5229170000000067,
+          "p99": 16.074875000000247,
+          "max": 168.90208299999995,
+          "mean": 2.4400901484480437
+        },
+        "histogramMs": {
+          "p50": 11.468799,
+          "p95": 12.533759,
+          "p99": 26.083327,
+          "max": 178.913279
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 429
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 992,
+          "deleted": 8
+        },
+        "errors": {},
+        "dueCount": 992,
+        "oldestDueMs": 18910
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210799,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213820,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [
+        {
+          "deleted": 8,
+          "notFound": 0,
+          "failed": 0,
+          "deferred": 992,
+          "ms": 18401.843332999997
+        }
+      ],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "steady",
+      "gc": false,
+      "backend": "json",
+      "repeat": 2,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-steady-gc0-r2",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1796.6667500000003,
+        "p95": 1946.766208,
+        "p99": 1946.766208,
+        "max": 2082.8747089999997,
+        "mean": 1759.003525
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3796.6667500000003,
+        "p95": 3946.766208,
+        "p99": 3946.766208,
+        "max": 4082.8747089999997,
+        "mean": 3759.003525
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2037.6149159999998,
+        "p95": 2041.863542,
+        "p99": 2041.863542,
+        "max": 2129.668083,
+        "mean": 2054.3773334
+      },
+      "elapsedMs": 4083.639,
+      "throughput": 1.2243981409718148,
+      "loop": {
+        "timerLagMs": {
+          "n": 260,
+          "p50": 1.6118340000002718,
+          "p95": 6.325041000000056,
+          "p99": 116.34629100000006,
+          "max": 138.72725000000014,
+          "mean": 5.769743223076925
+        },
+        "histogramMs": {
+          "p50": 11.616255,
+          "p95": 16.334847,
+          "p99": 126.287871,
+          "max": 148.766719
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 357
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 4506
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210772,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213793,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    },
+    {
+      "N": 2000,
+      "M": 2500,
+      "K": 5,
+      "mode": "steady",
+      "gc": true,
+      "backend": "json",
+      "repeat": 2,
+      "rounds": 1,
+      "D": 2000,
+      "id": "json-N2000-M2500-K5-steady-gc1-r2",
+      "complete": true,
+      "ok": 5,
+      "attempted": 5,
+      "failed": 0,
+      "overhead": {
+        "n": 5,
+        "p50": 1880.9662499999995,
+        "p95": 2034.8772080000003,
+        "p99": 2034.8772080000003,
+        "max": 2176.364084,
+        "mean": 1860.4713252000001
+      },
+      "latency": {
+        "n": 5,
+        "p50": 3880.9662499999995,
+        "p95": 4034.8772080000003,
+        "p99": 4034.8772080000003,
+        "max": 4176.364084,
+        "mean": 3860.4713252
+      },
+      "sdkElapsed": {
+        "n": 5,
+        "p50": 2032.9334579999997,
+        "p95": 2033.6326250000002,
+        "p99": 2033.6326250000002,
+        "max": 2046.286292,
+        "mean": 2035.255975
+      },
+      "elapsedMs": 4177.840875,
+      "throughput": 1.1967904354423264,
+      "loop": {
+        "timerLagMs": {
+          "n": 1434,
+          "p50": 1.9918330000000424,
+          "p95": 2.4075000000002547,
+          "p99": 13.33941699999923,
+          "max": 128.52075000000002,
+          "mean": 2.4639647105997167
+        },
+        "histogramMs": {
+          "p50": 12.009471,
+          "p95": 12.402687,
+          "p99": 24.363007,
+          "max": 138.543103
+        }
+      },
+      "before": {
+        "resourceRows": 2000,
+        "mappingRows": 2500,
+        "historyBytes": 35286250,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14114.5
+        },
+        "states": {
+          "live": 1000,
+          "retired": 1000
+        },
+        "errors": {},
+        "dueCount": 1000,
+        "oldestDueMs": 333
+      },
+      "after": {
+        "resourceRows": 2005,
+        "mappingRows": 2500,
+        "historyBytes": 35276650,
+        "historySizes": {
+          "n": 2500,
+          "p50": 5312,
+          "p95": 38912,
+          "p99": 78462,
+          "max": 78462,
+          "mean": 14110.66
+        },
+        "states": {
+          "live": 1005,
+          "retired": 992,
+          "deleted": 8
+        },
+        "errors": {},
+        "dueCount": 992,
+        "oldestDueMs": 18237
+      },
+      "sizesBefore": {
+        "session-gc.json": 1210817,
+        "sessions.json": 36990572
+      },
+      "sizesAfter": {
+        "session-gc.json": 1213838,
+        "sessions.json": 36983146
+      },
+      "metrics": {
+        "begin": null,
+        "commit": null,
+        "queueWaitMs": null,
+        "criticalSectionMs": null,
+        "busyAttempts": null,
+        "checkpoint": null,
+        "pragmas": null
+      },
+      "gcRuns": [
+        {
+          "deleted": 8,
+          "notFound": 0,
+          "failed": 0,
+          "deferred": 992,
+          "ms": 17839.024167000003
+        }
+      ],
+      "gcErrors": [],
+      "assertions": {
+        "expectedMappings": 2500,
+        "lostMappings": 0,
+        "observedAba": 0,
+        "unsafeDeletion": 0
+      },
+      "measurementWindow": "latency/throughput exclude final GC drain; loop/timeline include drain",
+      "errorCount": 0
+    }
+  ],
+  "interrupted": false,
+  "acceptance": {
+    "status": "NOT_ESTABLISHED",
+    "reasons": [
+      "Requires both backends, full matrix >=3 repeats, 10-minute matched soaks and Linux/ext4 FULL evidence",
+      "Semantic/fault suites are independent gates; this workload does not prove all ABA/deletion schedules",
+      "Queue/critical-section/BEGIN/COMMIT metrics require explicit production test seams, currently unavailable"
+    ]
+  },
+  "artifacts": {
+    "hashes": {
+      "environment.json": "8226e18b84f54cee85c36c237fa8f2ad6062147bd69ea3891fd8cc327ef7c2b8",
+      "json-N2000-M2500-K5-burst-gc0-r0.json": "a8b555fd1766fd23c288ddf050bb75aa255fd1adea492d150f1eb24b1a02f2f4",
+      "json-N2000-M2500-K5-burst-gc0-r0.log": "6dfe0706d5eea507838c72646a9cd4ddcdc40bd7dcef737e96f2315173f9a51a",
+      "json-N2000-M2500-K5-burst-gc0-r1.json": "4e38532eaa4a0374e33b362e06d75a7ff67681c9308e955425c9112c27ed84a6",
+      "json-N2000-M2500-K5-burst-gc0-r1.log": "5ebcf3b4a60236ce2ec5dd0cc18edc113712158cc9ae0bcba5a2bb05be96f51d",
+      "json-N2000-M2500-K5-burst-gc0-r2.json": "a6bd0b194ac5cbd6d686c7866efcba88872ba9f8652fa16f7f30d45716af2ccd",
+      "json-N2000-M2500-K5-burst-gc0-r2.log": "96f798e4496d9ed518c8b7e0e04280932b685ac9b3b95e6024647847a48e8312",
+      "json-N2000-M2500-K5-burst-gc1-r0.json": "f973fa420f4419e8e517cece4f2886154b97a66c6c73a299b8148ad41e94ff4f",
+      "json-N2000-M2500-K5-burst-gc1-r0.log": "09ac4180f144a776b1b99af7e75df288a73c78451063d8fbdde0de744720ab4e",
+      "json-N2000-M2500-K5-burst-gc1-r1.json": "5ffce49ed8b9ff913a859ad5a0e0ca9e923dafb2a5d14d5f0a8ceefa98f21759",
+      "json-N2000-M2500-K5-burst-gc1-r1.log": "3805ad543b717e60aa5b2e5d14967d10e0d3a4f4bc143f7a79de61a81070903c",
+      "json-N2000-M2500-K5-burst-gc1-r2.json": "8e44cdebef2b16558d66381779d6c4add4cefb42f769ba88210655afc19a82e6",
+      "json-N2000-M2500-K5-burst-gc1-r2.log": "d3f45953ee813f507dba71c7ad339192ed66187d1f603f8a4b1e8cdafaaeda48",
+      "json-N2000-M2500-K5-steady-gc0-r0.json": "ac67160f7df081d42ba50f28d9443b6cd107ea4ac8096e0757b3eb30dbf08c20",
+      "json-N2000-M2500-K5-steady-gc0-r0.log": "0d5b0e7d008ac4509dab63dfc3a03314b6bea3f11578383a77726de98a7aa0d7",
+      "json-N2000-M2500-K5-steady-gc0-r1.json": "091338643c6a5ac6e96f6e3bbe432fa71d6e6f767ade034c5a3aed960bbe6633",
+      "json-N2000-M2500-K5-steady-gc0-r1.log": "47fb1bc14a04237c226cbabf3c538a8bfb7652e39fe52b27c23a794bbc337699",
+      "json-N2000-M2500-K5-steady-gc0-r2.json": "9435273e10c1be960ebed0d1b5baddbe8e9e8ac572408fd21d2fe0f5fb40d66b",
+      "json-N2000-M2500-K5-steady-gc0-r2.log": "96cb0033777468f8890583cdb97ecc067f37fe32f84aed6d6e8a41ca9001b953",
+      "json-N2000-M2500-K5-steady-gc1-r0.json": "5bde3cdd6088bdad3c576cee73cb4857b7ed923d6e85da5a114075ba43f0da82",
+      "json-N2000-M2500-K5-steady-gc1-r0.log": "5c5a583a29160070a47b1dfd50343f0b3136ed3e3c662102e41f6ed39f0ad222",
+      "json-N2000-M2500-K5-steady-gc1-r1.json": "969c252dbf6219db4dedc71098a1f63fc41bd11f8bcbbfa971192457c39a2476",
+      "json-N2000-M2500-K5-steady-gc1-r1.log": "04f928c9605d6c0e75f6a6bfe7b75ce7605045dd6079130dc145e316968b9abf",
+      "json-N2000-M2500-K5-steady-gc1-r2.json": "59ac5c556cd42e5ab6d13d98b999f6a754d53f65e6d85c6acf627e67f5b50cfe",
+      "json-N2000-M2500-K5-steady-gc1-r2.log": "8679a275992774f422d348000ec4d2c8be1e35659410a6752d4fe15e01e9ed46",
+      "matrix.json": "aeefeb78bbdf9ae2378b27bfd6ccc9a712320ee0c490fd4f0baaa9288f03e769",
+      "matrix.md": "ff1205a3ab01f610d93b09295dd0c04b3bf4f625ca2621697670ce5570123738",
+      "plan.json": "a6aa088630edef35e892a0d55f8cffb6a5b96ed621e88b817c722fbcfedb3256",
+      "artifact-json/build-manifest.json": "1a44172f46d4b9b3e981bd1b36706295302f54e03bb45af5c067f586ff4ace92"
+    },
+    "archiveUrl": null,
+    "retention": null
+  }
+}
