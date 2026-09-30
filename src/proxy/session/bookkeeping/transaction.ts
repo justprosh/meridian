@@ -237,12 +237,19 @@ export function withBookkeepingWriteAsync<T>(
     throw new RangeError("invalid bookkeeping admission budget")
   }
   const started = performance.now()
+  const deadline = started + budget
   const timeout = new SessionLifecycleLockError("bookkeeping admission expired")
   const controller = new AbortController()
   const abort = () => controller.abort(options.admissionSignal?.reason)
   options.admissionSignal?.addEventListener("abort", abort, { once: true })
   if (options.admissionSignal?.aborted) abort()
-  const timer = setTimeout(() => controller.abort(timeout), budget)
+  // Node timers may fire before their monotonic deadline after rounding.
+  const expire = () => {
+    const remaining = deadline - performance.now()
+    if (remaining > 0) timer = setTimeout(expire, Math.max(1, remaining))
+    else controller.abort(timeout)
+  }
+  let timer = setTimeout(expire, budget)
   connection.pending++
   return lifecycleLockQueue
     .run(connection.path, controller.signal, async () => {

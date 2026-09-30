@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
+import { setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
+import { observeLifecycleState } from "./fixtures/bookkeeping-lifecycle-observer"
+import { injectDeletingResource } from "./fixtures/bookkeeping-lifecycle-injection"
+import type { TranscriptResource } from "../proxy/session/bookkeeping/types"
 import { spawn } from "node:child_process"
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -28,17 +31,8 @@ import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
 // capturing each spawned child's incarnation shells out to PowerShell/CIM on
 // Windows, which is budgeted up to 10s per probe on a cold host.
 
-interface StoredResource {
-  state: string
-  deletionToken?: string
-  deletionOwner?: unknown
-  deletionExecutor?: unknown
-  deletionProcessGroupId?: number
-  lastError?: string
-}
-
 interface StoredSidecar {
-  resources: Record<string, StoredResource>
+  resources: Record<string, TranscriptResource>
 }
 
 const tempRoots: string[] = []
@@ -79,7 +73,7 @@ async function makeFixture(sessionId: string): Promise<{
   const storeDir = join(root, "store")
   const configDir = join(root, "config")
   const projectDir = join(root, "project")
-  await mkdir(storeDir, { recursive: true })
+  await mkdir(storeDir, { recursive: true, mode: 0o700 })
   setupLifecycleBackend(storeDir)
   const sdkPath = join(root, "stub-sdk.mjs")
   await writeFile(sdkPath, STUB_SDK_SOURCE, "utf8")
@@ -104,7 +98,7 @@ function gcOptions(fixture: Awaited<ReturnType<typeof makeFixture>>) {
 }
 
 function readSidecar(storeDir: string): StoredSidecar {
-  return JSON.parse(readFileSync(join(storeDir, "session-gc.json"), "utf8")) as StoredSidecar
+  return observeLifecycleState(storeDir)
 }
 
 describe("session GC deletes retired transcripts on every platform", () => {
@@ -124,7 +118,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     expect(JSON.parse(output)).toEqual({ pid: child.pid, bun: null })
   }, 15_000)
 
-  legacyLifecycleOnly("reads JSON sidecar state", "runGc drives a retired transcript to deleted through the default fenced child", async () => {
+  test("runGc drives a retired transcript to deleted through the default fenced child", async () => {
     const fixture = await makeFixture("windows-gc-retired")
     const options = gcOptions(fixture)
     const key = getTranscriptResourceKey(fixture.locator)
@@ -148,7 +142,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     expect(logged.map((entry) => entry.sessionId)).toContain("windows-gc-retired")
   }, 60_000)
 
-  legacyLifecycleOnly("reads JSON sidecar state", "runGc tree-kills and joins a timed-out deletion child", async () => {
+  test("runGc tree-kills and joins a timed-out deletion child", async () => {
     const fixture = await makeFixture("windows-gc-timeout")
     const options = { ...gcOptions(fixture), deletionTimeoutMs: 2_000 }
     const key = getTranscriptResourceKey(fixture.locator)
@@ -176,7 +170,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
   // failure here before the allowance). Either way a loaded Windows host failed
   // every deletion. A budget far below the probe cost must still produce the
   // parent's own kill verdict.
-  legacyLifecycleOnly("reads JSON sidecar state", "the child's gate outlives the incarnation probe on a short deletion budget", async () => {
+  test("the child's gate outlives the incarnation probe on a short deletion budget", async () => {
     const fixture = await makeFixture("windows-gc-timeout")
     const options = { ...gcOptions(fixture), deletionTimeoutMs: 100 }
     const key = getTranscriptResourceKey(fixture.locator)
@@ -192,7 +186,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     expect(lastError).not.toContain("exited 75")
   }, 60_000)
 
-  legacyLifecycleOnly("reads JSON sidecar state", "the pending backlog drains instead of filling up", async () => {
+  test("the pending backlog drains instead of filling up", async () => {
     const fixture = await makeFixture("windows-gc-backlog")
     const options = { ...gcOptions(fixture), maxPending: 4 }
 
@@ -224,7 +218,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
   // surviving group members), so this test is win32-only rather than a win32
   // skip.
   describe.if(process.platform === "win32")("Windows-only recovery", () => {
-  legacyLifecycleOnly("mutates JSON sidecar state",
+  test(
     "reconcile recovers a deleting claim whose executor pid was reused by a live process",
     async () => {
       const fixture = await makeFixture("windows-gc-reused-pid")
@@ -239,8 +233,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
       // Same live pid as this process, but a boot id that can never match the
       // local host: a provably dead incarnation on a provably live pid.
       const reusedPidExecutor = { ...current, bootId: "00000000-0000-4000-8000-000000000000" }
-      const sidecarPath = join(fixture.storeDir, "session-gc.json")
-      const sidecar = JSON.parse(await readFile(sidecarPath, "utf8")) as StoredSidecar
+      const sidecar = observeLifecycleState(fixture.storeDir)
       const resource = sidecar.resources[key]
       if (!resource) throw new Error("expected sidecar resource for fixture locator")
       resource.state = "deleting"
@@ -248,7 +241,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
       resource.deletionOwner = reusedPidExecutor
       resource.deletionExecutor = reusedPidExecutor
       resource.deletionProcessGroupId = current.pid
-      await writeFile(sidecarPath, JSON.stringify(sidecar), "utf8")
+      injectDeletingResource(fixture.storeDir, resource)
 
       const recovered = await reconcile([], options)
       expect(recovered.deletingRecovered).toBe(1)

@@ -1,8 +1,12 @@
-import { expect, spyOn } from "bun:test"
-import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
+import { expect, it, spyOn } from "bun:test"
+import { sqliteLifecycleTest, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
+import { observeLifecycleState } from "./fixtures/bookkeeping-lifecycle-observer"
+import { withBookkeepingWrite } from "../proxy/session/bookkeeping/database"
+import { allocateResource } from "../proxy/session/bookkeeping/resources"
+import { canonicalizeLocator } from "../proxy/session/bookkeeping/locator"
 import * as crypto from "node:crypto"
 import * as fsPromises from "node:fs/promises"
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -16,7 +20,7 @@ import {
 } from "../proxy/sessionLifecycle"
 
 for (const withGc of [false, true]) {
-legacyLifecycleOnly("seeds and inspects JSON sidecar bytes and lock files",
+it(
   `durably admits 24 simultaneous registrations with a large sidecar (GC=${withGc})`, async () => {
   // Given: an isolated real sidecar with 1,400 resources and 800 pinned sessions.
   // macOS may return /var for a directory whose real path is /private/var.
@@ -33,7 +37,16 @@ legacyLifecycleOnly("seeds and inspects JSON sidecar bytes and lock files",
     const key = getTranscriptResourceKey(locator)
     return [key, { key, locator, state: "live", createdAt: 1, updatedAt: 1, attempts: 0 }]
   }))
-  writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify({ version: 1, resources }), { mode: 0o600 })
+  if (sqliteLifecycleTest) {
+    const canonical = locators.map(locator => canonicalizeLocator(locator))
+    withBookkeepingWrite(storeDir, {}, tx => {
+      for (const locator of canonical) allocateResource(tx, locator, {
+        state: "live", createdAt: 1, updatedAt: 1, attempts: 0,
+      })
+    })
+  } else {
+    writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify({ version: 1, resources }), { mode: 0o600 })
+  }
   const options: SessionLifecycleOptions = { storeDir, retiredGraceMs: 60_000, now: () => 10_000 }
   try {
     await reconcile(pins, options)
@@ -92,7 +105,7 @@ legacyLifecycleOnly("seeds and inspects JSON sidecar bytes and lock files",
       expect(hashes).toBeLessThan(100_000)
       expect(timeouts).toBe(0)
       expect(gcError).toBeUndefined()
-      const persisted: unknown = JSON.parse(readFileSync(join(storeDir, "session-gc.json"), "utf8"))
+      const persisted: unknown = observeLifecycleState(storeDir)
       for (let i = 0; i < 24; i++) {
         const key = getTranscriptResourceKey({ sessionId: `request-${i}`, configDir: storeDir })
         expect(persisted).toHaveProperty(`resources.${key}.state`, "live")

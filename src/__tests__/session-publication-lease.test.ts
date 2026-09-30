@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
+import { setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -105,10 +105,12 @@ describe("transcript publication lifetime", () => {
     await abandonFork(target, options)
   })
 
-  legacyLifecycleOnly("child writer uses JSON without a backend seam", "reclaims an unpublished target after its owning process exits", async () => {
+  it("reclaims an unpublished target after its owning process exits", async () => {
     const modulePath = fileURLToPath(new URL("../proxy/sessionLifecycle.ts", import.meta.url))
     const child = Bun.spawn([process.execPath, "--eval", `
       import { prepareForkForPublication } from ${JSON.stringify(modulePath)};
+      import { setupLifecycleBackend } from ${JSON.stringify(fileURLToPath(new URL("./fixtures/bookkeeping-lifecycle-install.ts", import.meta.url)))};
+      setupLifecycleBackend(${JSON.stringify(options.storeDir)});
       const target = await prepareForkForPublication(
         ${JSON.stringify({ sessionId: "crashed-request", configDir: join(directory, "claude") })},
         ${JSON.stringify({ storeDir: options.storeDir })});

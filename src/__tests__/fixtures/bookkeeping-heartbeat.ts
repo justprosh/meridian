@@ -21,9 +21,13 @@ export async function measureAdmissionHeartbeat(budgetMs: number, wait: () => Pr
   } finally { clearInterval(timer) }
 }
 
-export function assertAdmissionHeartbeat(sample: AdmissionHeartbeat): void {
+export function assertAdmissionDeadline(sample: Pick<AdmissionHeartbeat, "elapsedMs" | "budgetMs">): void {
   assert(sample.elapsedMs >= sample.budgetMs, `early expiry: ${sample.elapsedMs} < ${sample.budgetMs}`)
   assert(sample.elapsedMs < sample.budgetMs + 50, `late expiry: ${sample.elapsedMs}`)
+}
+
+export function assertAdmissionHeartbeat(sample: AdmissionHeartbeat): void {
+  assertAdmissionDeadline(sample)
   assert(sample.ticks.length >= Math.floor(sample.budgetMs / 5) - 3, `timer starved: ${sample.ticks.length} ticks`)
   assert(sample.maxGapMs <= 25, `timer gap ${sample.maxGapMs} > 25 ms`)
 }

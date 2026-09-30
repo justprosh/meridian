@@ -24,7 +24,7 @@ import { tmpdir } from "node:os"
 import { buildNodeFixture, writeBenchArtifact } from "./fixtures/bookkeeping-support"
 import { SessionLifecycleLockError, SessionLifecycleReentrancyError } from "../proxy/session/lifecycleErrors"
 import type { BookkeepingTransaction } from "../proxy/session/bookkeeping/types"
-import { assertAdmissionHeartbeat, type AdmissionHeartbeat } from "./fixtures/bookkeeping-heartbeat"
+import { assertAdmissionDeadline, assertAdmissionHeartbeat, type AdmissionHeartbeat } from "./fixtures/bookkeeping-heartbeat"
 
 let directory: string
 let handle: BookkeepingHandle
@@ -547,6 +547,23 @@ it("rolls back a leftover transaction on close and releases the file to another 
   expect({ code: child.status, stderr: child.stderr }).toEqual({ code: 0, stderr: "" })
   handle = initializeSessionBookkeeping(directory)
 })
+
+it("never expires 50 Node admission budgets early while a child holds BEGIN IMMEDIATE", async () => {
+  handle.close()
+  const build = await buildNodeFixture("bookkeeping-admission-deadline.ts", "deadline.mjs", directory)
+  expect(build.success).toBe(true)
+  const child = spawnSync("node", [join(directory, "deadline.mjs"), directory], {
+    encoding: "utf8", timeout: 15_000,
+  })
+  expect({ status: child.status, stderr: child.stderr, error: child.error }).toEqual({
+    status: 0, stderr: "", error: undefined,
+  })
+  const evidence = JSON.parse(child.stdout) as { node: string; samples: AdmissionHeartbeat[] }
+  writeBenchArtifact("admission-deadline.json", evidence)
+  expect(Number(evidence.node.split(".")[0])).toBeGreaterThanOrEqual(22)
+  expect(evidence.samples).toHaveLength(50)
+  for (const sample of evidence.samples) assertAdmissionDeadline(sample)
+}, 20_000)
 
 it("measures three competing Node writers and bounds lock starvation by the admission budget", async () => {
   handle.close()
