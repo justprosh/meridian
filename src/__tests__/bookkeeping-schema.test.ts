@@ -260,7 +260,7 @@ it("trigger counts equal COUNT across inserts, all state transitions, updates an
     insertResource(tx, r)
     insertMapping(tx, "key", { ...mapping(), currentTranscript: r.locator })
     insertResourceLease(tx, r.key, { token: "t", owner, createdAt: 1 })
-    tx.run("INSERT INTO priority_assignments VALUES('route','p','digest',1,'key','g','r',1)")
+    tx.run("INSERT INTO priority_assignments VALUES('route','p','digest',1,'key','g','r',1,1)")
     tx.run("INSERT INTO priority_attempts VALUES('route',0,NULL,NULL,NULL,NULL,NULL,'g',1)")
     tx.run("INSERT INTO priority_rollbacks VALUES('route','key','g')")
   })

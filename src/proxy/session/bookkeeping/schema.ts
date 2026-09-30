@@ -77,7 +77,8 @@ const statements = [
   `CREATE TABLE priority_assignments (
     route_key TEXT PRIMARY KEY NOT NULL, profile_id TEXT NOT NULL, last_human_turn_digest TEXT NOT NULL,
     ${integer("last_human_turn_issued_at")}, mapping_key TEXT NOT NULL, mapping_generation TEXT NOT NULL,
-    generation_id TEXT NOT NULL, ${integer("updated_at")}
+    generation_id TEXT NOT NULL, ${integer("updated_at")},
+    insertion_order INTEGER NOT NULL UNIQUE CHECK(insertion_order BETWEEN 1 AND 9007199254740991)
   ) STRICT`,
   `CREATE TABLE priority_attempts (
     route_key TEXT PRIMARY KEY NOT NULL, blocked INTEGER NOT NULL CHECK(blocked IN (0,1)),

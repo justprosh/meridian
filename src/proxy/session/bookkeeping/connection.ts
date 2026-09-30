@@ -108,7 +108,12 @@ export function database(connection: Connection): Database.Database {
   assertGuardHeld(connection.guard, connection.maintenance ? "exclusive" : "shared")
   return connection.db
 }
+export class BookkeepingTextParameterError extends TypeError {}
+
 export function checkParameters(parameters: SqlValue[]): void {
+  if (parameters.some((value) => typeof value === "string" && value.includes("\0"))) {
+    throw new BookkeepingTextParameterError("bookkeeping scalar TEXT cannot contain U+0000; encode payload as JSON")
+  }
   if (parameters.some((value) => typeof value === "number" && !Number.isSafeInteger(value))) {
     throw new RangeError("bookkeeping numbers must be safe integers")
   }

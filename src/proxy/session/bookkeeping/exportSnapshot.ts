@@ -37,7 +37,7 @@ export function snapshotForExport(reader: BookkeepingReader): ExportSnapshot {
   }
   else if (version === 3) {
     meta = { version: 3, slots: slots("store"),
-      priorityAssignments: Object.fromEntries(reader.all("SELECT * FROM priority_assignments ORDER BY route_key")
+      priorityAssignments: Object.fromEntries(reader.all("SELECT * FROM priority_assignments ORDER BY insertion_order")
         .map((row) => [String(row.route_key), { profileId: String(row.profile_id),
           lastHumanTurnDigest: String(row.last_human_turn_digest),
           lastHumanTurnIssuedAt: Number(row.last_human_turn_issued_at), mappingKey: String(row.mapping_key),

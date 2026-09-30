@@ -52,7 +52,7 @@ function mutations(tx: BookkeepingTransaction): void {
     generationId: "g",
     currentTranscript: locator,
   })
-  tx.run("INSERT INTO priority_assignments VALUES('route','p','digest',1,'key','g','r',1)")
+  tx.run("INSERT INTO priority_assignments VALUES('route','p','digest',1,'key','g','r',1,1)")
 }
 function expectEmpty(): void {
   for (const table of [

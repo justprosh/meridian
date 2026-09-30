@@ -96,7 +96,7 @@ export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: str
   const meta = plan.store.meta
   if (meta.version === 3) {
     for (const [key, row] of Object.entries(meta.priorityAssignments)) {
-      tx.run("INSERT INTO priority_assignments VALUES(?,?,?,?,?,?,?,?)", key, row.profileId,
+      tx.run("INSERT INTO priority_assignments VALUES(?,?,?,?,?,?,?,?,(SELECT coalesce(max(insertion_order),0)+1 FROM priority_assignments))", key, row.profileId,
         row.lastHumanTurnDigest, row.lastHumanTurnIssuedAt, row.mappingKey, row.mappingGeneration,
         row.generationId, row.updatedAt)
     }
