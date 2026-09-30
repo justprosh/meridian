@@ -4,7 +4,7 @@ Graph: r161 #200, #202, #206, #213. This is a harness handoff, not full performa
 
 |Observation|Outcome|Limit|
 |---|---|---|
-|Node22 harness command `node scripts/bench-bookkeeping.test.mjs`|18 passed locally after cold-review corrections; prior 13-test revision also passed on Linux|Author-run, cold re-review still required|
+|Node22 harness command `node scripts/bench-bookkeeping.test.mjs`|19 passed locally after fourth correction; first three findings cold-approved at 4e106939|Fourth-delta cold review still required|
 |Linux runner shell syntax and branch diff whitespace check|exit 0|No Linux execution inferred|
 |Canonical Bun-built SQL adapter on pre-activation candidate `58d45d2`|exit 1: `Production store facade is not activated`|Diagnostic dirty candidate, deliberately not accepted as SQL performance evidence|
 |Paired production-sized runs and ten-minute K20 soaks|NOT_ESTABLISHED|Await exact clean production activation candidate and exclusive measurement window|
@@ -46,13 +46,24 @@ refusing unexplained resource loss. GC-on hub.1 `022d37a` clips claimed deletion
 budgets; hub.2 `47b6e51` and SQL `c08b456` preserve full claimed-child timeout.
 Therefore old-baseline GC ratios are combined version comparisons, not SQL-only
 gains. Manifest/synopsis policies are explicit; targeted hub.2 K20/K40 controls
-remain required. Benchmark 8/10s cadence and production 16/60s ideal service
-ceiling are reported separately against intake, with no stability claim.
+remain required. Benchmark 8/10s is a stress scheduler, not production trigger
+topology. The 16/60s quantity describes only the periodic trigger, never an
+overall production service ceiling or acceptance gate (fourth review correction).
 Timeout/interrupt passes cancellation into production gates and drains GC; a
 positive IPC JOIN receipt is required. Missing receipt or any timeout stops the
 matrix. Unknown executors retain fixtures/fences. Focused production-gate test
 checks termination of a 60-second child after timeout using its recorded PID.
 No final SQL candidate performance has been measured by this revision.
+
+Fourth correction's canonical local probe on clean `08172801` used actual
+`createProxyServer().sweepSessionGc` and real SDK0.2.141 children. Two successful
+mapping-republication-boundary invocations deleted 32 files in 4.232s on the final local rerun, directly
+refuting the former 16/60s overall-ceiling claim. Startup/periodic/shutdown boundary
+invocations brought the total to 80 physical deletions/80 committed tombstones;
+mapped files remained intact and simultaneous calls shared the same promise.
+The periodic invocation waited the actual 60s default. This was manual boundary
+invocation with synthetic grace=0, no HTTP/model/fork intake, not stability proof.
+Production stability remains NOT_ESTABLISHED; stress measurements never upgrade it.
 
 The machine verdict remains NOT_ESTABLISHED. It checks paired full-turn and overhead
 p95 ratios, small-point tails and GC service separately, without lowering thresholds

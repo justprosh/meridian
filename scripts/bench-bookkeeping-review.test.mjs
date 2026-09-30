@@ -7,7 +7,7 @@ import { deletionService } from './bench-bookkeeping-metrics.mjs';
 import { conservation } from './bench-bookkeeping-conservation.mjs';
 import { runPoint } from './bench-bookkeeping-point.mjs';
 
-test('GC version confound is explicit; production cadence ceiling cannot be replaced by faster benchmark cadence', () => {
+test('GC version confound is explicit; periodic-only budget never proves production stability', () => {
   // Exact policy-bearing fragments observed in these pins; tests need no sibling worktree/git ref.
   const defaults = 'const DEFAULT_MAX_DELETES = 16; const DEFAULT_DELETE_TIMEOUT_MS = 30_000;';
   const clipped = defaults + 'const remainingMs = Math.max(1, deadline - Date.now()); const deletionTimeout = Math.min(option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs"), remainingMs)';
@@ -22,7 +22,9 @@ test('GC version confound is explicit; production cadence ceiling cannot be repl
   const service = deletionService([{ deleted: 80, notFound: 0 }], 40, 60000, 60000,
     { gc: true, realSdk: true, policy: sql });
   assert.equal(service.sufficientWithMargin, true);
-  assert.equal(service.productionCadence.sufficientWithMargin, false);
+  assert.equal(service.periodicOnlyBudget.idealPeriodicDeletesPerSecond, 16 / 60);
+  assert.equal(service.productionCadence, undefined);
+  assert.equal(service.productionStability.status, 'NOT_ESTABLISHED');
 });
 
 test('driver timeout persists INCOMPLETE and never launches the remaining planned points', async () => {

@@ -31,10 +31,7 @@ export function acceptance(environment, coverage, results) {
     if (!metrics?.begin?.n || !metrics?.commit?.n || !metrics?.criticalSectionMs?.n ||
       metrics.queueWaitMs === null || metrics.busyAttempts === null) reasons.push(`Missing transaction/admission metrics: ${candidate.id}`);
     if (candidate.mode === 'soak' && candidate.gc && !candidate.gcService?.sufficientWithMargin) {
-      reasons.push(`Deletion service below intake + margin (#213): ${candidate.id}`);
-    }
-    if (candidate.mode === 'soak' && candidate.gc && !candidate.gcService?.productionCadence?.sufficientWithMargin) {
-      reasons.push(`Production cadence/maxDeletes upper bound below intake + margin (#213): ${candidate.id}`);
+      reasons.push(`Stress-scheduler deletion service below intake + margin; not production stability proof (#213): ${candidate.id}`);
     }
     if (candidate.gc && environment.plan.gcSdk === 'real' && !(candidate.sdkFilesystem?.removedFiles > 0)) {
       reasons.push(`Real SDK physical deletion not established: ${candidate.id}`);
@@ -44,6 +41,7 @@ export function acceptance(environment, coverage, results) {
   // This executable measures an internal-API closure with a synthetic SDK, not these external gates.
   if (environment.plan.gcSdk !== 'real') reasons.push('Real SDK deletion throughput/open-arrival bound not established');
   else reasons.push('Real SDK deletion uses synthetic physical transcripts; open-arrival bound is an independent gate');
+  reasons.push('Production GC stability requires actual startup/periodic/publication triggers and coalescing measurements (#213)');
   reasons.push('Canonical npm-package, semantic/fault/platform suites are independent gates',
     'Immutable artifact archive URL and retention not recorded');
   return { status: 'NOT_ESTABLISHED', reasons: [...new Set(reasons)], comparisons,

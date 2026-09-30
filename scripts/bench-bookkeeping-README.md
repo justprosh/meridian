@@ -124,11 +124,14 @@ observed filesystem codec is explicitly pinned to SDK0.2.141; another SDK is ref
 until its installed codec is read. Current and previous mapping pins must remain on
 disk; removed files must equal committed deletions, with zero notFound substitutions.
 Both backends use identical physical fixtures. The Linux runner selects real SDK.
-The stress cadence (8 deletes/10s) is not the production default (16 deletes/60s).
-Each result separately reports production maxDeletes/cadence's ideal service
-ceiling against measured intake and the explicit 20% margin. This ceiling assumes
-instant deletes/no retries, so passing it is not production stability evidence;
-falling below intake falsifies stability even if the faster stress collector passes.
+The stress scheduler (8 deletes/10s) is not the production trigger topology.
+The 60s interval triggers periodic sweeps only; startup, successful publication and
+shutdown also call the same sweeper. Coalescing joins an in-flight promise but
+does not rate-limit successive sweeps to 60s. `periodicOnlyBudget` is labelled
+as such and is neither an overall ceiling nor an acceptance gate. Every fixed
+stress result explicitly leaves `productionStability` NOT_ESTABLISHED. Production
+stability needs actual trigger/coalescing measurements and intake; a real SDK
+deleter alone does not turn the fixed stress schedule into production throughput.
 There is no deliberate failure injection in the performance matrix. A failed
 deletion invalidates the point. The 8-delete bound leaves headroom beneath the
 pass deadline; the old 16×2s exceeded a 30s pass even before bookkeeping overhead.
@@ -181,6 +184,26 @@ child-termination proof, the matrix remains stopped and fixtures remain private.
 No generic process-name kills. Failed/unjoined fixtures are retained and excluded
 from sanitized archives. Focused tests exercise a 60-second production-gated child,
 timeout cancellation, OS process absence, and missing-JOIN refusal.
+
+### Canonical production GC boundary probe (separate from paired stress)
+
+Build an independent server-inclusive artifact with
+`buildArtifact(candidateRoot, artifact, 'sqlite', {includeServer:true})`, then run:
+
+```sh
+node scripts/bench-bookkeeping-production-gc.mjs "$artifact" "$evidence"
+```
+
+The carrier is the real `createProxyServer().sweepSessionGc()` (no listener or
+HTTP/model inference). It explicitly invokes startup, two successful canonical
+mapping-republication boundaries, the periodic boundary after its actual 60s
+delay, and shutdown. Every call also asserts coalescing. Default maxDeletes=16
+and real SDK child/import/deleteSession stay intact. Synthetic retired fixtures
+use a disclosed grace=0 override; no credentials or API quota are used. The two
+publication passes must delete >16 within 60s, falsifying the obsolete ceiling.
+Physical file deletion/tombstones and mapped pins are checked. This probe is
+**not** an HTTP managed-fork workload: republication produces no fork intake and
+does not prove production stability. Its output explicitly remains NOT_ESTABLISHED.
 
 SQLite uses the real offline `migrateBookkeeping(...,{writersStopped:true})` on
 the same synthetic legacy fixture, outside timing. Its one atomic import preserves

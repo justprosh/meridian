@@ -6,11 +6,12 @@ import { execFileSync } from 'node:child_process';
 import { hash } from './bench-bookkeeping-support.mjs';
 import { gcPolicy } from './bench-bookkeeping-policy.mjs';
 
-export function buildArtifact(packageRoot, output, backend) {
+export function buildArtifact(packageRoot, output, backend, { includeServer = false } = {}) {
   packageRoot = resolve(packageRoot);
   output = resolve(output);
   const require = createRequire(join(packageRoot, 'package.json'));
   const entries = ['sessionLifecycle', 'sessionStore', 'session/cache', 'session/sdkProcessGate'];
+  if (includeServer) entries.push('server');
   if (backend === 'sqlite') entries.push(...['database', 'migration', 'resources', 'mappings', 'runtime']
     .map(name => `session/bookkeeping/${name}`));
   const entryFiles = entries.map(name => join(packageRoot, `src/proxy/${name}.ts`));

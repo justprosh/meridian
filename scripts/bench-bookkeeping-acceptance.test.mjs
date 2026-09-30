@@ -17,6 +17,15 @@ test('acceptance refuses smoke, mismatched SDK, missing metrics and synthetic-on
   }
 });
 
+test('removing false periodic ceiling never promotes unobserved production GC stability', () => {
+  const env = { platform: 'linux', fs: { type: 0xef53 }, plan: { matrix: 'full', repeats: 3, soakMinutes: 10, gcSdk: 'real' },
+    builds: { json: { sdk: 'same' }, sqlite: { sdk: 'same' } } };
+  const a = acceptance(env, { complete: true }, []);
+  assert.equal(a.status, 'NOT_ESTABLISHED');
+  assert.ok(a.reasons.some(r => /actual startup\/periodic\/publication triggers/.test(r)));
+  assert.ok(!a.reasons.some(r => /cadence\/maxDeletes upper bound/.test(r)));
+});
+
 test('physical SDK fixture refuses path escape and detects missing pinned files/deletion mismatch', () => {
   const evidence = resolve('.evidence/bench-harden/tests');
   mkdirSync(evidence, { recursive: true });

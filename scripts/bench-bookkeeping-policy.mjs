@@ -10,6 +10,7 @@ export function gcPolicy(source, server, version, sqlDeletion) {
     throw Error('Unrecognized deletion timeout policy');
   }
   return { version, deletionBudget: clipped ? 'claimed-child-clipped-to-pass-deadline' : 'claimed-child-full-timeout',
+    cadenceScope: 'periodic-trigger-only; other triggers and in-flight coalescing require canonical server observation',
     maxDeletes: integer(source, /DEFAULT_MAX_DELETES = ([\d_]+)/),
     deletionTimeoutMs: integer(source, /DEFAULT_DELETE_TIMEOUT_MS = ([\d_]+)/),
     cadenceMs: integer(server, /envInt\("SESSION_GC_INTERVAL_MS", ([\d_]+)\)/) };
