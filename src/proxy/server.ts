@@ -1202,10 +1202,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           type: w.type,
           resetsAt: w.resetsAt,
           exhausted: (w.utilization ?? 0) >= 1,
-        }), {
-          ...sessionGcOptions,
-          admissionSignal: options.requestAbortLink?.controller.signal ?? options.context.req.raw.signal,
-        })
+        }))
         // Sentinel: resolveCooldownUntil falls back to `now + defaultMs` when
         // nothing is exhausted. Passing 0 makes that fallback identifiable, so
         // a snapshot showing a healthy account refines nothing and tier 3's
@@ -1314,7 +1311,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           routeKey: options.durableRoute!.routeKey,
           expectedAssignmentGeneration: options.durableRoute!.expectedGeneration,
           turn: options.claimTurn,
-        }))
+        }), {
+          ...sessionGcOptions,
+          admissionSignal: options.requestAbortLink?.controller.signal ?? options.context.req.raw.signal,
+        })
         if (!claim) {
           return options.context.json({
             type: "error",
