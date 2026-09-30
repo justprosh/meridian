@@ -1,8 +1,8 @@
 export function pointId(c) {
-  return `${c.backend}-N${c.N}-M${c.M}-K${c.K}-${c.mode}-gc${Number(c.gc)}-r${c.repeat}`;
+  return `${c.backend}-N${c.N}-M${c.M}-K${c.K}-${c.mode}-gc${Number(c.gc)}-r${c.repeat}${c.gcSdk === 'real' ? '-sdkreal' : ''}`;
 }
 
-export function plan({ backends = ['json'], matrix, repeats = 3, rounds, soakMinutes = 0 } = {}) {
+export function plan({ backends = ['json'], matrix, repeats = 3, rounds, soakMinutes = 0, gcSdk = 'simulated' } = {}) {
   const sizes = matrix ? [matrix] : [{ N: 2000, M: 2500 }, { N: 6400, M: 2500 }, { N: 12000, M: 5000 }];
   const result = [];
   for (let repeat = 0; repeat < repeats; repeat++) {
@@ -20,7 +20,7 @@ export function plan({ backends = ['json'], matrix, repeats = 3, rounds, soakMin
       }
     }
   }
-  return result.map(c => ({ ...c, id: pointId(c) }));
+  return result.map(c => ({ ...c, gcSdk, id: pointId({ ...c, gcSdk }) }));
 }
 
 export function completeness(planned, results) {

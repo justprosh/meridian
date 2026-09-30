@@ -22,7 +22,7 @@ export function mapping(index, transcript) {
 export function seed(root,N,M,lifecycle,{persist=true}={}) {
   mkdirSync(root,{recursive:true});
   const configDir=join(root,'config'), projectDir=join(root,'project');
-  mkdirSync(configDir,{recursive:true}); mkdirSync(projectDir,{recursive:true});
+  mkdirSync(configDir,{recursive:true,mode:0o700}); mkdirSync(projectDir,{recursive:true,mode:0o700});
   const sidecar={version:2,meta:{fenceSlots:{}},resources:{}};
   const locators=[];
   for(let i=0;i<N;i++) {

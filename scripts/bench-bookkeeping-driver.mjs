@@ -11,7 +11,7 @@ import { acceptance } from './bench-bookkeeping-acceptance.mjs';
 export async function driver(argv) {
   const flags = new Map();
   const known = ['backend', 'package-root', 'compare-root', 'matrix', 'rounds', 'repeats',
-    'soak-minutes', 'artifacts', 'synopsis', 'point-timeout-ms', 'interrupt-after-ms'];
+    'soak-minutes', 'artifacts', 'synopsis', 'point-timeout-ms', 'interrupt-after-ms', 'gc-sdk'];
   for (let i = 0; i < argv.length; i += 2) {
     const key = argv[i].replace(/^--/, '');
     if (!known.includes(key) || argv[i + 1] === undefined) throw Error(`Invalid option ${argv[i]}`);
@@ -38,21 +38,26 @@ export async function driver(argv) {
   const repeats = positive('repeats', 3), rounds = flags.has('rounds') ? positive('rounds') : undefined;
   if (!Number.isInteger(repeats) || (rounds && !Number.isInteger(rounds))) throw Error('integer repeats/rounds required');
   const soakMinutes = flags.has('soak-minutes') ? positive('soak-minutes') : 0;
-  const planned = plan({ backends: Object.keys(roots), matrix, repeats, rounds, soakMinutes });
+  const gcSdk = flags.get('gc-sdk') ?? 'simulated';
+  if (!['real', 'simulated'].includes(gcSdk)) throw Error('--gc-sdk must be real or simulated');
+  const planned = plan({ backends: Object.keys(roots), matrix, repeats, rounds, soakMinutes, gcSdk });
   const base = resolve(flags.get('artifacts') ?? '.evidence/bench-harden/runs');
   mkdirSync(base, { recursive: true });
   const evidence = mkdtempSync(join(base, 'run-'));
   const artifacts = {}, builds = {}, buildErrors = {};
   for (const [name, root] of Object.entries(roots)) {
     artifacts[name] = join(evidence, `artifact-${name}`);
-    try { builds[name] = buildArtifact(root, artifacts[name], name); }
+     try { builds[name] = buildArtifact(root, artifacts[name], name); }
     catch (error) { buildErrors[name] = error.message; }
+  }
+  if (gcSdk === 'real') for (const [name, build] of Object.entries(builds)) {
+    if (build.sdk !== '0.2.141') buildErrors[name] = 'Real deletion fixture codec was observed only on SDK0.2.141';
   }
   const fs = statfsSync(evidence);
   const environment = { node: process.version, platform: process.platform, release: os.release(), arch: os.arch(),
     cpu: os.cpus()[0]?.model, logicalCpus: os.cpus().length, totalMemory: os.totalmem(),
     loadStart: os.loadavg(), fs: { type: fs.type, blockSize: fs.bsize }, date: new Date().toISOString(), builds,
-    plan: { matrix: matrix ?? 'full', repeats, rounds: rounds ?? 'default', soakMinutes },
+    plan: { matrix: matrix ?? 'full', repeats, rounds: rounds ?? 'default', soakMinutes, gcSdk },
     pragmas: 'Backend runtime readback; JSON not applicable; SQLite WAL/FULL checked before timing' };
   writeFileSync(join(evidence, 'environment.json'), JSON.stringify(environment, null, 2));
   writeFileSync(join(evidence, 'plan.json'), JSON.stringify(planned, null, 2));

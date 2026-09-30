@@ -22,4 +22,4 @@ trap 'rmdir "$lock"' EXIT
 findmnt -T "$5" -no FSTYPE | grep -qx ext4 || { echo 'Mount is not ext4' >&2; exit 2; }
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 node "$script_dir/bench-session-bookkeeping.mjs" --backend json --package-root "$1" \
-  --compare-root "$3" --soak-minutes 10 --repeats 3 --artifacts "$5"
+  --compare-root "$3" --soak-minutes 10 --repeats 3 --gc-sdk real --artifacts "$5"

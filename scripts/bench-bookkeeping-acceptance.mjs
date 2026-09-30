@@ -28,11 +28,15 @@ export function acceptance(environment, coverage, results) {
     if (candidate.mode === 'soak' && candidate.gc && !candidate.gcService?.sufficientWithMargin) {
       reasons.push(`Deletion service below intake + margin (#213): ${candidate.id}`);
     }
+    if (candidate.gc && environment.plan.gcSdk === 'real' && !(candidate.sdkFilesystem?.removedFiles > 0)) {
+      reasons.push(`Real SDK physical deletion not established: ${candidate.id}`);
+    }
   }
   if (environment.platform !== 'linux' || environment.fs.type !== 0xef53) reasons.push('Linux/ext4 FULL point missing');
   // This executable measures an internal-API closure with a synthetic SDK, not these external gates.
-  reasons.push('Real SDK deletion throughput/open-arrival bound not established',
-    'Canonical npm-package, semantic/fault/platform suites are independent gates',
+  if (environment.plan.gcSdk !== 'real') reasons.push('Real SDK deletion throughput/open-arrival bound not established');
+  else reasons.push('Real SDK deletion uses synthetic physical transcripts; open-arrival bound is an independent gate');
+  reasons.push('Canonical npm-package, semantic/fault/platform suites are independent gates',
     'Immutable artifact archive URL and retention not recorded');
   return { status: 'NOT_ESTABLISHED', reasons: [...new Set(reasons)], comparisons };
 }

@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { summary } from './bench-bookkeeping-support.mjs';
 import { openAdapter } from './bench-bookkeeping-adapter.mjs';
-import { armedLoopProbe, retainedHandle } from './bench-bookkeeping-metrics.mjs';
+import { armedLoopProbe, retainedHandle, deletionService } from './bench-bookkeeping-metrics.mjs';
+import { sdkTranscriptFixture } from './bench-bookkeeping-sdk.mjs';
 
 export async function runCase(c, artifact, evidence) {
   const root = mkdtempSync(join(evidence, 'fixture-'));
@@ -24,6 +25,7 @@ export async function runCase(c, artifact, evidence) {
 async function workload(c, adapter, root, evidence) {
   const { L, S, storeSession, createSdkProcessGate } = adapter;
   const fixture = await adapter.seed(c.N, c.M);
+  const physical = c.gcSdk === 'real' ? sdkTranscriptFixture(fixture) : undefined;
   const active = new Map(), expected = new Map();
   for (const [key, entry] of adapter.entries()) expected.set(key, entry.currentTranscript);
   const pinProvider = () => [...active.values()].flat().concat(adapter.pins());
@@ -41,7 +43,7 @@ async function workload(c, adapter, root, evidence) {
   // Synthetic deletion target: no transcript content, credentials, or real SDK invocation.
   const sdkStub = join(root, 'gc-stub.mjs');
   writeFileSync(sdkStub, 'export async function deleteSession(){await new Promise(r=>setTimeout(r,2000));}\n');
-  const gcOptions = { ...opts, sdkModuleUrl: pathToFileURL(sdkStub).href,
+  const gcOptions = { ...opts, ...(physical ? {} : { sdkModuleUrl: pathToFileURL(sdkStub).href }),
     maxDeletesPerRun: 8, runTimeoutMs: 30000, deletionTimeoutMs: 30000 };
   const startGc = () => {
     if (!gcRunning) gcRunning = L.runGc(pinProvider(), gcOptions).then(
@@ -78,7 +80,8 @@ async function workload(c, adapter, root, evidence) {
         (executor, recoverable) => L.attachActiveTranscriptExecutor(lease, executor, opts, recoverable));
       const sdkStart = performance.now();
       const child = gate.spawnClaudeCodeProcess({ command: process.execPath,
-        args: ['-e', `setTimeout(()=>{},${c.D})`], env: process.env, cwd: root, signal: new AbortController().signal });
+        args: ['-e', physical?.childProgram(target, c.D) ?? `setTimeout(()=>{},${c.D})`],
+        env: process.env, cwd: root, signal: new AbortController().signal });
       await new Promise((resolve, reject) => {
         child.once('error', reject);
         child.once('close', code => code === 0 ? resolve() : reject(Error(`model child ${code}`)));
@@ -128,14 +131,7 @@ async function workload(c, adapter, root, evidence) {
     throw Error('State counts/history proof failed');
   }
   const drainedAt = performance.now() - started;
-  const removed = gcRuns.reduce((n, r) => n + r.deleted + r.notFound, 0);
-  const gcService = { syntheticSdk: true, deletionDelayMs: 2000, passes: gcRuns.length,
-    removed, intake: overheads.length, measurementMs: elapsed, drainIncludedMs: drainedAt,
-    removalsPerSecond: removed / (drainedAt / 1000), intakePerSecond: overheads.length / (elapsed / 1000),
-    // Drain counts cannot prove production service; failure with a faster SDK stub is a falsifier.
-    removalToIntakeRatio: removed / (drainedAt / 1000) / (overheads.length / (elapsed / 1000)),
-    margin: 1.2, sufficientWithMargin: c.gc && removed / (drainedAt / 1000) >= 1.2 * overheads.length / (elapsed / 1000),
-    scope: 'synthetic deletion service; real SDK import/delete cost and open-arrival bound not established' };
+  const gcService = deletionService(gcRuns, overheads.length, elapsed, drainedAt, { gc: c.gc, realSdk: !!physical });
   const result = { ...c, measuredAt, finishedAt: new Date().toISOString(),
     complete: !errors.length && !gcErrors.length && !gcRuns.some(r => r.failed > 0),
     ok: overheads.length, attempted, errors,
@@ -143,6 +139,7 @@ async function workload(c, adapter, root, evidence) {
     elapsedMs: elapsed, throughput: overheads.length / (elapsed / 1000), loop: loopMetrics,
     before, after, sizesBefore, sizesAfter: adapter.sizes(), timeline,
     metrics: { ...transactionMetrics, checkpoint }, gcRuns, gcErrors, gcService,
+    sdkFilesystem: physical?.assert(expected, gcRuns, adapter.pins()) ?? null,
     assertions: { expectedMappings: expected.size, lostMappings: 0, observedAba: 0, unsafeDeletion: 0 },
     measurementWindow: 'latency/throughput exclude final GC drain; loop/timeline include drain' };
   writeFileSync(join(evidence, `${c.id}.json`), JSON.stringify(result, null, 2));

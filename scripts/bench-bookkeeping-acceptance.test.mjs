@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { acceptance } from './bench-bookkeeping-acceptance.mjs';
 import { writeReport } from './bench-bookkeeping-report.mjs';
+import { sdkTranscriptFixture } from './bench-bookkeeping-sdk.mjs';
+import { seed, hash } from './bench-bookkeeping-support.mjs';
 
 test('acceptance refuses smoke, mismatched SDK, missing metrics and synthetic-only deletion proof', () => {
   const env = { platform: 'darwin', fs: { type: 1 }, plan: { matrix: 'small', repeats: 1, soakMinutes: 0 },
@@ -13,6 +15,24 @@ test('acceptance refuses smoke, mismatched SDK, missing metrics and synthetic-on
   for (const fragment of ['incomplete', 'full matrix', 'Dirty', 'SDK', 'Linux', 'Real SDK', 'retention']) {
     assert.ok(a.reasons.some(r => r.includes(fragment)), fragment);
   }
+});
+
+test('physical SDK fixture refuses path escape and detects missing pinned files/deletion mismatch', () => {
+  const evidence = resolve('.evidence/bench-harden/tests');
+  mkdirSync(evidence, { recursive: true });
+  const root = mkdtempSync(join(evidence, 'sdk-files-'));
+  try {
+    const fixture = seed(root, 20, 10, { getTranscriptResourceKey: l => hash(l.sessionId) });
+    const f = sdkTranscriptFixture(fixture), current = fixture.locators[0], retired = fixture.locators.at(-1);
+    const expected = new Map([['bench-0', current]]);
+    assert.equal(f.assert(expected, []).createdFiles, 20);
+    assert.throws(() => f.childProgram({ ...current, sessionId: '../escape' }, 10), /UUIDv4/);
+    const directory = join(fixture.configDir, 'projects', fixture.projectDir.replace(/[^a-zA-Z0-9]/g, '-'));
+    unlinkSync(join(directory, `${retired.sessionId}.jsonl`));
+    assert.throws(() => f.assert(expected, []), /proof differs/);
+    assert.equal(f.assert(expected, [{ deleted: 1, notFound: 0 }]).removedFiles, 1);
+    assert.throws(() => f.assert(expected, [{ deleted: 1, notFound: 0 }], [retired]), /pinned transcript/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('acceptance detects paired speedup and tail regression with no threshold relaxation', () => {

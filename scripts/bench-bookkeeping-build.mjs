@@ -10,7 +10,7 @@ export function buildArtifact(packageRoot, output, backend) {
   output = resolve(output);
   const require = createRequire(join(packageRoot, 'package.json'));
   const entries = ['sessionLifecycle', 'sessionStore', 'session/cache', 'session/sdkProcessGate'];
-  if (backend === 'sqlite') entries.push(...['database', 'migration', 'resources', 'mappings']
+  if (backend === 'sqlite') entries.push(...['database', 'migration', 'resources', 'mappings', 'runtime']
     .map(name => `session/bookkeeping/${name}`));
   const entryFiles = entries.map(name => join(packageRoot, `src/proxy/${name}.ts`));
   const ts = require('typescript'), pending = [...entryFiles];
@@ -50,8 +50,8 @@ export function buildArtifact(packageRoot, output, backend) {
   // Never borrow a changing worktree's native dependencies during measured runs.
   cpSync(join(packageRoot, 'node_modules'), join(output, 'node_modules'), { recursive: true, dereference: true });
   cpSync(join(packageRoot, 'package-lock.json'), join(output, 'package-lock.json'));
-  writeFileSync(join(output, 'package.json'), '{"type":"module"}\n');
   const pkg = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  writeFileSync(join(output, 'package.json'), JSON.stringify({ ...pkg, scripts: {}, type: 'module' }, null, 2));
   const sdk = JSON.parse(readFileSync(join(dirname(require.resolve('@anthropic-ai/claude-agent-sdk')),
     'package.json'), 'utf8')).version;
   const manifest = { backend, version: pkg.version, sdk, compiler: `bun ${execFileSync('bun', ['--version'], {encoding:'utf8'}).trim()}`,

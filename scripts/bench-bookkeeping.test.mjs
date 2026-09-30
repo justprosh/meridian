@@ -90,6 +90,7 @@ test('SQLite adapter refuses missing canonical migration/inspection APIs without
     'session/bookkeeping/migration': 'export function migrateBookkeeping() {}',
     'session/bookkeeping/resources': 'export function readResource() {}',
     'session/bookkeeping/mappings': 'export function readMapping() {}',
+    'session/bookkeeping/runtime': 'export function initializeProxyBookkeeping() {}',
   };
   try {
     mkdirSync(join(root, 'src/proxy/session/bookkeeping'), { recursive: true });

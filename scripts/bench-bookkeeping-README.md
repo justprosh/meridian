@@ -106,7 +106,14 @@ History mixture: 55% ~6KB, 30% ~12KB, 10% ~40KB, 5% ~80KB total mapping payload.
 Capacity headroom is identical: maxOwned/maxPending=100000; store limit=20000.
 
 GC starts at workload admission and every 10s, coalescing outstanding passes.
-The deletion stub takes 2s and succeeds; at most 8 deletes/pass with 30s budget.
+Default `--gc-sdk simulated` uses a 2s deletion stub; at most 8 deletes/pass with 30s budget.
+`--gc-sdk real` instead uses the canonical SDK child/import/deleteSession on private,
+nonempty synthetic JSONL files. Gated model children write only synthetic transcripts
+after D; no SDK inference, credential, HTTP request or Anthropic quota is used. The
+observed filesystem codec is explicitly pinned to SDK0.2.141; another SDK is refused
+until its installed codec is read. Current and previous mapping pins must remain on
+disk; removed files must equal committed deletions, with zero notFound substitutions.
+Both backends use identical physical fixtures. The Linux runner selects real SDK.
 There is no deliberate failure injection in the performance matrix. A failed
 deletion invalidates the point. The 8-delete bound leaves headroom beneath the
 pass deadline; the old 16×2s exceeded a 30s pass even before bookkeeping overhead.
@@ -159,10 +166,11 @@ attempts remain **null** until a production observer exists: no AST rewriting,
 alternate SQL implementation or guessed counts. This observation gap blocks full
 acceptance. Pragmas are read back and checked before timing.
 
-GC service/intake ratio includes final drain in the deletion measurement (a favorable
-bound) and uses an explicitly reported 20% margin. It is synthetic-only: a passed
-stub cannot establish real SDK deletion throughput or release #213. A failed soak
-ratio falsifies even the faster simulated deletion path and must be reported.
+GC service/intake ratio includes final drain in the deletion measurement and uses
+an explicitly reported 20% margin. A passed fake stub cannot establish SDK throughput
+or release #213. Real SDK mode records physical deletions and actual spawn/import
+cost, but still uses synthetic files and closed-loop arrival, not a live service.
+A failed soak ratio must be reported separately from p95/storage improvements.
 
 ## Metrics and PR gates
 

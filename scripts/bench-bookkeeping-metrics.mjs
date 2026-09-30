@@ -44,3 +44,15 @@ export function projection(resources, mappings) {
     historyBytes: histories.reduce((a, b) => a + b, 0), historySizes: summary(histories),
     states, errors, dueCount, oldestDueMs };
 }
+
+export function deletionService(gcRuns, intake, elapsedMs, drainMs, { gc, realSdk }) {
+  const removed = gcRuns.reduce((n, r) => n + r.deleted + r.notFound, 0);
+  const removalRate = removed / (drainMs / 1000), intakeRate = intake / (elapsedMs / 1000);
+  return { syntheticSdk: !realSdk, deletionDelayMs: realSdk ? null : 2000, passes: gcRuns.length,
+    removed, intake, measurementMs: elapsedMs, drainIncludedMs: drainMs,
+    removalsPerSecond: removalRate, intakePerSecond: intakeRate,
+    removalToIntakeRatio: intake > 0 ? removalRate / intakeRate : null,
+    margin: 1.2, sufficientWithMargin: gc && intake > 0 && removalRate >= 1.2 * intakeRate,
+    scope: realSdk ? 'canonical SDK import/delete on synthetic physical transcripts; no inference; closed-loop only'
+      : 'synthetic deletion service; real SDK import/delete cost and open-arrival bound not established' };
+}

@@ -10,12 +10,14 @@ import { requireFunctions } from './bench-bookkeeping-adapter.mjs';
 export async function sqliteAdapter(artifact, root, common) {
   const load = name => import(pathToFileURL(join(artifact, `src/proxy/session/bookkeeping/${name}.js`)).href);
   const db = await load('database'), migration = await load('migration'), resources = await load('resources'), mappings = await load('mappings');
+  const runtime = await load('runtime'), previousMode = process.env.MERIDIAN_BOOKKEEPING;
   requireFunctions(db, ['initializeSessionBookkeeping', 'withBookkeepingRead', 'checkpointBookkeeping'], 'SQLite engine');
   requireFunctions(migration, ['migrateBookkeeping'], 'SQLite migration');
   requireFunctions(resources, ['readResource'], 'SQLite resource projection');
   requireFunctions(mappings, ['readMapping'], 'SQLite mapping projection');
+  requireFunctions(runtime, ['initializeProxyBookkeeping'], 'Production SQLite startup');
   const { L, S } = common;
-  let handle, fixture, pragmas;
+  let handle, runtimeHandle, fixture, pragmas;
   let transactions = [], pending;
   const executeTransaction = (native, sql) => {
     const start = performance.now();
@@ -44,6 +46,9 @@ export async function sqliteAdapter(artifact, root, common) {
         throw Error('Canonical fixture migration did not preserve row counts');
       }
       handle = db.initializeSessionBookkeeping(root, { executeTransaction });
+      process.env.MERIDIAN_BOOKKEEPING = 'sqlite';
+      runtimeHandle = await runtime.initializeProxyBookkeeping();
+      if (!runtimeHandle) throw Error('Production SQLite startup returned no handle');
       pragmas = read(r => Object.fromEntries(['journal_mode', 'synchronous', 'foreign_keys',
         'busy_timeout', 'wal_autocheckpoint'].map(name => [name, Object.values(r.get(`PRAGMA ${name}`))[0]])));
       for (const [name, value] of Object.entries({ journal_mode: 'wal', synchronous: 2, foreign_keys: 1,
@@ -95,6 +100,10 @@ export async function sqliteAdapter(artifact, root, common) {
         }
       });
     },
-    close() { handle?.close(); S.setSessionStoreDir(null); },
+    close() {
+      runtimeHandle?.close(); handle?.close(); S.setSessionStoreDir(null);
+      if (previousMode === undefined) delete process.env.MERIDIAN_BOOKKEEPING;
+      else process.env.MERIDIAN_BOOKKEEPING = previousMode;
+    },
   };
 }
