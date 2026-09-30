@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
 import { spawn } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
@@ -43,6 +44,7 @@ interface StoredSidecar {
 const tempRoots: string[] = []
 
 afterEach(async () => {
+  teardownLifecycleBackend()
   await Promise.all(tempRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
@@ -78,6 +80,7 @@ async function makeFixture(sessionId: string): Promise<{
   const configDir = join(root, "config")
   const projectDir = join(root, "project")
   await mkdir(storeDir, { recursive: true })
+  setupLifecycleBackend(storeDir)
   const sdkPath = join(root, "stub-sdk.mjs")
   await writeFile(sdkPath, STUB_SDK_SOURCE, "utf8")
   return {
@@ -121,7 +124,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     expect(JSON.parse(output)).toEqual({ pid: child.pid, bun: null })
   }, 15_000)
 
-  test("runGc drives a retired transcript to deleted through the default fenced child", async () => {
+  legacyLifecycleOnly("reads JSON sidecar state", "runGc drives a retired transcript to deleted through the default fenced child", async () => {
     const fixture = await makeFixture("windows-gc-retired")
     const options = gcOptions(fixture)
     const key = getTranscriptResourceKey(fixture.locator)
@@ -145,7 +148,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     expect(logged.map((entry) => entry.sessionId)).toContain("windows-gc-retired")
   }, 60_000)
 
-  test("runGc tree-kills and joins a timed-out deletion child", async () => {
+  legacyLifecycleOnly("reads JSON sidecar state", "runGc tree-kills and joins a timed-out deletion child", async () => {
     const fixture = await makeFixture("windows-gc-timeout")
     const options = { ...gcOptions(fixture), deletionTimeoutMs: 2_000 }
     const key = getTranscriptResourceKey(fixture.locator)
@@ -173,7 +176,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
   // failure here before the allowance). Either way a loaded Windows host failed
   // every deletion. A budget far below the probe cost must still produce the
   // parent's own kill verdict.
-  test("the child's gate outlives the incarnation probe on a short deletion budget", async () => {
+  legacyLifecycleOnly("reads JSON sidecar state", "the child's gate outlives the incarnation probe on a short deletion budget", async () => {
     const fixture = await makeFixture("windows-gc-timeout")
     const options = { ...gcOptions(fixture), deletionTimeoutMs: 100 }
     const key = getTranscriptResourceKey(fixture.locator)
@@ -189,7 +192,7 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     expect(lastError).not.toContain("exited 75")
   }, 60_000)
 
-  test("the pending backlog drains instead of filling up", async () => {
+  legacyLifecycleOnly("reads JSON sidecar state", "the pending backlog drains instead of filling up", async () => {
     const fixture = await makeFixture("windows-gc-backlog")
     const options = { ...gcOptions(fixture), maxPending: 4 }
 
@@ -220,7 +223,8 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
   // claim forever. POSIX genuinely differs (the group probe waits out
   // surviving group members), so this test is win32-only rather than a win32
   // skip.
-  test.if(process.platform === "win32")(
+  describe.if(process.platform === "win32")("Windows-only recovery", () => {
+  legacyLifecycleOnly("mutates JSON sidecar state",
     "reconcile recovers a deleting claim whose executor pid was reused by a live process",
     async () => {
       const fixture = await makeFixture("windows-gc-reused-pid")
@@ -252,4 +256,5 @@ console.log(JSON.stringify({ pid: process.pid, bun: process.versions.bun ?? null
     },
     60_000,
   )
+  })
 })

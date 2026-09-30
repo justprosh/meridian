@@ -3,7 +3,8 @@ import { initializeSessionBookkeeping, type BookkeepingHandle } from "../../prox
 import { setSessionStoreBackendForTest } from "../../proxy/sessionStore"
 import { sqliteSessionStoreBackend } from "../../proxy/session/bookkeeping/sqliteStoreBackend"
 
-export const sqliteStoreTest = process.env.BOOKKEEPING_TEST_STORE_BACKEND === "sqlite"
+export const sqliteStoreTest = process.env.BOOKKEEPING_TEST_BACKEND === "sqlite"
+  || process.env.BOOKKEEPING_TEST_STORE_BACKEND === "sqlite"
 /** These assertions observe JSON bytes, file replacement or JSON-only child writers. */
 export function legacyStoreOnly(name: string, test: () => void | Promise<void>, timeout?: number): void {
   const suite = sqliteStoreTest ? describe.skip : describe

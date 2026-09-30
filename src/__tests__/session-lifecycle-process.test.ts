@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect } from "bun:test"
+import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
 import { randomUUID } from "node:crypto"
 import { existsSync, readFileSync } from "node:fs"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
@@ -132,6 +133,7 @@ afterEach(async () => {
     Bun.sleep(1_000),
   ])))
   children.clear()
+  teardownLifecycleBackend()
   await Promise.all(tempRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
@@ -223,6 +225,7 @@ async function makeFixture(sessionId: string): Promise<{
 }> {
   const root = await mkdtemp(join(tmpdir(), "meridian-lifecycle-process-"))
   tempRoots.push(root)
+  setupLifecycleBackend(root)
   return {
     root,
     events: join(root, "events.jsonl"),
@@ -245,7 +248,7 @@ function gcOptions(storeDir: string) {
 }
 
 describe("session lifecycle leases across OS processes", () => {
-  test("does not retire or delete a transcript leased by a live writer process", async () => {
+  legacyLifecycleOnly("child writer uses JSON without a backend seam", "does not retire or delete a transcript leased by a live writer process", async () => {
     const fixture = await makeFixture("live-cross-process-writer")
     const worker = spawnLeaseWorker(fixture.root, fixture.locator, "armed")
     const ready = await waitForEvent(fixture.events, "ready")
@@ -287,7 +290,7 @@ describe("session lifecycle leases across OS processes", () => {
     expect(readSidecar(fixture.root).resources[key]?.state).toBe("deleted")
   }, 15_000)
 
-  test("keeps an orphaned real SDK gate fenced until its exact executor exits", async () => {
+  legacyLifecycleOnly("child writer uses JSON without a backend seam", "keeps an orphaned real SDK gate fenced until its exact executor exits", async () => {
     if (process.platform === "win32") return
     const fixture = await makeFixture("crashed-owner-live-gate")
     const worker = spawnLeaseWorker(fixture.root, fixture.locator, "gated-crash")
@@ -331,7 +334,7 @@ describe("session lifecycle leases across OS processes", () => {
     expect(readSidecar(fixture.root).resources[key]?.activeLeases).toBeUndefined()
   }, 15_000)
 
-  test("recovers an unarmed lease after its owner process dies", async () => {
+  legacyLifecycleOnly("child writer uses JSON without a backend seam", "recovers an unarmed lease after its owner process dies", async () => {
     const fixture = await makeFixture("dead-unarmed-writer")
     const worker = spawnLeaseWorker(fixture.root, fixture.locator, "unarmed")
     const ready = await waitForEvent(fixture.events, "ready")
@@ -357,7 +360,7 @@ describe("session lifecycle leases across OS processes", () => {
     expect(readSidecar(fixture.root).resources[key]?.state).toBe("deleted")
   }, 15_000)
 
-  test("classifies a child-reported absent transcript as notFound and tombstones it", async () => {
+  legacyLifecycleOnly("reads JSON sidecar state", "classifies a child-reported absent transcript as notFound and tombstones it", async () => {
     if (process.platform === "win32") return
     const fixture = await makeFixture(randomUUID())
     await prepareFork(fixture.locator, gcOptions(fixture.root))
@@ -369,7 +372,7 @@ describe("session lifecycle leases across OS processes", () => {
       .toBe("deleted")
   }, 20_000)
 
-  test("keeps a genuine child deletion failure failed for retry", async () => {
+  legacyLifecycleOnly("reads JSON sidecar state", "keeps a genuine child deletion failure failed for retry", async () => {
     if (process.platform === "win32") return
     const fixture = await makeFixture("not-a-uuid")
     await prepareFork(fixture.locator, gcOptions(fixture.root))

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -23,6 +24,7 @@ describe("transcript publication lifetime", () => {
 
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), "meridian-publication-lease-"))
+    setupLifecycleBackend(join(directory, "store"))
     deleted = []
     options = {
       storeDir: join(directory, "store"),
@@ -32,7 +34,10 @@ describe("transcript publication lifetime", () => {
     }
   })
 
-  afterEach(() => rmSync(directory, { recursive: true, force: true }))
+  afterEach(() => {
+    teardownLifecycleBackend()
+    rmSync(directory, { recursive: true, force: true })
+  })
 
   for (const stage of ["before SDK", "after SDK", "after commit"] as const) {
     it(`protects an unpublished target from another collector ${stage}`, async () => {
@@ -100,7 +105,7 @@ describe("transcript publication lifetime", () => {
     await abandonFork(target, options)
   })
 
-  it("reclaims an unpublished target after its owning process exits", async () => {
+  legacyLifecycleOnly("child writer uses JSON without a backend seam", "reclaims an unpublished target after its owning process exits", async () => {
     const modulePath = fileURLToPath(new URL("../proxy/sessionLifecycle.ts", import.meta.url))
     const child = Bun.spawn([process.execPath, "--eval", `
       import { prepareForkForPublication } from ${JSON.stringify(modulePath)};

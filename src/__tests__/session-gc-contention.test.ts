@@ -1,4 +1,5 @@
-import { expect, it, spyOn } from "bun:test"
+import { expect, spyOn } from "bun:test"
+import { legacyLifecycleOnly, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
 import * as crypto from "node:crypto"
 import * as fsPromises from "node:fs/promises"
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
@@ -14,11 +15,14 @@ import {
   type TranscriptLocator,
 } from "../proxy/sessionLifecycle"
 
-it.each([false, true])("durably admits 24 simultaneous registrations with a large sidecar (GC=%s)", async withGc => {
+for (const withGc of [false, true]) {
+legacyLifecycleOnly("seeds and inspects JSON sidecar bytes and lock files",
+  `durably admits 24 simultaneous registrations with a large sidecar (GC=${withGc})`, async () => {
   // Given: an isolated real sidecar with 1,400 resources and 800 pinned sessions.
   // macOS may return /var for a directory whose real path is /private/var.
   // Use the same canonical path for fixture keys and lifecycle registrations.
   const storeDir = realpathSync(mkdtempSync(join(tmpdir(), "meridian-gc-contention-")))
+  setupLifecycleBackend(storeDir)
   const locators: TranscriptLocator[] = Array.from({ length: 1_400 }, (_, i) => ({
     sessionId: `synthetic-${i}`,
     configDir: storeDir,
@@ -101,6 +105,8 @@ it.each([false, true])("durably admits 24 simultaneous registrations with a larg
       unlinkSpy.mockRestore()
     }
   } finally {
+    teardownLifecycleBackend()
     rmSync(storeDir, { recursive: true, force: true })
   }
 }, 60_000)
+}
