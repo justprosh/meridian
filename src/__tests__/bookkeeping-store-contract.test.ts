@@ -107,6 +107,31 @@ it("facade lookup sees uncommitted store writes and returns copies, not aliases"
   expect(store.lookupSharedSessionResult("key").status).toBe("missing")
 })
 
+it("never aliases caller-owned store locators or returned lookup/snapshot objects", async () => {
+  await migrate()
+  const locator = { configDir: directory, sessionId: "id" }
+  expect(store.storeSharedSession("key", "id", 1, undefined, ["original"], undefined,
+    undefined, undefined, undefined, undefined, locator)).not.toBe(false)
+  const original = structuredClone(store.readSessionStoreSnapshot())
+  locator.configDir = "/caller-mutated"
+  locator.sessionId = "caller-mutated"
+  expect(store.readSessionStoreSnapshot()).toEqual(original)
+
+  const lookup = store.lookupSharedSessionResult("key")
+  if (lookup.status !== "found") throw new Error("stored mapping not found")
+  lookup.session.currentTranscript!.configDir = "/lookup-mutated"
+  lookup.session.messageHashes![0] = "lookup-mutated"
+  lookup.session.claudeSessionId = "lookup-mutated"
+  expect(store.readSessionStoreSnapshot()).toEqual(original)
+
+  const snapshot = store.readSessionStoreSnapshot()
+  snapshot.key!.currentTranscript!.sessionId = "snapshot-mutated"
+  snapshot.key!.messageHashes!.push("snapshot-mutated")
+  delete snapshot.key
+  expect(store.readSessionStoreSnapshot()).toEqual(original)
+  expect(store.lookupSharedSessionResult("key")).toMatchObject({ status: "found", session: original.key })
+})
+
 it("inspect refuses a reduced experimental schema with corrupt/5 and export guidance", async () => {
   await migrate()
   handle!.close()
