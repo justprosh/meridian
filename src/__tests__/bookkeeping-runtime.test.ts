@@ -67,6 +67,20 @@ it("installs both complete ports and retains the connection until the last owner
   expect(reopened.reader.get("SELECT count(*) AS n FROM mappings")?.n).toBe(1)
 })
 
+it("releases only a nonfinal owner during admission while the last owner retains its guard", async () => {
+  const first = await initializeProxyBookkeeping()
+  const second = retainProxyBookkeeping()
+  if (!first || !second) throw new Error("SQL owners missing")
+  handles.push(first, second)
+  const pending = admitSessionStoreWrite(() => storeSharedSession("active-owner", "sdk"))
+  expect(() => first.close()).not.toThrow()
+  expect(() => second.close()).toThrow("cannot close during transaction/admission")
+  await pending
+  expect(lookupSharedSession("active-owner")?.claudeSessionId).toBe("sdk")
+  second.close()
+  expect(activeStoreBackend()).toBeUndefined()
+})
+
 it("does not import legacy data implicitly and permits only explicit offline migration", async () => {
   process.env.MERIDIAN_BOOKKEEPING = "json"
   storeSharedSession("legacy", "sdk-legacy")

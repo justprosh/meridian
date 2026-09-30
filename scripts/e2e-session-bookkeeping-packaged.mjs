@@ -34,8 +34,8 @@ function install(name, spec) {
   return join(directory, "node_modules", "@rynfar", "meridian")
 }
 const childFile = fileURLToPath(new URL("./fixtures/bookkeeping-package-server.mjs", import.meta.url))
-async function start(packageRoot, sessionDirectory, mode) {
-  const child = fork(childFile, [packageRoot, sessionDirectory, mode], {
+async function start(packageRoot, sessionDirectory, mode, instances = "1") {
+  const child = fork(childFile, [packageRoot, sessionDirectory, mode, instances], {
     env, stdio: ["ignore", "pipe", "pipe", "ipc"],
   })
   children.push(child)
@@ -99,6 +99,11 @@ try {
   assert.equal((await fetch(`${fresh.url}/health`)).status, 200)
   await usage(fresh.url, 404)
   await stop(fresh.child)
+  for (const sharedDirectory of ["default", join(root, "explicit-two")]) {
+    const two = await start(candidate, sharedDirectory, "sqlite", "2")
+    assert.equal((await fetch(`${two.url}/health`)).status, 200)
+    await stop(two.child)
+  }
   console.log(JSON.stringify({ verdict: "PASS", node: process.version, platform: process.platform,
     architecture: process.arch, surface: "packaged runtime, migration, two HTTP processes, restart, export and baseline read",
     liveSdk: false }))

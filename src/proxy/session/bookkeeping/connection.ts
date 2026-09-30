@@ -415,7 +415,10 @@ export function openHandle(
     },
     close() {
       if (!owned) return
-      if (owned.scope || owned.pending) throw new Error("cannot close during transaction/admission")
+      // Releasing a nonfinal owner never closes SQLite or drops its maintenance
+      // guard. Only the final owner must wait for every scope/admission to join.
+      if (owned.refs === 1 && (owned.scope || owned.pending))
+        throw new Error("cannot close during transaction/admission")
       const closing = owned
       owned = undefined
       if (--closing.refs === 0) {
