@@ -161,8 +161,8 @@ inspection uses `withBookkeepingRead` and the implementation's `readResource`.
 
 Native BEGIN/COMMIT and critical-section metrics are observed through the existing
 initialization `executeTransaction` option, forwarding `native.exec(sql)` exactly
-once. Counts cover successful write transactions only. Admission wait and busy
-attempts remain **null** until a production observer exists: no AST rewriting,
+once. Timings cover successful writes; native BEGIN attempts and BUSY/LOCKED refusals
+are counted directly. Admission wait remains **null** until a production observer exists: no AST rewriting,
 alternate SQL implementation or guessed counts. This observation gap blocks full
 acceptance. Pragmas are read back and checked before timing.
 

@@ -4,7 +4,7 @@ Graph: r161 #200, #202, #206, #213. This is a harness handoff, not full performa
 
 |Observation|Outcome|Limit|
 |---|---|---|
-|Node22 harness command `node scripts/bench-bookkeeping.test.mjs`|13 passed, 0 failed|Author-run, cold verdict still required|
+|Node22 harness command `node scripts/bench-bookkeeping.test.mjs`|14 passed locally; prior 13-test revision also passed on Linux|Author-run, cold verdict still required|
 |Linux runner shell syntax and branch diff whitespace check|exit 0|No Linux execution inferred|
 |Canonical Bun-built SQL adapter on pre-activation candidate `58d45d2`|exit 1: `Production store facade is not activated`|Diagnostic dirty candidate, deliberately not accepted as SQL performance evidence|
 |Paired production-sized runs and ten-minute K20 soaks|NOT_ESTABLISHED|Await exact clean production activation candidate and exclusive measurement window|
@@ -34,7 +34,8 @@ and deletion workloads are required in each sequentially paired backend run.
 
 Native transaction observation forwards the existing executeTransaction option
 once to native.exec; it does not alter rollback or uncertain COMMIT handling.
-Admission-wait and busy-attempt observation is still unavailable and reported null.
+Admission wait is still unavailable and reported null; native BEGIN attempts and
+BUSY/LOCKED failures are observed directly, without guessing a zero.
 GC service/intake uses an explicit 20% margin and records the measurement/drain
 windows. `--gc-sdk real` is available for Linux evidence with physical file/tombstone
 proof, while simulated results never establish real deletion throughput.

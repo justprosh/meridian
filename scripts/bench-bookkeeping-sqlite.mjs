@@ -11,6 +11,7 @@ export async function sqliteAdapter(artifact, root, common) {
   const load = name => import(pathToFileURL(join(artifact, `src/proxy/session/bookkeeping/${name}.js`)).href);
   const db = await load('database'), migration = await load('migration'), resources = await load('resources'), mappings = await load('mappings');
   const runtime = await load('runtime'), previousMode = process.env.MERIDIAN_BOOKKEEPING;
+  const previousDirectory = process.env.MERIDIAN_SESSION_DIR;
   requireFunctions(db, ['initializeSessionBookkeeping', 'withBookkeepingRead', 'checkpointBookkeeping'], 'SQLite engine');
   requireFunctions(migration, ['migrateBookkeeping'], 'SQLite migration');
   requireFunctions(resources, ['readResource'], 'SQLite resource projection');
@@ -18,9 +19,10 @@ export async function sqliteAdapter(artifact, root, common) {
   requireFunctions(runtime, ['initializeProxyBookkeeping'], 'Production SQLite startup');
   const { L, S } = common;
   let handle, runtimeHandle, fixture, pragmas;
-  let transactions = [], pending;
+  let transactions = [], pending, beginAttempts = 0, busyAttempts = 0;
   const executeTransaction = (native, sql) => {
     const start = performance.now();
+    if (sql === 'BEGIN IMMEDIATE') beginAttempts++;
     try {
       native.exec(sql);
       if (sql === 'BEGIN IMMEDIATE') pending = { beginMs: performance.now() - start, beganAt: start };
@@ -28,7 +30,10 @@ export async function sqliteAdapter(artifact, root, common) {
         transactions.push({ ...pending, commitMs: performance.now() - start,
           criticalSectionMs: performance.now() - pending.beganAt }); pending = undefined;
       } else if (sql === 'ROLLBACK') pending = undefined;
-    } catch (error) { pending = undefined; throw error; }
+    } catch (error) {
+      if (sql === 'BEGIN IMMEDIATE' && /^(SQLITE_BUSY|SQLITE_LOCKED)(_|$)/.test(error.code ?? '')) busyAttempts++;
+      pending = undefined; throw error;
+    }
   };
   const read = callback => db.withBookkeepingRead(root, callback);
   const rows = () => read(r => r.all('SELECT key FROM resources').map(({ key }) => resources.readResource(r, key)));
@@ -47,6 +52,7 @@ export async function sqliteAdapter(artifact, root, common) {
       }
       handle = db.initializeSessionBookkeeping(root, { executeTransaction });
       process.env.MERIDIAN_BOOKKEEPING = 'sqlite';
+      process.env.MERIDIAN_SESSION_DIR = root;
       runtimeHandle = await runtime.initializeProxyBookkeeping();
       if (!runtimeHandle) throw Error('Production SQLite startup returned no handle');
       pragmas = read(r => Object.fromEntries(['journal_mode', 'synchronous', 'foreign_keys',
@@ -82,11 +88,11 @@ export async function sqliteAdapter(artifact, root, common) {
     inspect: () => { noLegacy(); return projection(rows(), Object.values(snapshot())); },
     sizes: () => Object.fromEntries(['session-bookkeeping.sqlite', 'session-bookkeeping.sqlite-wal',
       'session-bookkeeping.sqlite-shm'].map(name => [name, existsSync(join(root, name)) ? statSync(join(root, name)).size : 0])),
-    resetMetrics: () => { transactions = []; pending = undefined; },
+    resetMetrics: () => { transactions = []; pending = undefined; beginAttempts = 0; busyAttempts = 0; },
     metrics: () => ({ begin: summary(transactions.map(t => t.beginMs)),
       commit: summary(transactions.map(t => t.commitMs)),
       criticalSectionMs: summary(transactions.map(t => t.criticalSectionMs)),
-      queueWaitMs: null, busyAttempts: null, checkpoint: null, pragmas,
+      queueWaitMs: null, beginAttempts, busyAttempts, checkpoint: null, pragmas,
       observer: 'initializeSessionBookkeeping executeTransaction; native exec forwarded once; successful writes only' }),
     checkpoint: () => db.checkpointBookkeeping(root),
     assert(expected) {
@@ -104,6 +110,8 @@ export async function sqliteAdapter(artifact, root, common) {
       runtimeHandle?.close(); handle?.close(); S.setSessionStoreDir(null);
       if (previousMode === undefined) delete process.env.MERIDIAN_BOOKKEEPING;
       else process.env.MERIDIAN_BOOKKEEPING = previousMode;
+      if (previousDirectory === undefined) delete process.env.MERIDIAN_SESSION_DIR;
+      else process.env.MERIDIAN_SESSION_DIR = previousDirectory;
     },
   };
 }

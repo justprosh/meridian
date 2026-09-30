@@ -10,7 +10,7 @@ for (const name of ['matrix.json', 'plan.json', 'environment.json', 'SHA256SUMS.
 const artifacts = [];
 const visit = dir => {
   for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === 'archive-manifest.json') continue;
+    if (name === 'node_modules' || name === 'archive-manifest.json' || name.startsWith('fixture-')) continue;
     const file = join(dir, name), st = statSync(file);
     if (st.isDirectory()) visit(file);
     else artifacts.push({ path: file.slice(root.length + 1), bytes: st.size,
@@ -23,7 +23,7 @@ const manifest = { format: 1, syntheticOnly: true, createdAt: new Date().toISOSt
   privacy: 'No environment dump, real transcripts, credentials, production install tarball or dependencies included', artifacts };
 writeFileSync(join(root, 'archive-manifest.json'), JSON.stringify(manifest, null, 2));
 const archive = `${root}.tar.gz`;
-execFileSync('tar', ['--exclude=node_modules', '-czf', archive, '-C', dirname(root), basename(root)]);
+execFileSync('tar', ['--exclude=node_modules', '--exclude=fixture-*', '-czf', archive, '-C', dirname(root), basename(root)]);
 const digest = createHash('sha256').update(readFileSync(archive)).digest('hex');
 writeFileSync(`${archive}.sha256`, `${digest}  ${basename(archive)}\n`);
 console.log(JSON.stringify({ archive, sha256: digest, archiveUrl: null, retention: null }));

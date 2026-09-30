@@ -12,13 +12,14 @@ export async function runCase(c, artifact, evidence) {
   process.env.MERIDIAN_MAX_STORED_SESSIONS = '20000';
   process.env.MERIDIAN_CONFIG_DIR = join(root, 'config');
   process.env.MERIDIAN_TELEMETRY_PERSIST = '0';
-  let adapter;
+  let adapter, result;
   try {
     adapter = await openAdapter(artifact, c.backend, root);
-    await retainedHandle(() => workload(c, adapter, root, evidence));
+    result = await retainedHandle(() => workload(c, adapter, root, evidence));
   } finally {
     adapter?.close();
-    rmSync(root, { recursive: true, force: true });
+    // Failed/unjoined execution retains its durable fences for diagnosis, never erases them.
+    if (result?.complete) rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -39,7 +40,7 @@ async function workload(c, adapter, root, evidence) {
   const errors = [], overheads = [], latencies = [], sdkElapsed = [], gcRuns = [], gcErrors = [], timeline = [];
   adapter.resetMetrics?.();
   const loop = armedLoopProbe();
-  let gcRunning, attempted = 0, elapsed;
+  let gcRunning, attempted = 0, elapsed, unjoinedExecutors = 0;
   // Synthetic deletion target: no transcript content, credentials, or real SDK invocation.
   const sdkStub = join(root, 'gc-stub.mjs');
   writeFileSync(sdkStub, 'export async function deleteSession(){await new Promise(r=>setTimeout(r,2000));}\n');
@@ -104,7 +105,7 @@ async function workload(c, adapter, root, evidence) {
     } catch (error) {
       errors.push({ name: error.constructor.name, message: error.message, latencyMs: performance.now() - start });
     } finally {
-      if (gate) await gate.closeAndJoin();
+      if (gate && !await gate.closeAndJoin()) { unjoinedExecutors++; lease = undefined; }
       if (lease) await L.releaseJoinedTranscriptLease(lease, opts);
       active.delete(chat);
     }
@@ -133,15 +134,17 @@ async function workload(c, adapter, root, evidence) {
   const drainedAt = performance.now() - started;
   const gcService = deletionService(gcRuns, overheads.length, elapsed, drainedAt, { gc: c.gc, realSdk: !!physical });
   const result = { ...c, measuredAt, finishedAt: new Date().toISOString(),
-    complete: !errors.length && !gcErrors.length && !gcRuns.some(r => r.failed > 0),
+    complete: !errors.length && !gcErrors.length && !gcRuns.some(r => r.failed > 0)
+      && !unjoinedExecutors && !(after.states.deleting > 0),
     ok: overheads.length, attempted, errors,
     failed: errors.length, overhead: summary(overheads), latency: summary(latencies), sdkElapsed: summary(sdkElapsed),
     elapsedMs: elapsed, throughput: overheads.length / (elapsed / 1000), loop: loopMetrics,
     before, after, sizesBefore, sizesAfter: adapter.sizes(), timeline,
     metrics: { ...transactionMetrics, checkpoint }, gcRuns, gcErrors, gcService,
-    sdkFilesystem: physical?.assert(expected, gcRuns, adapter.pins()) ?? null,
+    sdkFilesystem: physical?.assert(expected, gcRuns, adapter.pins()) ?? null, unjoinedExecutors,
     assertions: { expectedMappings: expected.size, lostMappings: 0, observedAba: 0, unsafeDeletion: 0 },
     measurementWindow: 'latency/throughput exclude final GC drain; loop/timeline include drain' };
   writeFileSync(join(evidence, `${c.id}.json`), JSON.stringify(result, null, 2));
   if (!result.complete) process.exitCode = 1;
+  return result;
 }

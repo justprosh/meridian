@@ -10,6 +10,7 @@ import { requireFunctions, openAdapter } from './bench-bookkeeping-adapter.mjs';
 import { buildArtifact } from './bench-bookkeeping-build.mjs';
 import { renderReport } from './bench-bookkeeping-report.mjs';
 import './bench-bookkeeping-acceptance.test.mjs';
+import './bench-bookkeeping-cleanup.test.mjs';
 
 const evidence = resolve('.evidence/bench-harden/tests');
 mkdirSync(evidence, { recursive: true });
