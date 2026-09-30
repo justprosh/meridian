@@ -1,6 +1,6 @@
 /** Explicit offline format transition; never called by request-path initialization. */
 import { randomUUID } from "node:crypto"
-import { existsSync, linkSync, readFileSync, statfsSync, unlinkSync } from "node:fs"
+import { existsSync, linkSync, lstatSync, readFileSync, statfsSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { withLegacyLifecycleMaintenanceLock } from "../../sessionLifecycle"
 import { withLegacyStoreMaintenanceLock } from "../../sessionStore"
@@ -23,12 +23,14 @@ import { archivePreviousCycle } from "./cycles"
 import { archiveResidues, planResidueArchive } from "./residueArchive"
 import type { ArchivedResidue } from "./residueTypes"
 import { refuseUnjournaledDatabase } from "./maintenancePreflight"
+import { resumeRetirements, retireFile } from "./privateRetirement"
 
 export interface MigrationOptions {
   /** Operator attestation, not something inferred from a quiet lease table. */
   writersStopped: boolean
   /** Test seam for the storage boundary, not an override for the required space. */
   availableBytes?: (directory: string) => number
+  afterPreflightForTest?: () => void
 }
 export interface MigrationResult {
   id: string; phase: "READY"; resources: number; mappings: number; residues: ArchivedResidue[]
@@ -54,7 +56,7 @@ function sources(directory: string, journal?: MigrationJournal) {
   return observations
 }
 
-function archiveSource(directory: string, name: SourceName, expected: string | null): void {
+function archiveSource(directory: string, name: SourceName, expected: string | null, id: string): void {
   const source = join(directory, name)
   const backup = join(directory, name.slice(0, -5) + ".migrated.json")
   if (expected === null) {
@@ -74,9 +76,8 @@ function archiveSource(directory: string, name: SourceName, expected: string | n
   }
   if (existsSync(source)) {
     if (digestBytes(readFileSync(source, "utf8")) !== expected) throw new Error(`source digest mismatch: ${name}`)
-    unlinkSync(source)
-    syncDirectoryDurablySync(directory)
   }
+  retireFile(source, id, lstatSync(backup))
   crashPoint(`backup:${name}`)
 }
 
@@ -135,7 +136,7 @@ function importOrResume(directory: string, journal: MigrationJournal, guard: Mai
       journal.phase = "IMPORTED"
       saveJournal(directory, journal)
       crashPoint("IMPORTED")
-      for (const source of journal.finalSources!) archiveSource(directory, source.path, source.digest)
+      for (const source of journal.finalSources!) archiveSource(directory, source.path, source.digest, journal.id)
       journal.phase = "READY"
       saveJournal(directory, journal)
       crashPoint("READY")
@@ -151,9 +152,11 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
     )
   }
   refuseUnjournaledDatabase(input)
+  options.afterPreflightForTest?.()
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
+    resumeRetirements(directory)
     archivePreviousCycle(directory)
     if (existsSync(join(directory, EXPORT_JOURNAL_NAME))) {
       throw new BookkeepingMaintenanceRequiredError("export journal exists; resume export-json")
@@ -163,6 +166,11 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
       throw new BookkeepingMaintenanceRequiredError("migration aborted; finish abort-migration before any new transition")
     }
     if (!journal && existsSync(join(directory, BOOKKEEPING_FILENAME))) {
+      if (guard.createdIdentity) {
+        const identity = guard.createdIdentity
+        guard.close()
+        retireFile(guard.path, randomUUID(), identity)
+      }
       throw new BookkeepingMaintenanceRequiredError("database without migration journal; refuse implicit adoption")
     }
     const residues = journal ? journal.residues ?? [] : planResidueArchive(directory)

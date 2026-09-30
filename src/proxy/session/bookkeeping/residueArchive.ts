@@ -1,4 +1,4 @@
-import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, unlinkSync } from "node:fs"
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { fileIdentity, verifyFile } from "./exportJournal"
@@ -7,6 +7,7 @@ import { archiveIncompleteDirectory } from "./residueDirectory"
 import { candidateVerdict, inspectArtifacts } from "./residueInventory"
 import type { ArchivedResidue } from "./residueTypes"
 import { BookkeepingMaintenanceRequiredError, ownedFd } from "./storagePaths"
+import { retireFile } from "./privateRetirement"
 
 /** Called only under maintenance ownership and explicit operator stop/drain attestation. */
 export function planResidueArchive(directory: string): ArchivedResidue[] {
@@ -43,7 +44,7 @@ export function archiveResidues(directory: string, id: string, residues: Archive
     closeSync(ownedFd(parent, true))
     syncDirectoryDurablySync(dirname(parent))
     if (row.kind === "incomplete-candidate") {
-      archiveIncompleteDirectory(source, target, row)
+      archiveIncompleteDirectory(directory, source, target, row, id)
       crashPoint(`residue:moved:${row.path}`)
       continue
     }
@@ -65,10 +66,7 @@ export function archiveResidues(directory: string, id: string, residues: Archive
     verifyFile(archive, row.path, expected)
     const archived = lstatSync(target)
     if (archived.dev !== row.dev || archived.ino !== row.ino) throw new Error(`foreign residue archive: ${row.path}`)
-    if (existsSync(source)) {
-      unlinkSync(source)
-      syncDirectoryDurablySync(dirname(source))
-    }
+    retireFile(source, id, row)
     crashPoint(`residue:moved:${row.path}`)
   }
 }

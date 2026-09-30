@@ -26,7 +26,7 @@ it("never overwrites an occupied private release name", () => {
   const { directory, id, path } = setup()
   let privatePath = ""
   try {
-    assertRefusal(() => releaseOwnBarrier(directory, "sessions.json", id, { beforeLink: (target) => {
+    assertRefusal(() => releaseOwnBarrier(directory, "sessions.json", id, { beforeRename: (target) => {
       privatePath = target
       expect(readJournal(directory)?.releases?.["sessions.json"]?.name).toBe(target.slice(directory.length + 1))
       writeFileSync(target, "foreign", { mode: 0o600 })
@@ -38,10 +38,10 @@ it("never overwrites an occupied private release name", () => {
   } finally { rmSync(directory, { recursive: true, force: true }) }
 })
 
-for (const hook of ["beforeLink", "afterLink"] as const) it(`preserves replacement at ${hook}`, () => {
+it("restores the file substituted between descriptor check and rename", () => {
   const { directory, id, path } = setup()
   try {
-    assertRefusal(() => releaseOwnBarrier(directory, "sessions.json", id, { [hook]: () => {
+    assertRefusal(() => releaseOwnBarrier(directory, "sessions.json", id, { beforeRename: () => {
       renameSync(path, path + ".original")
       writeFileSync(path, "foreign", { mode: 0o600 })
     } }))
@@ -60,18 +60,30 @@ it("refuses a foreign public barrier before recording an intent", () => {
   } finally { rmSync(directory, { recursive: true, force: true }) }
 })
 
-it("resume leaves a replacement public inode alone and drops only our private link", () => {
+it("resume leaves a replacement public inode alone and retains the private capture", () => {
   const { directory, id, path } = setup()
   let privatePath = ""
   try {
-    expect(() => releaseOwnBarrier(directory, "sessions.json", id, { afterLink: (target) => {
+    expect(() => releaseOwnBarrier(directory, "sessions.json", id, { afterRename: (target) => {
       privatePath = target
-      throw new Error("interrupt after link")
-    } })).toThrow("interrupt after link")
-    renameSync(path, path + ".original")
+      throw new Error("interrupt after rename")
+    } })).toThrow("interrupt after rename")
     writeFileSync(path, "foreign", { mode: 0o600 })
     assertRefusal(() => releaseOwnBarrier(directory, "sessions.json", id))
     expect(readFileSync(path, "utf8")).toBe("foreign")
-    expect(existsSync(privatePath)).toBe(false)
+    expect(existsSync(privatePath)).toBe(true)
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+it("occupied restoration name preserves both the captured foreign file and the new public file", () => {
+  const { directory, id, path } = setup()
+  let privatePath = ""
+  try {
+    assertRefusal(() => releaseOwnBarrier(directory, "sessions.json", id, {
+      beforeRename: () => { renameSync(path, path + ".original"); writeFileSync(path, "foreign moved") },
+      afterRename: (target) => { privatePath = target; writeFileSync(path, "foreign public") },
+    }))
+    expect(readFileSync(privatePath, "utf8")).toBe("foreign moved")
+    expect(readFileSync(path, "utf8")).toBe("foreign public")
   } finally { rmSync(directory, { recursive: true, force: true }) }
 })

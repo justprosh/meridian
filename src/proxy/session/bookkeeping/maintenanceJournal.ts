@@ -1,13 +1,14 @@
 import { randomUUID, createHash } from "node:crypto"
 import {
   closeSync, constants, existsSync, fsyncSync, fstatSync, openSync, readFileSync, renameSync,
-  unlinkSync, writeFileSync,
+  writeFileSync,
 } from "node:fs"
 import { dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { errorCode, ownedFd } from "./storagePaths"
 import { validResidues } from "./residueTypes"
 import type { ArchivedResidue } from "./residueTypes"
+import { privateName, unlinkPrivate } from "./privateNames"
 
 export const JOURNAL_NAME = "session-bookkeeping-migration.json"
 export const SOURCE_NAMES = ["session-gc.json", "sessions.json"] as const
@@ -36,7 +37,7 @@ export const digestBytes = (value: string) => createHash("sha256").update(value)
 
 /** Atomic file publication; callers hold the exclusive maintenance guard. */
 export function writeDurably(path: string, value: string): void {
-  const temporary = `${path}.write-${randomUUID()}`
+  const temporary = privateName(path + ".write", randomUUID())
   const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
   try {
     writeFileSync(fd, value)
@@ -48,7 +49,7 @@ export function writeDurably(path: string, value: string): void {
     renameSync(temporary, path)
     syncDirectoryDurablySync(dirname(path))
   } finally {
-    try { unlinkSync(temporary) } catch (error) {
+    try { unlinkPrivate(temporary) } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error
     }
   }

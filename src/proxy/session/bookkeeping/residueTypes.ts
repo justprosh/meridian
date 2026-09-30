@@ -1,6 +1,8 @@
 export type ResidueVerdict = "dead-incarnation" | "live" | "unknown"
 export interface Residue { path: string; verdict: ResidueVerdict; kind?: "incomplete-candidate" }
-export interface ArchivedResidue extends Residue { digest: string; bytes: number; dev: number; ino: number }
+export interface ArchivedResidue extends Residue {
+  digest: string; bytes: number; dev: number; ino: number; archiveName?: string
+}
 
 export function isResiduePath(path: string): boolean {
   return /^(session-gc|sessions)\.json\.lock[^/]*\.candidate-[^/]+$/.test(path)
@@ -15,6 +17,9 @@ export function validResidues(value: unknown): value is ArchivedResidue[] {
       return typeof row.path === "string" && isResiduePath(row.path) && !row.path.endsWith("/.")
         && ["dead-incarnation", "unknown"].includes(String(row.verdict))
         && (row.kind === undefined || row.kind === "incomplete-candidate" && row.verdict === "unknown")
+        && (row.archiveName === undefined || row.kind === "incomplete-candidate"
+          && typeof row.archiveName === "string" && row.archiveName.startsWith(`${row.path}.residue.releasing-`)
+          && /^[a-f0-9-]{73}$/.test(row.archiveName.slice(`${row.path}.residue.releasing-`.length)))
         && typeof row.digest === "string" && /^[a-f0-9]{64}$/.test(row.digest)
         && [row.bytes, row.dev, row.ino].every((v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0)
     })

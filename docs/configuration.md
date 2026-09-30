@@ -789,25 +789,38 @@ Gate files do not persist an incarnation, so their verdict is `unknown`, never i
 `temporary` lists empty `session-gc.json.tmp-<pid>-<uuid>` files (interrupted legacy atomic writes).
 `turn-locks/` is outside bookkeeping and is neither listed nor moved.
 An empty directory candidate lacking `owner.json` is `unknown` with `kind: "incomplete-candidate"`,
-not corruption. Its archive is a directory containing `.bookkeeping-residue.json` with the original
-empty directory's identity. Removal uses `rmdir` only after that manifest is durable; populated/inode-changed
-sources are refused. An interrupted archive directory without its manifest is ambiguous: migration refuses
-without removing the original, rather than adopting a foreign directory.
+not corruption. Its original inode is captured by rename into a fresh UUID name under `residue/`, recorded
+as `archiveName` in the migration journal before the move. An adjacent `<private-name>.manifest.json`
+records source, private path, before/after device and inode, reason, and time. No source rmdir is used.
+If identity differs after capture, the directory stays private and exit 5 names its location and manifest:
+**nothing was deleted**. The operator must inspect it. There is deliberately no automatic directory rename
+back to a public name: POSIX rename could overwrite a newly occupied empty directory. A nonempty source
+observed before capture is refused without moving it.
 
 For `migrate --writers-stopped`, the operator attests that all proxies **and SDK/deletion children**
 have stopped. Under that attestation, unknown/dead residues are moved, not deleted, to
 `bookkeeping-cycles/<migration_id>/residue/<relative-path>`. The PREPARED migration journal records
 `residues` (path, verdict, SHA256, bytes, device/inode); the command returns the same list in
-`result.residues`. Link/fsync/unlink steps are resumable and never overwrite a foreign archive inode.
+`result.residues`. File archival uses no-clobber links followed by journaled private capture of the source;
+only that private name is deleted. Directory archival preserves the directory rather than copying/removing it.
 A live candidate refuses migration with its address (3 from legacy; 4 if barriers are already active).
 Other maintenance commands do not accept unknown candidates/gates. An already-ready CLI migrate is a
 no-op and does not archive newly appeared residues. The current cycle's residue directory does not count
 as an archived cycle. Inspection alone only reports residues, without applying the operator attestation.
-Barrier release records a random private name and the barrier inode in the migration journal **before**
-linking `<source>.lock.releasing-<migration_id>-<uuid>`. Exclusive link creation never overwrites a foreign
-private name. Resume accepts only the journaled inode; a replacement public inode is left intact and
-returns 5. A foreign SQLite database without a migration journal refuses migration with 3 before guard
-creation or any other write to the directory.
+**Deletion invariant:** bookkeeping never calls unlink/rmdir on a public name. Every retirement first
+records a fresh private UUID name and observed identity durably, captures the public name by rename, and
+checks the captured inode. Only `PrivatePath` capabilities reach the deletion wrappers. Barrier intent
+lives in the migration journal; other file retirements have private `.deletion-intent.releasing-*` journals.
+If the captured file is foreign, restoration uses link (never overwrite): EEXIST leaves the private file
+intact and returns 5. Resume accepts the recorded identity; a missing capture with the original still public
+starts a new capture with a new UUID. The accepted POSIX limit is that another process cannot name a newly
+generated private UUID; the stop/drain attestation excludes live coordinators. Directory mismatch is
+fail-closed without automatic restoration, at the operator's explicitly accepted recovery cost.
+A foreign SQLite database without a migration journal refuses migration with 3 before guard creation.
+If it appears between preflight and guard acquisition, the operation releases its lease and retires only
+the guard inode it published itself, leaving the foreign main/WAL/SHM untouched. A pre-existing guard is
+not adopted as disposable. Ordinary durable journal publication remains the metadata-write protocol;
+the invariant above governs file retirement and restoration, not disabling journal updates.
 Inspection never repairs permissions or bootstraps a missing guard. WAL without SHM requires offline recovery
 rather than creating SHM during inspection. Without `--json`, output is indented for human reading.
 

@@ -8,12 +8,14 @@ import {
 } from "./maintenanceJournal"
 import { releaseOwnBarrier } from "./barrier"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
+import { resumeRetirements } from "./privateRetirement"
 
 /** Only the pre-database BARRIERS failure is reversible without exporting SQLite authority. */
 export function abortBookkeepingMigration(input: string): void {
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
+    resumeRetirements(directory)
     const journal = readJournal(directory)
     if (!journal || !["BARRIERS", "ABORTING", "ABORTED"].includes(journal.phase)) {
       throw new BookkeepingMaintenanceRequiredError("abort requires a BARRIERS migration journal")

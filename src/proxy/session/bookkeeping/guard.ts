@@ -5,6 +5,7 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
@@ -36,6 +37,8 @@ export interface GuardLease {
   close(): void
 }
 export interface MaintenanceGuardLease extends GuardLease {
+  /** Present only when this call exclusively published the guard inode. */
+  readonly createdIdentity?: { dev: number; ino: number }
   /** The state recheck runs only after a NEW shared lock was obtained. */
   toShared(verifyBackend: () => void, afterExclusiveCommitForTest?: () => void): GuardLease
 }
@@ -112,7 +115,7 @@ function validate(db: Database.Database): number {
   return row.epoch
 }
 
-function bootstrap(path: string): void {
+function bootstrap(path: string): { dev: number; ino: number } | undefined {
   cleanupBootstrapOrphans(path)
   if (existsSync(path)) return
   const temporary = createBootstrapPath(path)
@@ -147,6 +150,8 @@ function bootstrap(path: string): void {
     }
     try {
       linkSync(temporary, path)
+      const published = lstatSync(temporary)
+      return { dev: published.dev, ino: published.ino }
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error
     }
@@ -201,8 +206,9 @@ function openGuard(directory: string, mode: State["mode"]): MaintenanceGuardLeas
   if (existing && (mode !== "shared" || existing.mode !== "shared")) {
     throw new BookkeepingGuardBusyError("maintenance guard is held; stop all proxies before maintenance")
   }
+  let createdIdentity: { dev: number; ino: number } | undefined
   if (!existing) {
-    bootstrap(path)
+    createdIdentity = bootstrap(path)
     checkFiles(path)
   }
   let db: Database.Database | undefined
@@ -224,6 +230,7 @@ function openGuard(directory: string, mode: State["mode"]): MaintenanceGuardLeas
     const shared = state
     const lease: MaintenanceGuardLease = {
       path,
+      ...(createdIdentity ? { createdIdentity } : {}),
       get mode() {
         return shared.mode
       },

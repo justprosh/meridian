@@ -17,6 +17,7 @@ import { releaseOwnBarrier } from "./barrier"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { assertQuiescent } from "./migrationImport"
 import { parseLegacySidecar } from "./legacyCodec"
+import { resumeRetirements } from "./privateRetirement"
 
 const stageName = (journal: ExportJournal, name: string) => `${name}.export-${journal.id}`
 
@@ -24,6 +25,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
+    resumeRetirements(directory)
     const migration = readJournal(directory)
     if (migration?.phase !== "READY") {
       throw new BookkeepingMaintenanceRequiredError("export requires a READY migration journal")
@@ -75,7 +77,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
         }
         if (journal.phase === "STAGED") {
           for (const file of journal.documents) {
-            moveExportFile(directory, stageName(journal, file.name), file.name, file)
+            moveExportFile(directory, stageName(journal, file.name), file.name, file, journal.migrationId)
           }
           verifyInstalled(directory, journal)
           saveExportJournal(directory, journal, "INSTALLED")
@@ -99,7 +101,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
     if (journal.phase === "CHECKPOINTED") {
       verifyInstalled(directory, journal)
       for (const file of journal.archive!) {
-        moveExportFile(directory, file.name, `${file.name}.exported-${journal.id}`, file)
+        moveExportFile(directory, file.name, `${file.name}.exported-${journal.id}`, file, journal.migrationId)
       }
       saveExportJournal(directory, journal, "ARCHIVED")
     }

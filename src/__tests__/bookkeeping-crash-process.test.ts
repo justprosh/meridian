@@ -93,7 +93,7 @@ function seed(directory: string, sidecarVersion: number, storeVersion: number) {
 const migrationPoints = ["PREPARED", "barrier:session-gc.json", "barrier:sessions.json", "BARRIERS",
   "database-prepared", "before-import-commit", "after-import-commit", "IMPORTED",
   "backup-linked:session-gc.json", "backup:session-gc.json", "backup-linked:sessions.json", "backup:sessions.json",
-  "READY"]
+  "READY", "retire:intent:sessions.json", "retire:captured:sessions.json", "retire:deleted:sessions.json"]
 const exportPoints = ["PREPARED", "staged:session-gc.json", "staged:sessions.json", "STAGED",
   "linked:session-gc.json", "moved:session-gc.json", "linked:sessions.json", "moved:sessions.json", "INSTALLED",
   "checkpoint", "closed", "CHECKPOINTED", "linked:session-bookkeeping.sqlite", "moved:session-bookkeeping.sqlite",
@@ -101,7 +101,7 @@ const exportPoints = ["PREPARED", "staged:session-gc.json", "staged:sessions.jso
   "linked:session-bookkeeping.sqlite-shm", "moved:session-bookkeeping.sqlite-shm",
   "ARCHIVED", "EXPORTED", "released:session-gc.json", "released:sessions.json",
   "barrier:intent:session-gc.json", "barrier:intent:sessions.json",
-  "barrier:linked:session-gc.json", "barrier:linked:sessions.json",
+  "barrier:captured:session-gc.json", "barrier:captured:sessions.json",
   "barrier:releasing:session-gc.json", "barrier:releasing:sessions.json"]
 
 for (const sidecarVersion of [1, 2] as const) for (const storeVersion of [1, 3]) {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import {
-  closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync,
+  closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, writeFileSync,
 } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import {
@@ -8,6 +8,7 @@ import {
 } from "../processIncarnation"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { errorCode } from "./storagePaths"
+import { resumeFileRetirement, retireBootstrapAlias, retireFile } from "./privateRetirement"
 
 /** Identity is durable before the temporary SQLite inode can exist. */
 export function createBootstrapPath(path: string): string {
@@ -27,7 +28,7 @@ export function createBootstrapPath(path: string): string {
 
 function unlinkIfPresent(path: string): void {
   try {
-    unlinkSync(path)
+    retireFile(path, randomUUID())
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error
   }
@@ -68,9 +69,11 @@ export function cleanupBootstrapOrphans(path: string): void {
             throw new Error(`foreign bootstrap hardlink: ${candidate}`)
           }
         }
-        unlinkSync(candidate)
+        if (stat.nlink === 2) retireBootstrapAlias(candidate, randomUUID(), stat)
+        else retireFile(candidate, randomUUID(), stat)
       } catch (error) {
         if (errorCode(error) !== "ENOENT") throw error
+        resumeFileRetirement(candidate)
       }
     }
     unlinkIfPresent(ownerPath)

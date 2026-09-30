@@ -1,78 +1,60 @@
-import { randomUUID } from "node:crypto"
-import { closeSync, constants, fstatSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync } from "node:fs"
-import { join } from "node:path"
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, renameSync } from "node:fs"
+import { basename, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { barrierBytes, crashPoint, readJournal, saveJournal } from "./maintenanceJournal"
 import type { SourceName } from "./maintenanceJournal"
-import { errorCode } from "./storagePaths"
+import { privateName, unlinkPrivate } from "./privateNames"
+import type { PrivatePath } from "./privateNames"
+import { PrivateIdentityError, restoreCapturedFile, sameInode } from "./privateRetirement"
 
-export class BookkeepingBarrierReplacedError extends Error { readonly exitCode = 5 }
+export { PrivateIdentityError as BookkeepingBarrierReplacedError } from "./privateRetirement"
 export interface BarrierReleaseHooks {
-  beforeLink?: (privatePath: string) => void
-  afterLink?: (privatePath: string) => void
-}
-function present(path: string): boolean {
-  try { lstatSync(path); return true } catch (error) {
-    if (errorCode(error) === "ENOENT") return false
-    throw error
-  }
+  beforeRename?: (privatePath: PrivatePath) => void
+  afterRename?: (privatePath: PrivatePath) => void
 }
 
-/** Exclusive maintenance ownership; durable intent precedes no-clobber publication. */
+/** Public names are captured, never unlinked. Only the durable private capability may be deleted. */
 export function releaseOwnBarrier(directory: string, source: SourceName, id: string,
   hooks: BarrierReleaseHooks = {}): void {
   const path = join(directory, source + ".lock")
-  const replaced = () => new BookkeepingBarrierReplacedError(`barrier replaced or foreign barrier: ${source}`)
+  const replaced = () => new PrivateIdentityError(`barrier replaced or foreign barrier: ${source}; nothing deleted`)
   const journal = readJournal(directory)
   if (!journal || journal.id !== id) throw replaced()
-  let intent = journal.releases?.[source]
-  if (!intent) {
-    if (!present(path)) return
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    try {
-      const stat = fstatSync(fd)
-      if (!stat.isFile() || readFileSync(fd, "utf8") !== barrierBytes(id)) throw replaced()
-      intent = { name: `${source}.lock.releasing-${id}-${randomUUID()}`, dev: stat.dev, ino: stat.ino }
-    } finally { closeSync(fd) }
-    journal.releases = { ...journal.releases, [source]: intent }
+  const previous = journal.releases?.[source]
+  if (previous) {
+    const captured = privateName(path, id, join(directory, previous.name))
+    if (existsSync(captured)) {
+      if (!sameInode(lstatSync(captured), previous)) restoreCapturedFile(captured, path)
+      if (existsSync(path)) throw replaced()
+      const fd = openSync(captured, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+      try {
+        if (!sameInode(fstatSync(fd), previous) || readFileSync(fd, "utf8") !== barrierBytes(id)) throw replaced()
+      } finally { closeSync(fd) }
+      unlinkPrivate(captured)
+      syncDirectoryDurablySync(directory)
+      return
+    }
+    if (existsSync(path) && !sameInode(lstatSync(path), previous)) throw replaced()
+  }
+  if (!existsSync(path)) return
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const expected = fstatSync(fd)
+    if (!expected.isFile() || readFileSync(fd, "utf8") !== barrierBytes(id)) throw replaced()
+    const captured = privateName(path, id)
+    journal.releases = { ...journal.releases,
+      [source]: { name: basename(captured), dev: expected.dev, ino: expected.ino } }
     saveJournal(directory, journal)
     crashPoint(`barrier:intent:${source}`)
-  }
-  const privatePath = join(directory, intent.name)
-  const isOurs = (file: string) => {
-    const stat = lstatSync(file)
-    return stat.isFile() && stat.dev === intent.dev && stat.ino === intent.ino
-  }
-  if (!present(privatePath)) {
-    if (!present(path)) return
-    if (!isOurs(path)) throw replaced()
-    hooks.beforeLink?.(privatePath)
-    try { linkSync(path, privatePath) } catch (error) {
-      if (errorCode(error) === "EEXIST") throw replaced()
-      throw error
-    }
+    hooks.beforeRename?.(captured)
+    if (existsSync(captured)) throw replaced()
+    renameSync(path, captured)
     syncDirectoryDurablySync(directory)
-    hooks.afterLink?.(privatePath)
-    // Only this invocation's newly created link may be removed on failed acquisition.
-    if (!isOurs(privatePath)) {
-      unlinkSync(privatePath)
-      syncDirectoryDurablySync(directory)
-      throw replaced()
-    }
-    crashPoint(`barrier:linked:${source}`)
-  }
-  if (!isOurs(privatePath) || readFileSync(privatePath, "utf8") !== barrierBytes(id)) throw replaced()
-  if (present(path)) {
-    if (!isOurs(path)) {
-      unlinkSync(privatePath)
-      syncDirectoryDurablySync(directory)
-      throw replaced()
-    }
-    unlinkSync(path)
+    hooks.afterRename?.(captured)
+    if (!sameInode(lstatSync(captured), expected)) restoreCapturedFile(captured, path)
+    crashPoint(`barrier:captured:${source}`)
+    crashPoint(`barrier:releasing:${source}`)
+    unlinkPrivate(captured)
     syncDirectoryDurablySync(directory)
-  }
-  crashPoint(`barrier:releasing:${source}`)
-  unlinkSync(privatePath)
-  syncDirectoryDurablySync(directory)
-  if (present(path)) throw replaced()
+  } finally { closeSync(fd) }
 }

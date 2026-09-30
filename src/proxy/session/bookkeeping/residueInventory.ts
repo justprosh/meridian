@@ -28,7 +28,7 @@ export function candidateVerdict(path: string): ResidueVerdict {
 }
 
 export function inspectArtifacts(directory: string): { candidates: Residue[]; gates: Residue[]; temporary: Residue[] } {
-  const names = readdirSync(directory)
+  const names = readdirSync(directory).filter((name) => !name.includes(".releasing-"))
   const candidates = names.filter((name) => /^(session-gc|sessions)\.json\.lock[^/]*\.candidate-/.test(name))
     .map((path): Residue => {
       const full = join(directory, path)

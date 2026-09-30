@@ -1,4 +1,4 @@
-import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, unlinkSync } from "node:fs"
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { releaseOwnBarrier } from "./barrier"
@@ -6,6 +6,7 @@ import { EXPORT_JOURNAL_NAME, fileIdentity, readExportJournal, verifyFile } from
 import type { ExportFile } from "./exportJournal"
 import { crashPoint, JOURNAL_NAME, readJournal, SOURCE_NAMES, writeDurably } from "./maintenanceJournal"
 import { ownedFd } from "./storagePaths"
+import { retireFile } from "./privateRetirement"
 
 export const CYCLES_DIRECTORY = "bookkeeping-cycles"
 export const CYCLE_TRANSITION_NAME = "session-bookkeeping-cycle.json"
@@ -88,12 +89,11 @@ export function archivePreviousCycle(directory: string): void {
       if (!before.isFile() || before.dev !== after.dev || before.ino !== after.ino) {
         throw new Error(`cycle archive inode mismatch: ${file.name}`)
       }
-      unlinkSync(source)
-      syncDirectoryDurablySync(directory)
     }
+    retireFile(source, transition.id, lstatSync(target))
     crashPoint(`cycle:moved:${file.name}`)
   }
-  unlinkSync(join(directory, CYCLE_TRANSITION_NAME))
+  retireFile(join(directory, CYCLE_TRANSITION_NAME), transition.id)
   syncDirectoryDurablySync(directory)
   crashPoint("cycle:ARCHIVED")
 }

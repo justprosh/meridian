@@ -1,6 +1,7 @@
-import { closeSync, existsSync, linkSync, lstatSync, readFileSync, unlinkSync } from "node:fs"
+import { closeSync, existsSync, linkSync, lstatSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
+import { retireFile } from "./privateRetirement"
 import { ownedFd } from "./storagePaths"
 import { writeDurably, crashPoint, SOURCE_NAMES } from "./maintenanceJournal"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
@@ -69,7 +70,7 @@ export function saveExportJournal(directory: string, journal: ExportJournal, pha
 }
 
 /** Exclusive destination publication, recoverable on either side of unlink; never overwrite a foreign name. */
-export function moveExportFile(directory: string, source: string, target: string, expected: ExportFile): void {
+export function moveExportFile(directory: string, source: string, target: string, expected: ExportFile, id: string): void {
   if (existsSync(join(directory, target))) verifyFile(directory, target, expected)
   else {
     verifyFile(directory, source, expected)
@@ -83,8 +84,7 @@ export function moveExportFile(directory: string, source: string, target: string
     if (!from.isFile() || from.dev !== to.dev || from.ino !== to.ino) {
       throw new Error(`foreign export destination inode: ${target}`)
     }
-    unlinkSync(join(directory, source))
-    syncDirectoryDurablySync(directory)
   }
+  retireFile(join(directory, source), id, lstatSync(join(directory, target)))
   crashPoint(`export:moved:${expected.name}`)
 }

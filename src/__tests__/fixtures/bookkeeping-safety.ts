@@ -38,10 +38,16 @@ if (mode === "startup") {
   }), { mode: 0o600 })
   process.kill(owner.pid, 0)
   fs.linkSync(handle.path, temporary)
+  const protectedInodes = new Set(fs.readdirSync(directory).filter((name) => /\.sqlite(?:-wal|-shm|-journal)?$/.test(name))
+    .map((name) => { const stat = fs.lstatSync(join(directory, name)); return `${stat.dev}:${stat.ino}` }))
   const original = fs.openSync
   fs.openSync = (...args: Parameters<typeof fs.openSync>) => {
     const path = String(args[0])
-    assert(path.endsWith(".owner.json") || !path.includes(".sqlite"), `unexpected SQLite inode open: ${path}`)
+    // File names of durable deletion intents contain '.sqlite', but their inodes are not SQLite aliases.
+    if (fs.existsSync(path)) {
+      const stat = fs.lstatSync(path)
+      assert(!protectedInodes.has(`${stat.dev}:${stat.ino}`), `unexpected SQLite inode open: ${path}`)
+    }
     return original(...args)
   }
   syncBuiltinESMExports()

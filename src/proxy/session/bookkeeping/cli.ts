@@ -65,7 +65,7 @@ function unsafeState(directory: string): boolean {
     || Boolean(migration && !["PREPARED", "ABORTED"].includes(migration.phase) && exported?.phase !== "EXPORTED")
 }
 
-export async function runBookkeepingCli(args: string[]): Promise<number> {
+export async function runBookkeepingCli(args: string[], afterMigrationPreflightForTest?: () => void): Promise<number> {
   if (args.length === 1 && ["--help", "-h"].includes(args[0]!)) { console.log(HELP); return 0 }
   const started = performance.now()
   let previous = started
@@ -116,7 +116,8 @@ export async function runBookkeepingCli(args: string[]): Promise<number> {
           preflightLegacyMigration(directory)
         }
         result = before?.phase === "ready" ? { already_ready: true }
-          : await migrateBookkeeping(directory, { writersStopped: options.writersStopped })
+          : await migrateBookkeeping(directory, { writersStopped: options.writersStopped,
+            afterPreflightForTest: afterMigrationPreflightForTest })
       } else if (options.command === "export-json") result = exportBookkeepingJson(directory)
       else if (options.command === "recanonicalize") result = recanonicalizeBookkeeping(directory)
       else abortBookkeepingMigration(directory)
