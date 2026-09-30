@@ -5,12 +5,18 @@ import { releaseOwnBarrier } from "./barrier"
 import { EXPORT_JOURNAL_NAME, fileIdentity, readExportJournal, verifyFile } from "./exportJournal"
 import type { ExportFile } from "./exportJournal"
 import { crashPoint, JOURNAL_NAME, readJournal, SOURCE_NAMES, writeDurably } from "./maintenanceJournal"
-import { ownedFd } from "./storagePaths"
+import { BookkeepingFormatError, ownedFd } from "./storagePaths"
+import { isUuidV4 } from "./uuid"
 import { retireFile } from "./privateRetirement"
 
 export const CYCLES_DIRECTORY = "bookkeeping-cycles"
 export const CYCLE_TRANSITION_NAME = "session-bookkeeping-cycle.json"
 interface CycleTransition { version: 1; id: string; files: ExportFile[] }
+
+function isExportedDatabaseName(name: string): boolean {
+  const prefix = /^session-bookkeeping\.sqlite(-wal|-shm)?\.exported-/.exec(name)?.[0]
+  return prefix !== undefined && isUuidV4(name.slice(prefix.length))
+}
 
 export function readTransition(directory: string, readOnly = false): CycleTransition | undefined {
   const path = join(directory, CYCLE_TRANSITION_NAME)
@@ -18,9 +24,9 @@ export function readTransition(directory: string, readOnly = false): CycleTransi
   const fd = ownedFd(path, false, false, readOnly)
   let value: unknown
   try { value = JSON.parse(readFileSync(fd, "utf8")) } finally { closeSync(fd) }
-  if (!value || typeof value !== "object") throw new Error("invalid cycle transition")
+  if (!value || typeof value !== "object") throw new BookkeepingFormatError("invalid cycle transition")
   const row = value as Record<string, unknown>
-  if (row.version !== 1 || typeof row.id !== "string" || !/^[a-f0-9-]{36}$/.test(row.id)
+  if (row.version !== 1 || !isUuidV4(row.id)
     || !Array.isArray(row.files) || row.files.length === 0
     || row.files.at(-1)?.name !== JOURNAL_NAME
     || new Set(row.files.map((file) => file?.name)).size !== row.files.length
@@ -29,10 +35,10 @@ export function readTransition(directory: string, readOnly = false): CycleTransi
       const item = file as Record<string, unknown>
       return typeof item.name === "string" && (item.name === JOURNAL_NAME || item.name === EXPORT_JOURNAL_NAME
         || /^(session-gc|sessions)\.migrated\.json$/.test(item.name)
-        || /^session-bookkeeping\.sqlite(-wal|-shm)?\.exported-[a-f0-9-]{36}$/.test(item.name))
+        || isExportedDatabaseName(item.name))
         && typeof item.digest === "string" && /^[a-f0-9]{64}$/.test(item.digest)
         && typeof item.bytes === "number" && Number.isSafeInteger(item.bytes) && item.bytes >= 0
-    })) throw new Error("invalid cycle transition")
+    })) throw new BookkeepingFormatError("invalid cycle transition")
   return row as unknown as CycleTransition
 }
 

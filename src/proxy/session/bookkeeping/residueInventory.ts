@@ -4,6 +4,7 @@ import { captureProcessIncarnation, parseProcessIncarnation, probeProcessIncarna
 import { protectedBytes } from "./exportJournal"
 import { errorCode, ownedFd } from "./storagePaths"
 import type { Residue, ResidueVerdict } from "./residueTypes"
+import { isLegacyTemporaryName } from "./residueTypes"
 
 export function candidateVerdict(path: string): ResidueVerdict {
   const stat = lstatSync(path)
@@ -42,7 +43,7 @@ export function inspectArtifacts(directory: string): { candidates: Residue[]; ga
     closeSync(ownedFd(path, true, false, true))
     for (const file of readdirSync(path)) gates.push({ path: `${name}/${file}`, verdict: "unknown" })
   }
-  const temporary: Residue[] = names.filter((name) => /^session-gc\.json\.tmp-\d+-[a-f0-9-]{36}$/.test(name))
+  const temporary: Residue[] = names.filter(isLegacyTemporaryName)
     .filter((name) => protectedBytes(join(directory, name), true, true).length === 0)
     .map((path) => ({ path, verdict: "unknown" }))
   return { candidates, gates, temporary }

@@ -1,3 +1,5 @@
+import { isUuidV4 } from "./uuid"
+
 export type ResidueVerdict = "dead-incarnation" | "live" | "unknown"
 export interface Residue { path: string; verdict: ResidueVerdict; kind?: "incomplete-candidate" }
 export interface ArchivedResidue extends Residue {
@@ -7,7 +9,16 @@ export interface ArchivedResidue extends Residue {
 export function isResiduePath(path: string): boolean {
   return /^(session-gc|sessions)\.json\.lock[^/]*\.candidate-[^/]+$/.test(path)
     || /^(deletion-gates|sdk-process-gates)\/[^/]+$/.test(path) && !path.endsWith("/..")
-    || /^session-gc\.json\.tmp-\d+-[a-f0-9-]{36}$/.test(path)
+    || isLegacyTemporaryName(path)
+}
+
+export function isLegacyTemporaryName(path: string): boolean {
+  const prefix = /^session-gc\.json\.tmp-\d+-/.exec(path)?.[0]
+  return prefix !== undefined && isUuidV4(path.slice(prefix.length))
+}
+
+function validArchiveSuffix(value: string): boolean {
+  return isUuidV4(value.slice(0, 36)) && value[36] === "-" && isUuidV4(value.slice(37))
 }
 export function validResidues(value: unknown): value is ArchivedResidue[] {
   return Array.isArray(value) && new Set(value.map((row) => row?.path)).size === value.length
@@ -19,7 +30,7 @@ export function validResidues(value: unknown): value is ArchivedResidue[] {
         && (row.kind === undefined || row.kind === "incomplete-candidate" && row.verdict === "unknown")
         && (row.archiveName === undefined || row.kind === "incomplete-candidate"
           && typeof row.archiveName === "string" && row.archiveName.startsWith(`${row.path}.residue.releasing-`)
-          && /^[a-f0-9-]{73}$/.test(row.archiveName.slice(`${row.path}.residue.releasing-`.length)))
+          && validArchiveSuffix(row.archiveName.slice(`${row.path}.residue.releasing-`.length)))
         && typeof row.digest === "string" && /^[a-f0-9]{64}$/.test(row.digest)
         && [row.bytes, row.dev, row.ino].every((v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0)
     })

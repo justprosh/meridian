@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { syncBuiltinESMExports } from "node:module"
 import { join } from "node:path"
@@ -21,7 +22,7 @@ if (mode === "startup") {
   const owner = captureProcessIncarnation()
   assert(owner)
   const main = join(directory, "session-bookkeeping.sqlite")
-  for (const [suffix, linked] of [["abcd", false], ["dcba", true]] as const) {
+  for (const [suffix, linked] of [[randomUUID(), false], [randomUUID(), true]] as const) {
     const temporary = `${main}.tmp-${process.pid}-${suffix}`
     fs.writeFileSync(`${temporary}.owner.json`, JSON.stringify(owner), { mode: 0o600 })
     if (linked) fs.linkSync(main, temporary)
@@ -31,7 +32,7 @@ if (mode === "startup") {
   const handle = initializeSessionBookkeeping(directory)
   const owner = captureProcessIncarnation()
   assert(owner)
-  const temporary = `${handle.path}.tmp-${process.pid}-abcd`
+  const temporary = `${handle.path}.tmp-${process.pid}-${randomUUID()}`
   fs.writeFileSync(`${temporary}.owner.json`, JSON.stringify({
     ...owner, startId: owner.startIdKind === "darwin-ps-lstart"
       ? "Mon Jan  1 00:00:00 2001" : owner.startId === "1" ? "2" : "1",

@@ -9,6 +9,7 @@ import {
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { errorCode } from "./storagePaths"
 import { resumeFileRetirement, retireBootstrapAlias, retireFile } from "./privateRetirement"
+import { isUuidV4 } from "./uuid"
 
 /** Identity is durable before the temporary SQLite inode can exist. */
 export function createBootstrapPath(path: string): string {
@@ -51,7 +52,10 @@ function readOwner(path: string) {
 export function cleanupBootstrapOrphans(path: string): void {
   const prefix = `${basename(path)}.tmp-`
   for (const name of readdirSync(dirname(path))) {
-    if (!name.startsWith(prefix) || !/^\d+-[a-f0-9-]+\.owner\.json$/.test(name.slice(prefix.length))) continue
+    if (!name.startsWith(prefix) || !name.endsWith(".owner.json")) continue
+    const stem = name.slice(prefix.length, -".owner.json".length)
+    const separator = stem.indexOf("-")
+    if (!/^\d+$/.test(stem.slice(0, separator)) || !isUuidV4(stem.slice(separator + 1))) continue
     const ownerPath = join(dirname(path), name)
     const owner = readOwner(ownerPath)
     if (!owner || probeProcessIncarnation(owner) !== "dead") continue

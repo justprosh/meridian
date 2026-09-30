@@ -1,15 +1,18 @@
 import { randomUUID } from "node:crypto"
 import { rmdirSync, unlinkSync } from "node:fs"
+import { isUuidV4 } from "./uuid"
+import { BookkeepingFormatError } from "./storagePaths"
 
 declare const privatePathBrand: unique symbol
 export type PrivatePath = string & { readonly [privatePathBrand]: true }
 
 /** The optional name is only for a validated durable intent, never an arbitrary path cast. */
 export function privateName(publicPath: string, migrationId: string, recorded?: string): PrivatePath {
+  if (!isUuidV4(migrationId)) throw new BookkeepingFormatError("invalid private name migration UUID")
   const prefix = `${publicPath}.releasing-${migrationId}-`
   const path = recorded ?? `${prefix}${randomUUID()}`
-  if (!path.startsWith(prefix) || !/^[a-f0-9-]{36}$/.test(path.slice(prefix.length))) {
-    throw new Error("invalid recorded private name")
+  if (!path.startsWith(prefix) || !isUuidV4(path.slice(prefix.length))) {
+    throw new BookkeepingFormatError("invalid recorded private name")
   }
   return path as PrivatePath
 }

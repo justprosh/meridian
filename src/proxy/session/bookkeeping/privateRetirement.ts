@@ -7,13 +7,14 @@ import type { PrivatePath } from "./privateNames"
 import { errorCode } from "./storagePaths"
 import { crashPoint, writeDurably } from "./maintenanceJournal"
 import { randomUUID } from "node:crypto"
+import { isUuidV4 } from "./uuid"
 
 export class PrivateIdentityError extends Error { readonly exitCode = 5 }
 export interface FileIdentity { dev: number; ino: number }
 interface Intent extends FileIdentity { source: string; private: string; id: string; nativeAlias?: true }
 export interface RetirementHooks {
-  beforeRename?: (path: PrivatePath) => void
-  afterRename?: (path: PrivatePath) => void
+  beforeRename?: (path: string) => void
+  afterRename?: (path: string) => void
 }
 export function sameInode(a: FileIdentity, b: FileIdentity): boolean { return a.dev === b.dev && a.ino === b.ino }
 
@@ -81,7 +82,7 @@ function retire(source: string, id: string, expected: FileIdentity | undefined,
     } finally { closeSync(fd) }
     if (!value || typeof value !== "object") throw new PrivateIdentityError(`invalid deletion intent: ${path}`)
     const row = value as Record<string, unknown>
-    if (row.source !== source || typeof row.id !== "string" || !/^[a-f0-9-]{36}$/.test(row.id)
+    if (row.source !== source || !isUuidV4(row.id)
       || typeof row.private !== "string" || (row.nativeAlias !== undefined && row.nativeAlias !== true)
       || ![row.dev, row.ino].every((n) => typeof n === "number"
         && Number.isSafeInteger(n) && n >= 0)) throw new PrivateIdentityError(`invalid deletion intent: ${path}`)

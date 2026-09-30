@@ -1,5 +1,7 @@
 /** Legacy-only codecs. SQLite request operations must not parse full legacy documents. */
 import { createHash } from "node:crypto"
+import { isUuidV4 } from "./uuid"
+export { UUID_PATTERN } from "./uuid"
 import { isAbsolute } from "node:path"
 import { parseProcessIncarnation } from "../processIncarnation"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
@@ -229,7 +231,6 @@ export function hasExactObjectKeys(value: Record<string, unknown>, expected: rea
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index])
 }
 
-export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 export function validatePriorityAssignment(routeKey: string, value: unknown): DurablePriorityAssignment {
   if (!routeKey || routeKey.length > 512 || !value || typeof value !== "object" || Array.isArray(value)) {
@@ -283,11 +284,11 @@ export function validatePriorityAssignment(routeKey: string, value: unknown): Du
   if (
     typeof assignment.mappingGeneration !== "string" ||
     !assignment.mappingGeneration.startsWith(expectedMappingPrefix) ||
-    !UUID_PATTERN.test(assignment.mappingGeneration.slice(expectedMappingPrefix.length))
+    !isUuidV4(assignment.mappingGeneration.slice(expectedMappingPrefix.length))
   ) {
     throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid mapping generation`)
   }
-  if (typeof assignment.generationId !== "string" || !UUID_PATTERN.test(assignment.generationId)) {
+  if (typeof assignment.generationId !== "string" || !isUuidV4(assignment.generationId)) {
     throw new Error(`session store priority route ${JSON.stringify(routeKey)} has invalid generationId`)
   }
   if (
@@ -341,13 +342,13 @@ export function validatePriorityAttempt(routeKey: string, value: unknown): Durab
     (attempt.blockedTurnDigest === null) !== (attempt.blockedTurnIssuedAt === null) ||
     (attempt.pendingTurnDigest === null) !== (attempt.pendingTurnIssuedAt === null) ||
     (attempt.ownerToken !== null &&
-      (typeof attempt.ownerToken !== "string" || !UUID_PATTERN.test(attempt.ownerToken))) ||
+      (typeof attempt.ownerToken !== "string" || !isUuidV4(attempt.ownerToken))) ||
     (attempt.ownerToken === null && attempt.pendingTurnDigest !== null) ||
     (!attempt.blocked && attempt.ownerToken === null)
   ) {
     throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid state`)
   }
-  if (typeof attempt.generationId !== "string" || !UUID_PATTERN.test(attempt.generationId)) {
+  if (typeof attempt.generationId !== "string" || !isUuidV4(attempt.generationId)) {
     throw new Error(`session store priority attempt ${JSON.stringify(routeKey)} has invalid generationId`)
   }
   if (
@@ -464,7 +465,7 @@ export function validateStoreMeta(value: unknown): SessionStoreMeta {
     if (
       typeof rollback.mappingGeneration !== "string" ||
       !rollback.mappingGeneration.startsWith(expectedMappingPrefix) ||
-      !UUID_PATTERN.test(rollback.mappingGeneration.slice(expectedMappingPrefix.length))
+      !isUuidV4(rollback.mappingGeneration.slice(expectedMappingPrefix.length))
     ) {
       throw new Error(
         `session store priority rollback ${JSON.stringify(routeKey)} has invalid mapping generation`,

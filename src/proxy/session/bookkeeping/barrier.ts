@@ -4,13 +4,12 @@ import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { barrierBytes, crashPoint, readJournal, saveJournal } from "./maintenanceJournal"
 import type { SourceName } from "./maintenanceJournal"
 import { privateName, unlinkPrivate } from "./privateNames"
-import type { PrivatePath } from "./privateNames"
 import { PrivateIdentityError, restoreCapturedFile, sameInode } from "./privateRetirement"
 
 export { PrivateIdentityError as BookkeepingBarrierReplacedError } from "./privateRetirement"
 export interface BarrierReleaseHooks {
-  beforeRename?: (privatePath: PrivatePath) => void
-  afterRename?: (privatePath: PrivatePath) => void
+  beforeRename?: (privatePath: string) => void
+  afterRename?: (privatePath: string) => void
 }
 
 /** Public names are captured, never unlinked. Only the durable private capability may be deleted. */

@@ -6,12 +6,11 @@ import { crashPoint, readJournal, saveJournal } from "./maintenanceJournal"
 import type { ArchivedResidue } from "./residueTypes"
 import { ownedFd } from "./storagePaths"
 import { privateName } from "./privateNames"
-import type { PrivatePath } from "./privateNames"
 import { PrivateIdentityError, sameInode } from "./privateRetirement"
 
 export interface DirectoryArchiveHooks {
-  beforeRename?: (privatePath: PrivatePath) => void
-  afterRename?: (privatePath: PrivatePath) => void
+  beforeRename?: (privatePath: string) => void
+  afterRename?: (privatePath: string) => void
 }
 
 /** Directory recovery never renames onto a public name: mismatch retains the captured directory for the operator. */

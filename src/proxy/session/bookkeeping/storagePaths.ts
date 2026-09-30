@@ -1,8 +1,9 @@
 import { closeSync, constants, fchmodSync, fstatSync, lstatSync, openSync } from "node:fs"
-import { SessionLifecycleError, SessionLifecycleLockError } from "../lifecycleErrors"
+import { SessionLifecycleCorruptError, SessionLifecycleError, SessionLifecycleLockError } from "../lifecycleErrors"
 
 export class BookkeepingBusyError extends SessionLifecycleLockError {}
 export class BookkeepingMaintenanceRequiredError extends SessionLifecycleError {}
+export class BookkeepingFormatError extends SessionLifecycleCorruptError { readonly exitCode = 5 }
 
 export function errorCode(error: unknown): string | undefined {
   return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined

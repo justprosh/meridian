@@ -2,7 +2,8 @@ import { closeSync, existsSync, linkSync, lstatSync, readFileSync } from "node:f
 import { join } from "node:path"
 import { createHash } from "node:crypto"
 import { retireFile } from "./privateRetirement"
-import { ownedFd } from "./storagePaths"
+import { BookkeepingFormatError, ownedFd } from "./storagePaths"
+import { isUuidV4 } from "./uuid"
 import { writeDurably, crashPoint, SOURCE_NAMES } from "./maintenanceJournal"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 
@@ -39,9 +40,8 @@ export function readExportJournal(directory: string, readOnly = false): ExportJo
   const path = join(directory, EXPORT_JOURNAL_NAME)
   if (!existsSync(path)) return undefined
   const value: unknown = JSON.parse(protectedBytes(path, true, readOnly).toString("utf8"))
-  if (!value || typeof value !== "object") throw new Error("invalid export journal")
+  if (!value || typeof value !== "object") throw new BookkeepingFormatError("invalid export journal")
   const row = value as Record<string, unknown>
-  const uuid = (v: unknown) => typeof v === "string" && /^[a-f0-9-]{36}$/.test(v)
   const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0
   const files = (v: unknown, names: readonly string[], exact: boolean): boolean => Array.isArray(v)
     && (exact ? v.length === names.length : v.length >= 1 && v.length <= names.length)
@@ -52,14 +52,14 @@ export function readExportJournal(directory: string, readOnly = false): ExportJo
       return typeof file.name === "string" && (exact ? file.name === names[index] : names.includes(file.name))
         && typeof file.digest === "string" && /^[a-f0-9]{64}$/.test(file.digest) && count(file.bytes)
     })
-  if (row.format !== "meridian-bookkeeping-export" || row.version !== 1 || !uuid(row.id)
-    || !uuid(row.migrationId) || !EXPORT_PHASES.includes(row.phase as ExportPhase)
+  if (row.format !== "meridian-bookkeeping-export" || row.version !== 1 || !isUuidV4(row.id)
+    || !isUuidV4(row.migrationId) || !EXPORT_PHASES.includes(row.phase as ExportPhase)
     || !count(row.resources) || !count(row.mappings) || !files(row.documents, SOURCE_NAMES, true)
     || (row.archive !== undefined && !files(row.archive,
       ["session-bookkeeping.sqlite", "session-bookkeeping.sqlite-wal", "session-bookkeeping.sqlite-shm"], false))
     || (Array.isArray(row.archive) && !row.archive.some((file) => file?.name === "session-bookkeeping.sqlite"))
     || (["CHECKPOINTED", "ARCHIVED", "EXPORTED"].includes(String(row.phase)) && !row.archive)) {
-    throw new Error("invalid export journal")
+    throw new BookkeepingFormatError("invalid export journal")
   }
   return row as unknown as ExportJournal
 }

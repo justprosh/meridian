@@ -11,6 +11,7 @@ import { BOOKKEEPING_APPLICATION_ID, pragmaValue, RESOURCE_STATES } from "./sche
 import { parseLegacySidecar, parseLegacyStoreForMaintenance } from "./legacyCodec"
 import { inspectArtifacts } from "./residueInventory"
 import type { Residue } from "./residueTypes"
+import { isUuidV4 } from "./uuid"
 
 export class BookkeepingOwnerMismatchError extends Error { readonly exitCode = 6 }
 export type InspectionPhase = "legacy" | "prepared" | "barriers" | "imported" | "ready"
@@ -55,7 +56,7 @@ export function inspectBookkeeping(input: string): Inspection {
     if (existsSync(root)) {
       closeSync(ownedFd(root, true, false, true))
       archived = readdirSync(root).filter((name) => name !== transition?.id && name !== migration?.id
-        && /^[a-f0-9-]{36}$/.test(name) && lstatSync(join(root, name)).isDirectory()).length
+        && isUuidV4(name) && lstatSync(join(root, name)).isDirectory()).length
     }
     const id = migration?.id ?? transition?.id ?? null
     const phase: InspectionPhase = transition

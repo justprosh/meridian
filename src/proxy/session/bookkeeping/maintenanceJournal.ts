@@ -5,7 +5,8 @@ import {
 } from "node:fs"
 import { dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
-import { errorCode, ownedFd } from "./storagePaths"
+import { BookkeepingFormatError, errorCode, ownedFd } from "./storagePaths"
+import { isUuidV4 } from "./uuid"
 import { validResidues } from "./residueTypes"
 import type { ArchivedResidue } from "./residueTypes"
 import { privateName, unlinkPrivate } from "./privateNames"
@@ -91,15 +92,15 @@ export function readJournal(directory: string, readOnly = false): MigrationJourn
   const fd = ownedFd(path, false, true, readOnly)
   let value: unknown
   try { value = JSON.parse(readFileSync(fd, "utf8")) } finally { closeSync(fd) }
-  if (!value || typeof value !== "object") throw new Error("invalid migration journal")
+  if (!value || typeof value !== "object") throw new BookkeepingFormatError("invalid migration journal")
   const row = value as Record<string, unknown>
   if (row.format !== "meridian-bookkeeping-migration" || row.version !== 1 || row.targetVersion !== 1
-    || typeof row.id !== "string" || !/^[a-f0-9-]{36}$/.test(row.id)
+    || !isUuidV4(row.id)
     || !["PREPARED", "BARRIERS", "IMPORTED", "READY", "ABORTING", "ABORTED"].includes(String(row.phase))
     || !validSources(row.sources) || (row.finalSources !== undefined && !validSources(row.finalSources))
     || (row.residues !== undefined && !validResidues(row.residues))
     || (row.releases !== undefined && !validReleases(row.releases, String(row.id)))
-    || (row.phase !== "PREPARED" && !row.finalSources)) throw new Error("invalid migration journal")
+    || (row.phase !== "PREPARED" && !row.finalSources)) throw new BookkeepingFormatError("invalid migration journal")
   return row as unknown as MigrationJournal
 }
 
@@ -110,7 +111,7 @@ function validReleases(value: unknown, id: string): boolean {
     const row = item as Record<string, unknown>
     const prefix = `${source}.lock.releasing-${id}-`
     return typeof row.name === "string" && row.name.startsWith(prefix)
-      && /^[a-f0-9-]{36}$/.test(row.name.slice(prefix.length))
+      && isUuidV4(row.name.slice(prefix.length))
       && [row.dev, row.ino].every((v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0)
   })
 }
