@@ -7,6 +7,7 @@ import {
 import type { SessionGcSidecar, SessionStoreDocument, SessionStoreMeta } from "./legacyCodec"
 import type { BookkeepingReader } from "./types"
 import { digestBytes } from "./maintenanceJournal"
+import { MAPPING_OBJECT_ORDER } from "./mappingMetadata"
 
 export interface ExportSnapshot {
   sidecar: string
@@ -56,7 +57,7 @@ export function snapshotForExport(reader: BookkeepingReader): ExportSnapshot {
     }
   } else throw new Error("unsupported store metadata version")
   const store: SessionStoreDocument = { meta,
-    sessions: Object.fromEntries(reader.all("SELECT key FROM mappings ORDER BY key")
+    sessions: Object.fromEntries(reader.all(`SELECT key FROM mappings ORDER BY ${MAPPING_OBJECT_ORDER}`)
       .map((row) => [String(row.key), legacyExport(reader, "mapping", String(row.key), readMapping(reader, String(row.key))!)])),
   }
   const result = { sidecar: serializeLegacySidecar(sidecar), store: serializeLegacyStore(store),

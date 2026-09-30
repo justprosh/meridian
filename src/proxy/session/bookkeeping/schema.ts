@@ -59,7 +59,10 @@ const statements = [
     passthrough_tool_call_assistant_uuid TEXT,
     passthrough_tool_call_ids_json TEXT CHECK(passthrough_tool_call_ids_json IS NULL OR
       (json_valid(passthrough_tool_call_ids_json) AND json_type(passthrough_tool_call_ids_json)='array')),
-    ${json("current_locator_json")}, ${json("previous_locator_json")}
+    ${json("current_locator_json")}, ${json("previous_locator_json")},
+    generation_token TEXT NOT NULL, legacy_denial INTEGER NOT NULL CHECK(legacy_denial IN (0,1)),
+    object_index INTEGER NOT NULL CHECK(object_index BETWEEN 0 AND 4294967295),
+    insertion_order INTEGER NOT NULL UNIQUE CHECK(insertion_order BETWEEN 1 AND 9007199254740991)
   ) STRICT`,
   `CREATE TABLE mapping_history (
     mapping_key TEXT PRIMARY KEY NOT NULL REFERENCES mappings(key) ON DELETE CASCADE,
@@ -101,7 +104,7 @@ const statements = [
   "CREATE INDEX resources_deleted ON resources(updated_at DESC,key) WHERE state='deleted'",
   "CREATE INDEX resources_prepared ON resources(updated_at,key) WHERE state='prepared'",
   "CREATE INDEX resources_live ON resources(key) WHERE state='live'",
-  "CREATE INDEX mappings_claude ON mappings(claude_session_id,last_used_at DESC,key)",
+  "CREATE INDEX mappings_claude ON mappings(claude_session_id,legacy_denial,last_used_at DESC,object_index,insertion_order)",
   "CREATE INDEX mappings_lru ON mappings(last_used_at,key)",
   "CREATE INDEX rollback_mapping ON priority_rollbacks(mapping_key)",
   "CREATE INDEX pins_resource ON mapping_pins(resource_key,generation,mapping_key)",

@@ -10,6 +10,7 @@ import type { SessionGcSidecar, SessionStoreDocument } from "./legacyCodec"
 import type { BookkeepingResource, CanonicalStoredSession, BookkeepingTransaction } from "./types"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { preserveLegacyExport } from "./legacyExport"
+import { mappingGeneration, legacyUserDenial } from "./mappingMetadata"
 
 export interface ImportPlan {
   sidecar: SessionGcSidecar
@@ -85,6 +86,9 @@ export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: str
     writeMappingRow(tx, key, canonical)
     if (canonical.generationId === undefined) {
       tx.run("UPDATE mapping_history SET history_json=? WHERE mapping_key=?", original, key)
+      const entry = plan.store.sessions[key]!
+      tx.run("UPDATE mappings SET generation_token=?,legacy_denial=? WHERE key=?",
+        mappingGeneration(key, entry), legacyUserDenial(entry), key)
     } else {
       preserveLegacyExport(tx, "mapping", key, plan.store.sessions[key]!)
     }

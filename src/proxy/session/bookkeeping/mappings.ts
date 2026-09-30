@@ -3,6 +3,7 @@ import { resourceKey, canonicalizeLocator } from "./locator"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import type { CanonicalStoredSession } from "./types"
+import { mappingGeneration, legacyUserDenial, mappingObjectIndex, MAPPING_OBJECT_ORDER } from "./mappingMetadata"
 import type {
   BookkeepingReader,
   BookkeepingTransaction,
@@ -84,21 +85,25 @@ export function writeMappingRow(
     "last_used_at",
     "message_count",
     ...optionalColumns.map(([, column]) => column),
+    "generation_token", "legacy_denial", "object_index",
   ]
   const assignments = columns.map((column) => `${column}=excluded.${column}`).join(",")
   const conflict = update ? `ON CONFLICT(key) DO UPDATE SET ${assignments}` : ""
   tx.run(
-    `INSERT INTO mappings(key,${columns.join(",")})
-    VALUES(${Array(5 + values.length)
+    `INSERT INTO mappings(key,${columns.join(",")},insertion_order)
+    VALUES(${Array(8 + values.length)
       .fill("?")
-      .join(",")}) ${conflict}`,
+      .join(",")},(SELECT coalesce(max(insertion_order),0)+1 FROM mappings)) ${conflict}`,
     key,
     entry.claudeSessionId,
     entry.createdAt,
     entry.lastUsedAt,
     entry.messageCount,
     ...values,
+    mappingGeneration(key, entry), legacyUserDenial(entry), mappingObjectIndex(key),
   )
+  // Mutation invalidates imported bytes even if a later projection happens to return to its old shape.
+  tx.run("DELETE FROM legacy_exports WHERE kind='mapping' AND key=?", key)
   const legacy = entry.generationId === undefined
   const history = legacy
     ? entry
@@ -106,6 +111,7 @@ export function writeMappingRow(
         messageHashes: entry.messageHashes,
         messageBlockHashes: entry.messageBlockHashes,
         sdkMessageUuids: entry.sdkMessageUuids,
+        passthroughResumeUuid: (entry as StoredSession & { passthroughResumeUuid?: unknown }).passthroughResumeUuid,
       }
   tx.run(
     `INSERT INTO mapping_history VALUES(?,?,?) ON CONFLICT(mapping_key)
@@ -165,7 +171,7 @@ export function readMapping(reader: BookkeepingReader, key: string): StoredSessi
   const payload = JSON.parse(String(history.history_json)) as Record<string, unknown>
   if (
     Object.keys(payload).some(
-      (key) => !["messageHashes", "messageBlockHashes", "sdkMessageUuids"].includes(key),
+      (key) => !["messageHashes", "messageBlockHashes", "sdkMessageUuids", "passthroughResumeUuid"].includes(key),
     )
   )
     throw new Error("unexpected mapping history field")
@@ -175,7 +181,7 @@ export function readMapping(reader: BookkeepingReader, key: string): StoredSessi
 }
 
 export function readMappingGeneration(reader: BookkeepingReader, key: string): string {
-  const row = reader.get("SELECT generation_id FROM mappings WHERE key=?", key)
+  const row = reader.get("SELECT generation_token FROM mappings WHERE key=?", key)
   if (!row) {
     const slot = reader.get(
       "SELECT counter FROM fence_slots WHERE namespace='store' AND slot=?",
@@ -183,8 +189,7 @@ export function readMappingGeneration(reader: BookkeepingReader, key: string): s
     )
     return `a:${digest(key)}:${slot?.counter ?? 0}`
   }
-  const generation = row.generation_id ?? `legacy-${digest(JSON.stringify(readMapping(reader, key)))}`
-  return `p:${digest(key)}:${generation}`
+  return String(row.generation_token)
 }
 
 /** A missing key is compared by its durable fence slot, not by mere absence. */
@@ -206,7 +211,8 @@ export function compareAndSwapMapping(
 }
 
 export const LOOKUP_CLAUDE_SQL =
-  "SELECT key FROM mappings WHERE claude_session_id=? ORDER BY last_used_at DESC,key LIMIT 1"
+  `SELECT key FROM mappings WHERE claude_session_id=? AND legacy_denial=0
+   ORDER BY last_used_at DESC,${MAPPING_OBJECT_ORDER} LIMIT 1`
 export const PIN_LOOKUP_SQL =
   "SELECT mapping_key FROM mapping_pins WHERE resource_key=? AND (generation IS NULL OR generation=?)"
 
@@ -241,6 +247,13 @@ export function captureMappingPinsValidation(reader: BookkeepingReader): () => v
     for (const row of rows) {
       if (row.encoding !== (row.generation_id === null ? "legacy-entry" : "history")) {
         throw new SessionLifecycleCorruptError("mapping history/encoding mismatch")
+      }
+      const entryForMetadata = row.encoding === "legacy-entry"
+        ? JSON.parse(String(row.history_json)) as StoredSession : readMapping(reader, String(row.key))!
+      if (row.generation_token !== mappingGeneration(String(row.key), entryForMetadata)
+        || row.legacy_denial !== legacyUserDenial(entryForMetadata)
+        || row.object_index !== mappingObjectIndex(String(row.key))) {
+        throw new SessionLifecycleCorruptError(`mapping lookup metadata/payload mismatch: ${JSON.stringify(row.key)}`)
       }
       if (row.encoding === "legacy-entry") {
         const entry = JSON.parse(String(row.history_json)) as StoredSession
