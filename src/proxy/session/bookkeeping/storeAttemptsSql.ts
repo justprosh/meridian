@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { checkParameters } from "./connection"
 import { getMaxPriorityAttemptsLimit } from "../../sessionStore"
 import { readPriorityAssignment } from "./storePrioritySql"
 import { advanceStoreSlot } from "./storeMutationSupport"
@@ -21,6 +22,7 @@ function writeAttempt(tx: BookkeepingTransaction, route: string, attempt: Durabl
 export function claimPriorityAttempt(directory: string, options: {
   routeKey: string; expectedAssignmentGeneration: string; turn?: PriorityAttemptTurn
 }): PriorityAttemptClaim | false {
+  checkParameters([options.routeKey, options.expectedAssignmentGeneration, options.turn?.turnId ?? null])
   if (!options.routeKey || options.routeKey.length > 512)
     throw new Error("priority attempt requires a bounded route key")
   const turn = options.turn
@@ -59,6 +61,7 @@ export function claimPriorityAttempt(directory: string, options: {
 }
 
 function settle(directory: string, route: string, token: string, block: boolean): boolean {
+  checkParameters([route, token])
   if (!route || route.length > 512 || !UUID_PATTERN.test(token)) return false
   return withStoreWrite(directory, (tx) => {
     const lookup = readPriorityAssignment(tx, route)

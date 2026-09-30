@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, it } from "bun:test"
+import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
 import { randomUUID } from "node:crypto"
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -18,6 +18,8 @@ import { STORE_META_KEY, getStoredSessionGeneration } from "../proxy/session/boo
 import * as legacy from "../proxy/sessionStore"
 import type { BookkeepingReader, SqlValue, CanonicalStoredSession } from "../proxy/session/bookkeeping/types"
 import { canonicalizeLocator } from "../proxy/session/bookkeeping/locator"
+import { connectionFor } from "../proxy/session/bookkeeping/connection"
+import { sqliteSessionStoreBackend } from "../proxy/session/bookkeeping/sqliteStoreBackend"
 
 let directory: string
 let handle: BookkeepingHandle | undefined
@@ -27,6 +29,7 @@ beforeEach(() => {
   legacy.setSessionStoreDir(directory)
 })
 afterEach(() => {
+  legacy.setSessionStoreBackendForTest(null)
   handle?.close()
   handle = undefined
   legacy.setSessionStoreDir(null)
@@ -83,7 +86,9 @@ it("matches JSON reads, legacy denial, equal timestamps and exact legacy digest 
 
 it("hydrates only the addressed winner; generation snapshots never read history", async () => {
   const adapter = "😀_%tail"
-  seed({ [adapter]: entry(), [`z:${adapter}`]: entry(), other: entry(), denied: {
+  seed({ [adapter]: entry(), [`z:${adapter}`]: entry(), other: entry(),
+    ...Object.fromEntries(Array.from({ length: 50 }, (_, n) => [`other-${n}`, entry({ messageHashes: ["other"] })])),
+    denied: {
     ...entry({ lastUsedAt: 11 }), passthroughResumeUuid: "user",
   } })
   const expected = legacy.readSessionStoreGenerationSnapshot(adapter, ["p", "", "default"])
@@ -105,6 +110,22 @@ it("hydrates only the addressed winner; generation snapshots never read history"
     expect(plan).toContain("mappings_claude")
     expect(plan).not.toContain("TEMP B-TREE")
   })
+  legacy.setSessionStoreBackendForTest(sqliteSessionStoreBackend)
+  const winner = mappings.lookupSharedSessionResult(directory, adapter)
+  const prepare = spyOn(connectionFor(directory).db!, "prepare")
+  try {
+    for (const lookup of [() => legacy.lookupSharedSessionResult(adapter),
+      () => legacy.lookupSharedSessionByClaudeIdResult("claude")]) {
+      prepare.mockClear()
+      expect(lookup()).toEqual(winner)
+      const payload = prepare.mock.calls.map(([sql]) => sql).filter((sql) => /mapping_history|history_json/i.test(sql))
+      expect(payload).toHaveLength(1)
+      expect(payload.every((sql) => /WHERE mapping_key\s*=\s*\?/i.test(sql))).toBe(true)
+    }
+    prepare.mockClear()
+    expect(legacy.readSessionStoreGenerationSnapshot(adapter, ["p", "", "default"])).toEqual(expected)
+    expect(prepare.mock.calls.some(([sql]) => /mapping_history|history_json/i.test(sql))).toBe(false)
+  } finally { prepare.mockRestore() }
 })
 
 it("preserves Object.entries numeric/string order across updates and delete/reinsert", async () => {

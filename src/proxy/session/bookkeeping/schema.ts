@@ -166,7 +166,9 @@ export function validateBookkeepingSchema(db: Database.Database, phase = "READY"
     meta[0]?.phase !== phase ||
     JSON.stringify(schemaRows(db)) !== expectedSchema
   ) {
-    throw new SessionLifecycleCorruptError("bookkeeping schema/version/phase mismatch; maintenance required")
+    throw new SessionLifecycleCorruptError(
+      "bookkeeping schema/version/phase mismatch; export with the build that created it, then migrate",
+    )
   }
   if (!full) return
   if (pragmaValue(db, "quick_check") !== "ok" || (db.pragma("foreign_key_check") as unknown[]).length) {

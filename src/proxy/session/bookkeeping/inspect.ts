@@ -7,7 +7,7 @@ import { barrierBytes, readJournal, SOURCE_NAMES } from "./maintenanceJournal"
 import { protectedBytes, readExportJournal } from "./exportJournal"
 import { CYCLES_DIRECTORY, readTransition } from "./cycles"
 import { ownedFd } from "./storagePaths"
-import { BOOKKEEPING_APPLICATION_ID, pragmaValue, RESOURCE_STATES } from "./schema"
+import { BOOKKEEPING_APPLICATION_ID, pragmaValue, RESOURCE_STATES, validateBookkeepingSchema } from "./schema"
 import { parseLegacySidecar, parseLegacyStoreForMaintenance } from "./legacyCodec"
 import { inspectArtifacts } from "./residueInventory"
 import type { Residue } from "./residueTypes"
@@ -85,6 +85,7 @@ export function inspectBookkeeping(input: string): Inspection {
           throw new Error("bookkeeping database application id mismatch")
         }
         const meta = db.prepare("SELECT migration_id,phase FROM schema_meta").get() as Record<string, unknown>
+        validateBookkeepingSchema(db, String(meta.phase))
         if (meta.phase === "READY" && meta.migration_id !== id) throw new Error("database migration id mismatch")
         const counts = db.prepare("SELECT state,count(*) AS n FROM resources GROUP BY state").all() as
           Array<{ state: string; n: number }>

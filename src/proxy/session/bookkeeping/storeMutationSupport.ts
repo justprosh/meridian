@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { connectionFor } from "./connection"
+import { connectionFor, checkParameters } from "./connection"
 import { canonicalizeLocator, persistedCanonicalLocator, validateLocator } from "./locator"
 import { mappingDigest, MAPPING_OBJECT_ORDER } from "./mappingMetadata"
 import type { BookkeepingReader, BookkeepingTransaction, CanonicalStoredSession, StoredSession,
@@ -16,9 +16,15 @@ export function rollbackProtected(reader: BookkeepingReader, key: string): boole
 
 /** A publication scope has already prepared its locators; never realpath while holding its SQL lock. */
 export function prepareStoreLocator(directory: string, locator: TranscriptLocator | undefined,
-  sessionId?: string): CanonicalTranscriptLocator | undefined {
+  sessionId?: string, label = "currentTranscript"): CanonicalTranscriptLocator | undefined {
   if (!locator) return undefined
-  validateLocator(locator)
+  for (const value of Object.values(locator)) {
+    if (typeof value === "string") checkParameters([value])
+  }
+  try { validateLocator(locator) } catch (error) {
+    if (error instanceof TypeError) throw new TypeError(`${label}.${error.message}`, { cause: error })
+    throw error
+  }
   if (sessionId !== undefined && locator.sessionId !== sessionId)
     throw new Error("currentTranscript.sessionId must match claudeSessionId")
   return connectionFor(directory).scope

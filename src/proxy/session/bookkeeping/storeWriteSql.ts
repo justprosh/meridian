@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { checkParameters } from "./connection"
 import { getMaxStoredSessionsLimit } from "../../sessionStore"
 import { mappingDigest } from "./mappingMetadata"
 import { readMapping, readMappingGeneration, writeMappingRow } from "./mappings"
@@ -12,8 +13,10 @@ export function storeSharedSession(directory: string, ...args: StoreSessionArgum
   const [key, claudeSessionId, messageCount, lineageHash, messageHashes, sdkMessageUuids, contextUsage,
     messageBlockHashes, passthroughToolCallAssistantUuid, passthroughToolCallIds, current, source,
     expectedGeneration] = args
+  checkParameters([key, claudeSessionId, lineageHash ?? null,
+    passthroughToolCallAssistantUuid ?? null, expectedGeneration ?? null])
   const currentTranscript = prepareStoreLocator(directory, current, claudeSessionId)
-  const sourceTranscript = prepareStoreLocator(directory, source)
+  const sourceTranscript = prepareStoreLocator(directory, source, undefined, "sourceTranscript")
   return withStoreWrite(directory, (tx) => {
     if (rollbackProtected(tx, key)) return false
     const actual = readMappingGeneration(tx, key)

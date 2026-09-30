@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { checkParameters } from "./connection"
 import { getMaxStoredSessionsLimit } from "../../sessionStore"
 import { readMappingGeneration, writeMappingRow } from "./mappings"
 import { persistedCanonicalLocator } from "./locator"
@@ -13,6 +14,8 @@ import type { DurablePriorityAssignment } from "./legacyCodec"
 
 export function finalizeSharedSessionAndPriorityAssignment(directory: string,
   options: FinalizeSharedSessionAndPriorityAssignmentOptions): boolean {
+  checkParameters([options.key, options.routeKey, options.expectedMappingGeneration,
+    options.expectedAssignmentGeneration, options.rollbackMappingKey ?? null, options.attemptOwnerToken ?? null])
   return withStoreWrite(directory, (tx) => {
     if (readMappingGeneration(tx, options.key) !== options.expectedMappingGeneration) return false
     const lookup = readPriorityAssignment(tx, options.routeKey)
@@ -34,6 +37,8 @@ export function finalizeSharedSessionAndPriorityAssignment(directory: string,
 
 export function rollbackSharedSessionAndPriorityAssignment(directory: string,
   options: RollbackSharedSessionAndPriorityAssignmentOptions): RollbackSharedSessionAndPriorityAssignmentResult | false {
+  checkParameters([options.key, options.routeKey, options.expectedMappingGeneration,
+    options.expectedAssignmentGeneration, options.attemptOwnerToken ?? null])
   // Preparation occurs outside our own SQL transaction; a joined caller supplies canonical locators.
   const previous = options.previousMapping ? structuredClone(options.previousMapping) : null
   const current = prepareStoreLocator(directory, previous?.currentTranscript)

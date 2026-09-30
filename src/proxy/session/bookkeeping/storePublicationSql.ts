@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { checkParameters } from "./connection"
 import { getMaxPriorityAssignmentsLimit, getMaxStoredSessionsLimit } from "../../sessionStore"
 import { UUID_PATTERN } from "./legacyCodec"
 import type { DurablePriorityAssignment } from "./legacyCodec"
@@ -55,9 +56,12 @@ function pruneRoutes(tx: BookkeepingTransaction, route: string): boolean {
 
 export function storeSharedSessionAndPriorityAssignment(directory: string,
   options: SharedSessionAndPriorityAssignmentOptions): SharedSessionAndPriorityAssignmentResult | false {
+  checkParameters([options.key, options.claudeSessionId, options.lineageHash, options.expectedMappingGeneration,
+    options.rollbackMappingKey ?? null, options.attemptOwnerToken ?? null, options.priority.routeKey,
+    options.priority.profileId, options.priority.lastHumanTurnDigest, options.priority.expectedAssignmentGeneration])
   validate(options)
   const current = prepareStoreLocator(directory, options.currentTranscript, options.claudeSessionId)
-  const source = prepareStoreLocator(directory, options.sourceTranscript)
+  const source = prepareStoreLocator(directory, options.sourceTranscript, undefined, "sourceTranscript")
   return withStoreWrite(directory, (tx) => {
     const key = options.key, route = options.priority.routeKey
     const actual = readMappingGeneration(tx, key)
