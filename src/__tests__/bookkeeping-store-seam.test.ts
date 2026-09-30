@@ -175,6 +175,14 @@ contractTest("preserves every existing function signature and JSON body after re
       statements = statements.slice(2)
     }
     if (name === "setSessionStoreDir") statements = statements.slice(1)
+    if (name === "getSessionStoreDir") {
+      // Runtime address dispatch is separate from the unchanged legacy default-directory body.
+      // Do not use activeStoreBackend here: address reads are legal even in a direct SQL scope
+      // while the facade is JSON, whereas choosing that JSON backend is deliberately refused.
+      expect(statements[0]?.getText(current)).toBe("const retained = retainedBookkeepingRuntimeDirectory()")
+      expect(statements[1]?.getText(current)).toBe("if (retained) return retained")
+      statements = statements.slice(2)
+    }
     const body = (rows: readonly ts.Statement[], file: ts.SourceFile) =>
       printer.printNode(ts.EmitHint.Unspecified, ts.factory.createBlock(rows, true), file)
     expect(body(statements, current), name).toBe(body(previous.body!.statements, old))

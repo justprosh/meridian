@@ -556,8 +556,9 @@ export function setSessionStoreDir(dir: string | null, _opts?: { skipLocking?: b
 
 /** Return the directory containing the cross-process session store. */
 export function getSessionStoreDir(): string {
-  return retainedBookkeepingRuntimeDirectory()
-    || sessionDirOverride
+  const retained = retainedBookkeepingRuntimeDirectory()
+  if (retained) return retained
+  return sessionDirOverride
     || process.env.MERIDIAN_SESSION_DIR
     || process.env.CLAUDE_PROXY_SESSION_DIR
     || getDefaultCacheDir()
