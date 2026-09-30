@@ -3,6 +3,33 @@ import { join } from "node:path"
 import { withBookkeepingWrite } from "../../proxy/session/bookkeeping/database"
 import type { TranscriptResource } from "../../proxy/session/bookkeeping/types"
 import { sqliteLifecycleTest } from "./bookkeeping-lifecycle-install"
+import type { BookkeepingInitializeOptions } from "../../proxy/session/bookkeeping/connection"
+
+export type LifecycleCommitFault = "busy-before" | "ioerr-before" | "ioerr-after"
+
+/** Engine seam, armed only after setup; read COMMITs never consume a write fault. */
+export function lifecycleCommitInjection() {
+  let fault: LifecycleCommitFault | undefined, writesUntilFault = 1, writing = false, hits = 0
+  const executeTransaction: NonNullable<BookkeepingInitializeOptions["executeTransaction"]> = (db, sql) => {
+    if (sql === "BEGIN IMMEDIATE") writing = true
+    if (sql === "BEGIN") writing = false
+    if (sql === "COMMIT" && writing && fault && --writesUntilFault === 0) {
+      const point = fault
+      fault = undefined; writing = false; hits++
+      if (point === "ioerr-after") db.exec(sql)
+      throw Object.assign(new Error(`injected ${point}`), {
+        code: point === "busy-before" ? "SQLITE_BUSY" : "SQLITE_IOERR",
+      })
+    }
+    db.exec(sql)
+    if (sql === "COMMIT" || sql === "ROLLBACK") writing = false
+  }
+  return {
+    executeTransaction,
+    arm(point: LifecycleCommitFault, writeOrdinal = 1) { fault = point; writesUntilFault = writeOrdinal },
+    get hits() { return hits },
+  }
+}
 
 /** Inject a crash-state ledger row, not JSON corruption or a replacement writer connection. */
 export function injectDeletingResource(directory: string, resource: TranscriptResource): void {

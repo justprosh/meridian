@@ -3,6 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileS
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
+import { spawn } from "node:child_process"
+import { once } from "node:events"
+import { sqliteLifecycleBackend } from "../proxy/session/bookkeeping/lifecycleSql"
 import * as facade from "../proxy/sessionLifecycle"
 import * as incarnations from "../proxy/session/processIncarnation"
 import { initializeSessionBookkeeping, withBookkeepingWrite, type BookkeepingHandle }
@@ -284,6 +287,59 @@ it("run deadline stops the next claim, not an already started deletion's full ti
   expect(result).toEqual({ deleted: 1, notFound: 0, failed: 0, deferred: 1 })
 })
 
+it("an opened, hung real Node deletion executor stays fenced across GC and reconcile until exact finish", async () => {
+  facade.setSessionLifecycleBackendForTest(sqliteLifecycleBackend)
+  const locator = seed(), marker = join(directory, "hung-deletion-marker.json")
+  const claim = (await claimDeletion([], options))!
+  const child = spawn(facade.getSessionGcNodeExecutable(), ["-e", `
+    const fs = require('node:fs');
+    process.stdin.once('data', () => {
+      fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({pid: process.pid, node: process.versions.node}));
+      process.stdout.write('deletion-entered');
+      setInterval(() => {}, 1000);
+    });
+  `], { detached: true, stdio: ["pipe", "pipe", "pipe"] })
+  const exited = once(child, "exit")
+  const entered = once(child.stdout!, "data")
+  let joined = false
+  try {
+    let executor: ReturnType<typeof incarnations.captureProcessIncarnation>
+    for (let attempt = 0; attempt < 100 && !executor; attempt++) {
+      executor = incarnations.captureProcessIncarnation(child.pid!)
+      if (!executor) await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    expect(executor).toBeDefined()
+    expect(existsSync(marker)).toBe(false)
+    await attachDeletionExecutor(claim.key, claim.deletionToken!, executor!, child.pid!, options)
+    child.stdin!.write("open gate")
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 5000)
+    try {
+      await Promise.race([entered, exited.then(() => { throw new Error("executor exited before gate entry") })])
+    } finally { clearTimeout(timeout) }
+    expect(JSON.parse(readFileSync(marker, "utf8"))).toEqual({ pid: child.pid, node: expect.stringMatching(/^22\./) })
+    const fenced = row(locator)
+    expect(fenced.state).toBe("deleting")
+    expect(fenced.deletionToken).toBe(claim.deletionToken)
+    let deletions = 0
+    for (let pass = 0; pass < 2; pass++) {
+      expect(await facade.runGc([], { ...options, deleter: async () => { deletions++ } }))
+        .toEqual({ deleted: 0, notFound: 0, failed: 0, deferred: 1 })
+      expect((await facade.reconcile([], options)).deletingRecovered).toBe(0)
+      expect(row(locator)).toEqual(fenced)
+      expect(await claimDeletion([], options)).toBeUndefined()
+    }
+    expect(deletions).toBe(0)
+    await expect(finishDeletion(claim.key, "foreign-token", undefined, options)).rejects.toThrow("was lost")
+    expect(row(locator)).toEqual(fenced)
+    // Join only during cleanup; none of the sweeps above observed child completion.
+    child.kill("SIGKILL"); await exited; joined = true
+    await finishDeletion(claim.key, claim.deletionToken!, undefined, options)
+    expect(row(locator).state).toBe("deleted")
+  } finally {
+    if (!joined) { child.kill("SIGKILL"); await exited }
+  }
+}, 10_000)
+
 it("retries deferred lease release before claim instead of leaving a retired row fenced", async () => {
   const locator = seed(), active = lease(locator)
   // Aborted async admission produces the same retryable lifecycle lock error as overload.
@@ -295,6 +351,60 @@ it("retries deferred lease release before claim instead of leaving a retired row
   expect(handle.reader.all("SELECT token FROM resource_leases")).toHaveLength(0)
   expect(Object.keys(sqliteLifecycleLeases)).not.toContain("runGc")
 })
+
+it("SIGKILL of the real deletion parent after the SDK gate opens never releases its unjoined executor fence", async () => {
+  facade.setSessionLifecycleBackendForTest(sqliteLifecycleBackend)
+  const locator = seed(), marker = join(directory, "orphan-marker.json"), sdk = join(directory, "orphan-sdk.mjs")
+  writeFileSync(sdk, `import { writeFileSync } from 'node:fs';
+    export async function deleteSession(id) {
+      writeFileSync(${JSON.stringify(marker)}, JSON.stringify({id,pid:process.pid,node:process.versions.node}));
+      setInterval(() => {}, 1000); await new Promise(() => {});
+    }`)
+  const moduleUrl = (name: string) => pathToFileURL(join(import.meta.dir, "../proxy/session/bookkeeping", name)).href
+  const parent = Bun.spawn([process.execPath, "--eval", `
+    import { initializeSessionBookkeeping } from ${JSON.stringify(moduleUrl("database.ts"))};
+    import { sqliteLifecycleBackend } from ${JSON.stringify(moduleUrl("lifecycleSql.ts"))};
+    const handle = initializeSessionBookkeeping(${JSON.stringify(directory)});
+    await sqliteLifecycleBackend.runGc([], {
+      storeDir: ${JSON.stringify(directory)}, now: () => 1000,
+      deletionTimeoutMs: 60000, sdkModuleUrl: ${JSON.stringify(pathToFileURL(sdk).href)}
+    });
+    handle.close();
+  `], { stdout: "ignore", stderr: "pipe" })
+  let executor: ReturnType<typeof incarnations.captureProcessIncarnation>
+  try {
+    for (let attempt = 0; attempt < 500 && !existsSync(marker); attempt++) await Bun.sleep(10)
+    expect(existsSync(marker)).toBe(true)
+    const entered = JSON.parse(readFileSync(marker, "utf8")) as { id: string; pid: number; node: string }
+    expect(entered.id).toBe(locator.sessionId); expect(entered.node).toMatch(/^22\./)
+    const fenced = row(locator)
+    executor = fenced.deletionExecutor
+    expect(executor?.pid).toBe(entered.pid)
+    expect(fenced.deletionOwner?.pid).toBe(parent.pid)
+    expect(existsSync(join(directory, "deletion-gates", `${fenced.deletionToken}.go`))).toBe(true)
+    parent.kill("SIGKILL"); await parent.exited
+    expect(incarnations.processIncarnationIsDead(fenced.deletionOwner!)).toBe(true)
+    expect(incarnations.processIncarnationIsDead(executor!)).toBe(false)
+    let calls = 0
+    for (let pass = 0; pass < 2; pass++) {
+      expect(await facade.runGc([], { ...options, deleter: async () => { calls++ } }))
+        .toEqual({ deleted: 0, notFound: 0, failed: 0, deferred: 1 })
+      expect((await facade.reconcile([], options)).deletingRecovered).toBe(0)
+      expect(row(locator)).toEqual(fenced)
+      expect(await claimDeletion([], options)).toBeUndefined()
+    }
+    expect(calls).toBe(0)
+    process.kill(executor!.pid, "SIGKILL")
+    for (let attempt = 0; attempt < 500 && !incarnations.processIncarnationIsDead(executor!); attempt++) await Bun.sleep(10)
+    expect(incarnations.processIncarnationIsDead(executor!)).toBe(true)
+    await finishDeletion(fenced.key, fenced.deletionToken!, undefined, options)
+    expect(row(locator).state).toBe("deleted")
+  } finally {
+    parent.kill("SIGKILL"); await parent.exited
+    executor ??= row(locator).deletionExecutor
+    if (executor && !incarnations.processIncarnationIsDead(executor)) process.kill(executor.pid, "SIGKILL")
+  }
+}, 15_000)
 
 it("real Node child enters marker SDK only after executor attachment commits; capture has no SQL scope", async () => {
   const locator = seed(), marker = join(directory, "marker.json"), sdk = join(directory, "marker-sdk.mjs")

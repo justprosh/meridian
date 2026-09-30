@@ -5,6 +5,7 @@ import { readResource, readResourceLease } from "../../proxy/session/bookkeeping
 import { RESOURCE_STATES } from "../../proxy/session/bookkeeping/schema"
 import type { TranscriptResource } from "../../proxy/session/bookkeeping/types"
 import { sqliteLifecycleTest } from "./bookkeeping-lifecycle-install"
+import { getSessionStoreDir, readSessionTranscriptPins } from "../../proxy/sessionStore"
 
 export interface LifecycleState {
   resources: Record<string, TranscriptResource>
@@ -12,9 +13,17 @@ export interface LifecycleState {
   counts: Record<string, number>
 }
 
+/** Cross-backend test observation API. SQL state and public pin projection share one read scope.
+ * JSON has no public lifecycle snapshot API: its read-only codec stays behind this adapter. */
+export function observeLifecycleLedger(directory: string, sqlite = sqliteLifecycleTest) {
+  if (getSessionStoreDir() !== directory) throw new Error("observer requires the installed store directory")
+  const capture = () => ({ state: observeLifecycleState(directory, sqlite), pins: readSessionTranscriptPins() })
+  return sqlite ? withBookkeepingRead(directory, capture) : capture()
+}
+
 /** Observe ledger state in one read scope on the installed handle; never open a writer. */
-export function observeLifecycleState(directory: string): LifecycleState {
-  if (!sqliteLifecycleTest) {
+export function observeLifecycleState(directory: string, sqlite = sqliteLifecycleTest): LifecycleState {
+  if (!sqlite) {
     const sidecar = JSON.parse(readFileSync(join(directory, "session-gc.json"), "utf8")) as {
       resources: Record<string, TranscriptResource>; meta?: { fenceSlots?: Record<string, number> }
     }
