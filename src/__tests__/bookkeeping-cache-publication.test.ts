@@ -20,11 +20,16 @@ const incoming = [...messages, { role: "user", content: "next" }]
 const directoryHint = "/workspace"
 let directory: string, previousDirectory: string, handle: BookkeepingHandle
 let injection: ReturnType<typeof lifecycleCommitInjection>
+let transactionStatements: string[]
 beforeEach(() => {
   previousDirectory = getSessionStoreDir()
   directory = realpathSync(mkdtempSync(join(tmpdir(), "cache-publication-")))
   injection = lifecycleCommitInjection()
-  handle = initializeSessionBookkeeping(directory, injection)
+  transactionStatements = []
+  handle = initializeSessionBookkeeping(directory, { executeTransaction(db, sql) {
+    transactionStatements.push(sql)
+    injection.executeTransaction(db, sql)
+  } })
   setSessionStoreDir(directory)
   setSessionStoreBackendForTest(sqliteSessionStoreBackend)
   clearSessionCache()
@@ -70,6 +75,36 @@ function clearSharedMapping(key: string | undefined): void {
 
 describe("cache effects follow durable SQLite COMMIT (graph #205)", () => {
   for (const key of ["key", undefined]) {
+    it(`${key ?? "fingerprint"}: a foreign initialized transaction rejects before cache fallback or touch`, () => {
+      const otherDirectory = realpathSync(mkdtempSync(join(tmpdir(), "cache-foreign-")))
+      const otherHandle = initializeSessionBookkeeping(otherDirectory)
+      const originalNow = Date.now
+      try {
+        storeSession(key, messages, "cached-B", directoryHint)
+        setSessionStoreBackendForTest({ ...sqliteSessionStoreBackend,
+          lookupSharedSessionResult: () => ({ status: "error", error: new Error("read unavailable") }) })
+        const cached = lookupSession(key, incoming, directoryHint)
+        if (cached.type !== "continuation") throw new Error("cached B mapping missing")
+        const lastAccess = cached.session.lastAccess
+        setSessionStoreBackendForTest(sqliteSessionStoreBackend)
+        Date.now = () => lastAccess + 1000
+        expect(withBookkeepingWrite(otherDirectory, { scope: "publication" }, () => {
+          let failure: unknown
+          try { lookupSession(key, incoming, directoryHint) } catch (error) { failure = error }
+          // Check the observable cache object as well as rejection: a swallowed error must not touch it.
+          expect(cached.session.lastAccess).toBe(lastAccess)
+          expect(failure).toBeInstanceOf(Error)
+          expect((failure as Error).message).toBe("cross-database publication is forbidden")
+          return false
+        })).toBe(false)
+        expect(cached.session.lastAccess).toBe(lastAccess)
+      } finally {
+        Date.now = originalNow
+        setSessionStoreBackendForTest(sqliteSessionStoreBackend)
+        otherHandle.close()
+        rmSync(otherDirectory, { recursive: true, force: true })
+      }
+    })
     it(`${key ?? "fingerprint"}: transaction read errors never fall back to LRU`, () => {
       storeSession(key, messages, "old", directoryHint)
       setSessionStoreBackendForTest({ ...sqliteSessionStoreBackend,
@@ -83,15 +118,24 @@ describe("cache effects follow durable SQLite COMMIT (graph #205)", () => {
     })
     it(`${key ?? "fingerprint"}: success publishes only after COMMIT and reads its own writes`, () => {
       storeSession(key, messages, "old", directoryHint)
+      const start = transactionStatements.length
       withBookkeepingWrite(directory, { scope: "publication" }, () => {
         expect(storeSession(key, messages, "new", directoryHint)).not.toBe(false)
         const result = lookupSession(key, incoming, directoryHint)
         expect(result.type).toBe("continuation")
         if (result.type === "continuation") expect(result.session.claudeSessionId).toBe("new")
         expect(getSessionByClaudeId("new")?.claudeSessionId).toBe("new")
+        expect(transactionStatements.slice(start)).toEqual(["BEGIN IMMEDIATE"])
         return true
       })
+      expect(transactionStatements.slice(start)).toEqual(["BEGIN IMMEDIATE", "COMMIT"])
       expect(cachedId(key)).toBe("new")
+    })
+    it(`${key ?? "fingerprint"}: a standalone cache lookup opens only the store's one read transaction`, () => {
+      storeSession(key, messages, "old", directoryHint)
+      const start = transactionStatements.length
+      expect(lookupSession(key, incoming, directoryHint).type).toBe("continuation")
+      expect(transactionStatements.slice(start)).toEqual(["BEGIN", "COMMIT"])
     })
     for (const outcome of ["throw", "false", "busy-before", "ioerr-before", "ioerr-after"] as const) {
       it(`${key ?? "fingerprint"}: ${outcome} discards writes and lookup cache effects`, () => {

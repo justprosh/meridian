@@ -25,7 +25,7 @@ import {
 } from "../sessionStore"
 import { activeStoreBackend } from "./bookkeeping/storeBackend"
 import { connectionFor } from "./bookkeeping/connection"
-import { withStoreWrite } from "./bookkeeping/storeScope"
+import { withStoreRead, withStoreWrite } from "./bookkeeping/storeScope"
 import { getConversationFingerprint } from "./fingerprint"
 import {
   computeLineageHash,
@@ -119,6 +119,14 @@ function afterSessionStoreCommit(effect: () => void): void {
   } else if (scope !== "read") {
     effect()
   }
+}
+
+function lookupSharedSessionForCache(key: string): ReturnType<typeof lookupSharedSessionResult> {
+  // Address the engine before the store's degraded-read catch. Its own read joins this
+  // scope, so a foreign publication cannot turn into LRU authority (graph #205).
+  return activeStoreBackend()
+    ? withStoreRead(getSessionStoreDir(), () => lookupSharedSessionResult(key))
+    : lookupSharedSessionResult(key)
 }
 
 /** Clear all session caches (used in tests).
@@ -391,12 +399,12 @@ export function lookupSession(
   messages: Array<{ role: string; content: any }>,
   workingDirectory?: string
 ): LineageResult {
-  const inTransaction = isSessionStoreTransactionActive()
   if (sessionId) {
     // A durable absence is an authoritative eviction. Only an actual store
     // read error may use the local fallback; otherwise another proxy's abort
     // could be resurrected from stale memory.
-    const shared = lookupSharedSessionResult(sessionId)
+    const shared = lookupSharedSessionForCache(sessionId)
+    const inTransaction = isSessionStoreTransactionActive()
     const cached = inTransaction ? undefined : sessionCache.get(sessionId)
     const state = shared.status === "found"
       ? stateFromSharedSession(shared.session)
@@ -435,7 +443,8 @@ export function lookupSession(
   if (!workingDirectory) warnDegradedFingerprintOnce()
   const fp = getConversationFingerprint(messages, workingDirectory)
   if (fp) {
-    const shared = lookupSharedSessionResult(fp)
+    const shared = lookupSharedSessionForCache(fp)
+    const inTransaction = isSessionStoreTransactionActive()
     const cached = inTransaction ? undefined : fingerprintCache.get(fp)
     const state = shared.status === "found"
       ? stateFromSharedSession(shared.session)
