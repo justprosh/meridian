@@ -368,7 +368,8 @@ export function openHandle(
         }
         if (!migration) throw new BookkeepingMaintenanceRequiredError("database without owned provenance; refuse implicit adoption")
       }
-      if (expectPhase === undefined && lstatSync(path).nlink !== 1)
+      const publication = lstatSync(path)
+      if (expectPhase === undefined && publication.isFile() && publication.nlink !== 1)
         throw new BookkeepingMaintenanceRequiredError("published bootstrap alias requires recover-bootstrap --writers-stopped before runtime")
       cleanupBootstrapOrphans(path)
       const db = openDatabase(path, expectPhase ?? "READY", true, skipRealpathAudit)
