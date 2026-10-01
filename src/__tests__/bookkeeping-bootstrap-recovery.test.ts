@@ -110,3 +110,30 @@ it("first-guard alias cleanup keeps actual cross-process EXCLUSIVE exclusion thr
   expect(controls).toBe(1)
   expect(spawnSync("node", [join(root, "probe.mjs"), directory, "probe"]).status).toBe(0)
 })
+
+it.each(["directory", "directory-with-child", "symlink", "fifo"] as const)
+  ("nonregular main path is rejected before bootstrap-alias classification (%s)", kind => {
+    const handle = initializeSessionBookkeeping(directory), path = handle.path
+    handle.close()
+    rmSync(path)
+    const target = join(directory, "untouched-target")
+    writeFileSync(target, "unchanged", { mode: 0o600 })
+    if (kind === "directory" || kind === "directory-with-child") {
+      mkdirSync(path, { mode: 0o700 })
+      if (kind === "directory-with-child") mkdirSync(join(path, "child"), { mode: 0o700 })
+      expect(lstatSync(path).nlink).toBeGreaterThan(1)
+    } else if (kind === "symlink") {
+      const result = spawnSync("ln", ["-s", target, path])
+      expect(result.status).toBe(0)
+    } else expect(spawnSync("mkfifo", [path]).status).toBe(0)
+    const identity = lstatSync(path)
+    let failure: unknown
+    try { initializeSessionBookkeeping(directory).close() } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(Error)
+    const message = String(failure)
+    expect(message).toContain("regular")
+    expect(message).not.toContain("bootstrap alias")
+    expect(message).not.toContain("recover-bootstrap")
+    expect(lstatSync(path).ino).toBe(identity.ino)
+    expect(readFileSync(target, "utf8")).toBe("unchanged")
+  })

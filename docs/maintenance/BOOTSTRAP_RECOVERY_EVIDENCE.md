@@ -66,3 +66,25 @@ published independently of checkpoint outcome; checkpoint deferral/failure has
 distinct diagnostics and frame-count debt. External readers/writers can still
 prevent WAL progress, so neither this mechanism nor focused tests claim that
 every sweep shrinks WAL. Offline TRUNCATE remains exclusive and unchanged.
+
+## Nonregular-path integration follow-up
+
+Runtime follow-up `d052795d4937d2af790fbf866ff8fb594eece39f` must accompany A:
+only regular published files may receive the bootstrap-alias recovery hint.
+Directories, symlinks and FIFOs remain nonregular-file refusals before native
+open, without inode changes. Alias/ownership/OS-lock guards are not loosened.
+
+Exact unchanged `bookkeeping-schema.test.ts` was re-run on own immutable source
+snapshots and the corrected head under Node22/APFS: f464 and clean rebase 754
+fail at the directory assertion; d052 passes. The two failing connection files
+are byte-identical; the schema test is byte-identical in ALL three heads. This
+is an omitted late runtime follow-up, not a Node version, directory nlink or
+test-surface discrepancy. The original standalone Node counterexample observes
+directory nlink=2/mode=755 in both snapshots, but its wrong-class assertion no
+longer reproduces on d052. Raw records: `.evidence/type-classification/`.
+
+The additional table regression covers plain directory, directory with child
+(nlink>2), symlink and FIFO; both historical snapshots fail the directory cases
+and the corrected head passes all four without touching targets. Existing real
+recoverable nlink=2, live/unknown/foreign-owner and cross-process exclusion
+controls remain separate tests, not replaced by this negative-path table.
