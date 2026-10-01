@@ -7039,3 +7039,36 @@ Use the live companion with the same client/CLI and installed Pi scrub entry:
 `E2E_MERIDIAN_ROOT=<built checkout> E2E_PI_CLI=<cli.js> E2E_CLAUDE_BIN=<2.1.283> E2E_PLUGIN_PATH=<entrypoint> node scripts/e2e-pi-live-idle-control.mjs`.
 The controlled upstream is not a live model; the companion uses actual Opus 5.5
 and proves a real read receipt and Pi session continuation.
+
+# Packaged SQLite bookkeeping gate
+
+For a SQLite candidate, build and pack the final tree, then install both artifacts
+through the canonical smoke (Node 22):
+
+```sh
+npm run build
+npm pack --json
+node scripts/e2e-session-bookkeeping-packaged.mjs \
+  --package ./rynfar-meridian-<candidate>.tgz \
+  --baseline-package /path/to/independently-built-json-baseline.tgz
+node scripts/e2e-libsql-package.mjs ./rynfar-meridian-<candidate>.tgz
+```
+
+The bookkeeping smoke imports no `src/` modules: independently installed packages
+serve seeded context usage over HTTP, two Node processes share one SQLite
+directory, live owners refuse export, one owner's close preserves the other,
+restart retains mappings, explicit export restores a JSON baseline read, and a
+fresh directory initializes without migration. The baseline tarball is explicit
+because registry 1.78.0 has the known bundled-libsql import defect; a failed old
+import is not a successful rollback test.
+
+This gate exercises storage and server integration, **not** real model/SDK turns.
+It does not replace the affected-flow chain/parallel, stream/non-stream, resume,
+Linux admission or deletion-child platform scenarios in this guide. Run the same final
+package smoke on Linux before claiming Linux delivery. Node/OS/architecture,
+artifact digests, baseline identity and exit codes belong in the durable evidence.
+
+The old-writer compatibility suite also accepts an optional pre-SQLite package:
+`BOOKKEEPING_COMPAT_TARBALL=/path/to/package.tgz bun test src/__tests__/bookkeeping-old-artifacts.test.ts`.
+It supplements the published baseline with the same writer/gate assertions;
+an unavailable optional artifact is reported explicitly, not counted as a pass.
