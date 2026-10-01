@@ -1214,16 +1214,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       })
   }
 
-  /** Inspect a NON-STREAM inner response for an account-level failure.
+  function isEventStream(res: Response): boolean {
+    return (res.headers.get("content-type") ?? "").includes("text/event-stream")
+  }
+
+  /** Inspect a non-SSE inner response for an account-level failure.
    *  An account-shaped error on a non-OK status is worth another account;
    *  anything else is this account's honest answer and belongs to the client
-   *  untouched.
-   *
-   *  Streaming requests never reach this path: dispatchPriority returns the
-   *  outer SSE response immediately and `streamPriorityDispatch` runs
-   *  account selection inside that stream (`relayStreamAttempt`), forwarding
-   *  content-free keepalives while a verdict is pending. Awaiting a stream's
-   *  verdict here would withhold response headers and keepalives.
+   *  untouched. SSE bodies are decided in-stream by `streamPriorityDispatch`.
    *  The status gate is `!res.ok` rather than a literal 429
    *  because the qualifying types do not share one status — a spent quota
    *  window is 429, a refused subscription 402. */
@@ -1231,10 +1229,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     | { failed: true; errorPayload: unknown; errorType: string; response: Response }
     | { failed: false; errorPayload: null; errorType: null; response: Response }
   > {
-    const contentType = res.headers.get("content-type") ?? ""
-    // Streaming bodies are decided by the in-stream dispatcher; this sniffer
-    // must never await one.
-    if (contentType.includes("text/event-stream") || res.ok) {
+    if (isEventStream(res) || res.ok) {
       return { failed: false, errorPayload: null, errorType: null, response: res }
     }
     const body = await res.clone().json().catch(() => null) as { error?: { type?: string } } | null
@@ -1290,12 +1285,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return until
   }
 
-  /** Streaming priority dispatch: the candidate loop runs INSIDE the
-   *  client-facing stream.
+  /** Streaming priority dispatch, entered once an account answers with SSE:
+   *  that attempt and every later candidate run INSIDE the client-facing
+   *  stream.
    *
-   *  The outer SSE Response is returned before any attempt is awaited, so
-   *  response headers reach the client immediately; while an account is
-   *  still deciding, keepalives keep the connection live. An account-failover
+   *  The outer SSE Response is returned before the handed attempt's first
+   *  frame, so headers reach the client immediately and keepalives keep the
+   *  connection live while an account is still deciding. An account-failover
    *  error before any real frame suppresses that account and starts the next
    *  candidate — never on a cancelled request. The first real frame (content
    *  or an honest error) relays byte-exact; an exposure-committed attempt's
@@ -1309,6 +1305,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     options: PriorityDispatchOptions,
     attemptOwnerToken: string | undefined,
     settleAttempt: (disposition: "release" | "block") => boolean,
+    start: {
+      attempt: number
+      inner: Response
+      exposure: PriorityAttemptExposure
+      lastError: unknown
+      previous: string | null
+      previousReason: string
+      earliestPoolReset: number | null
+    },
   ): Promise<Response> {
     const encoder = new TextEncoder()
     const errorFrame = (payload: unknown): Uint8Array =>
@@ -1337,30 +1342,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
         let lastInner: Response | null = null
         try {
-          let lastError: unknown = null
-          let previous: string | null = null
-          let previousReason = "rate_limit_error"
-          let earliestPoolReset: number | null = null
-          for (const [attempt, candidate] of options.candidateIds.entries()) {
-            if (isCancelled() || requestAbort.controller.signal.aborted) break
-            activeExposure = { committed: false }
-            const { inner, exposure } = await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken, requestAbort, activeExposure)
+          let { lastError, previous, previousReason, earliestPoolReset } = start
+          for (let attempt = start.attempt; attempt < options.candidateIds.length; attempt++) {
+            const candidate = options.candidateIds[attempt]!
+            const handed = attempt === start.attempt
+            // The handed attempt is always relayed: its reader owns the cancel.
+            if (!handed && isCancelled()) break
+            activeExposure = handed ? start.exposure : { committed: false }
+            const { inner, exposure } = handed
+              ? start
+              : await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken, requestAbort, activeExposure)
             lastInner = inner
             const verdict = await relayStreamAttempt(inner, { ...sink, isCancelled })
             if (verdict.kind === "suppressed") {
-              // This is a terminal account error, as in the original sniffer.
               // Cancel BEFORE joining cleanup, then read the final exposure
               // state. Cleanup may itself latch a side effect; testing the
               // barrier before completion could replay an exposed attempt.
               await verdict.discard()
               await responseCompletions.get(inner)?.catch(() => {})
-              if (isCancelled()) {
-                break
-              }
               const reason = verdict.errorType
-              // Only a quota refusal has a reset to look up; otherwise the
-              // conservative default stands (see the non-stream loop).
               const cooldownUntil = markPriorityFailure(candidate, reason)
+              if (isCancelled()) break
               earliestPoolReset = Math.min(earliestPoolReset ?? cooldownUntil, cooldownUntil)
               lastError = verdict.errorPayload
               previous = candidate
@@ -1379,10 +1381,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 for (const chunk of verdict.held) await enqueue(chunk)
                 return
               }
-              // Suppressible and unexposed: tear the attempt down the same
-              // way the awaited sniffer did, then try the next candidate.
-              // Do not keep the previous attempt's reader as the cancel target
-              // while the next handler is preparing its response.
+              // Suppressible and unexposed: try the next candidate, without
+              // the previous attempt's reader as the cancel target.
               sink.registerCancel(() => {})
               continue
             }
@@ -1450,12 +1450,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           }
         } catch (error) {
           failedUnexpectedly = true
-          // Headers are already sent; an unexpected dispatch failure can only
-          // surface as a stream error frame.
+          // Headers are already sent: classify as the route's own handler
+          // would, but deliver the verdict as a stream error frame.
+          const errMsg = error instanceof Error ? error.message : String(error)
+          claudeLog("error.unhandled", { error: errMsg })
           if (!isCancelled()) {
+            const classified = classifyError(errMsg)
             await enqueue(errorFrame({
               type: "error",
-              error: { type: "api_error", message: error instanceof Error ? error.message : String(error) },
+              error: { type: classified.type, message: classified.message,
+                ...retryAfterBodyFields(retryAfterSeconds({ status: classified.status })) },
             }))
           }
         } finally {
@@ -1537,13 +1541,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
     }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
 
-    // Streaming runs its candidate loop inside the client-facing stream, so
-    // headers and keepalives reach the client while an account is still
-    // deciding; the durable claim and its settlements carry over.
-    if (options.wantsStream) {
-      return streamPriorityDispatch(options, attemptOwnerToken, settleAttempt)
-    }
-
     let lastError: unknown = null
     let lastStatus = 429
     let previous: string | null = null
@@ -1554,6 +1551,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let earliestPoolReset: number | null = null
     for (const [attempt, candidate] of options.candidateIds.entries()) {
       const { inner, exposure } = await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken)
+      // A non-SSE answer is decided here and keeps its HTTP status. Once an
+      // account streams, headers go out and the remaining candidates are
+      // tried inside the stream.
+      if (options.wantsStream && isEventStream(inner)) {
+        return streamPriorityDispatch(options, attemptOwnerToken, settleAttempt, {
+          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset,
+        })
+      }
       const sniffed = await sniffAccountFailure(inner)
       if (!sniffed.failed) {
         if (options.sessionKey && !options.durableRoute) {

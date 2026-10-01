@@ -394,32 +394,20 @@ before the failure existed. Under priority routing the wait names the *pool's*
 earliest opening, not the last account tried.
 
 **Failover runs inside the client-facing stream.** Under priority routing a
-streaming request returns an outer SSE response immediately and the candidate
-loop runs inside it: content-free keepalives (`: ping` comments — the service
-emits one every 15s) reach the client while an account is still deciding.
-SDK transport pings remain non-progress and are discarded by the unchanged
-upstream idle guard. Response headers never wait on an account verdict
-(`streamPriorityDispatch`, framing in
-`sseFailureSniff.ts`). An account-failover `event: error` before any real
-frame suppresses that account and starts the next candidate — never on a
-cancelled request, and the outer cancellation reaches the active attempt even
-before its first meaningful frame. The first real frame (`message_start` or
-any other) relays byte-exact; a stream a client is already consuming is never
-yanked. An exposure-committed attempt relays its error instead of failing
-over, and a pool exhausted after headers emits one coherent SSE error frame,
-because the HTTP status can no longer be rewritten. Non-stream dispatch keeps
-the awaited status-code sniffer (`sniffAccountFailure`).
+streaming request is decided like a non-stream one until an account answers
+with SSE: a non-SSE answer (such as a session-conflict 400) keeps its HTTP
+status, and an account-failover refusal moves to the next candidate. Once an
+account streams, the outer SSE response goes out and the remaining candidates
+run inside it (`streamPriorityDispatch`, framing in `sseFailureSniff.ts`).
+Content-free keepalives (`: ping`, every 15s) reach the client while the
+account decides; SDK transport pings stay non-progress for the idle guard. An
+account-failover `event: error` before any real frame suppresses that account
+and starts the next — never on a cancelled request. The first real frame
+relays byte-exact, an exposure-committed attempt relays its error instead of
+failing over, and a pool exhausted after headers emits one SSE error frame.
 
-The relay's outer queue applies byte-based backpressure (64 KiB plus at most
-one 16-KiB write), with keepalive timers skipping full queues. This does not
-change the SDK producer's existing buffering. Cancellation aborts the shared
-request link even while the next inner response is being prepared; a reader
-registered after cancellation is cancelled immediately. Suppressed readers
-are discarded before awaiting their completion. Incomplete EOF bytes are
-preserved, and undecoded UTF-8 bytes cannot be mistaken for an empty prelude.
-An incomplete prelude reaching 64 KiB conservatively ends sniffing and relays
-the attempt unchanged, preventing unbounded frame buffering without allowing
-cross-account replay after those bytes have been exposed.
+The relay is bounded: the outer queue holds 64 KiB, and an incomplete prelude
+reaching 64 KiB ends sniffing and relays the attempt unchanged.
 
 **A `[1m]` bench is scoped to whatever actually failed.** Extra Usage exhaustion
 is an entitlement fact about the account, so it benches the whole profile. A

@@ -114,12 +114,9 @@ export function classifySseFrame(frame: string): SseFrameClass {
 }
 
 /**
- * Incremental prelude scanner for a caller that streams chunks through the
- * verdict (the streaming priority dispatcher forwards keepalives while it
- * sniffs, so it cannot hold the decoded text the way an awaited sniffer
- * would). Feed each decoded chunk with `push`, drain complete frames with
- * `next`, then `trim` to drop the consumed text — the retained tail is only
- * the incomplete frame, bounded by one frame's size.
+ * Incremental prelude scanner. Feed each decoded chunk with `push`, drain
+ * complete frames with `next`, then `trim` to drop the consumed text — the
+ * retained tail is only the incomplete frame.
  */
 export class SsePreludeScanner {
   private text = ""
