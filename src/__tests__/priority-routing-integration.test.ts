@@ -1733,6 +1733,42 @@ describe("priority routing", () => {
     expect(text.split("event: message_start").length - 1).toBe(1)
   }, 20_000)
 
+  it("keeps a pre-stream refusal's own HTTP status on a streaming request", async () => {
+    const gate = createStreamCompletionGate(++capturePhase)
+    streamCompletionGate = gate
+    const app = createTestApp()
+    const headers = { "x-opencode-session": "stream-conflict-session" }
+    const first = await postStream(app, { headers, content: "same request" })
+    await gate.entered
+    const second = postStream(app, { headers, content: "same request" })
+    await Bun.sleep(10)
+    gate.open()
+    await first.text()
+    const refused = await second
+    expect(refused.status).toBe(400)
+    expect(refused.headers.get("content-type")).toContain("application/json")
+    const body = await refused.json() as { error: { type: string } }
+    expect(body.error.type).toBe("invalid_request_error")
+  }, 20_000)
+
+  it("lets a compat route relay a pre-stream refusal with its status", async () => {
+    const gate = createStreamCompletionGate(++capturePhase)
+    streamCompletionGate = gate
+    const app = createTestApp()
+    const completion = () => app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-opencode-session": "compat-conflict-session" },
+      body: JSON.stringify({ model: "claude-sonnet-4-5", stream: true, messages: [{ role: "user", content: "same request" }] }),
+    }))
+    const first = await completion()
+    await gate.entered
+    const second = completion()
+    await Bun.sleep(10)
+    gate.open()
+    await first.text()
+    expect((await second).status).toBe(400)
+  }, 20_000)
+
   const STREAM_BODY = JSON.stringify({
     model: "claude-sonnet-4-5",
     max_tokens: 128,
@@ -1741,11 +1777,8 @@ describe("priority routing", () => {
   })
 
   it("streams fail over when a keepalive ping precedes the account error", async () => {
-    // The SDK emits ping keepalives while the account decision is pending. A
-    // ping frame carries no content, so the quota refusal behind it must still
-    // reach the sniffer: the shipped code stopped at the FIRST complete
-    // frame, took the ping as the whole verdict, and relayed rate_limit_error
-    // straight to the client with the pool untouched.
+    // A ping frame carries no content, so the quota refusal behind it must
+    // still reach the sniffer and fail over.
     preludePingDirs.add("prof-work")
     const app = createTestApp()
     const res = await app.fetch(new Request("http://localhost/v1/messages", {

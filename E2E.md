@@ -4794,8 +4794,6 @@ working Claude Max credential directory.
 `E2E_SSE_WORKING_FIXTURE=1` replaces the answering account with a local
 fixture. This exercises the installed package, SDK/CLI and HTTP delivery
 without credentials, but does not establish live subscription/client behavior.
-Preserve both the failing baseline and passing candidate results, package
-digests, and the working-leg mode in the PR evidence.
 
 ## E45: Codex auto-defer
 
