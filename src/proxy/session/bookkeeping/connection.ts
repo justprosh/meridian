@@ -5,6 +5,7 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
@@ -12,7 +13,7 @@ import {
 } from "node:fs"
 import { cleanupBootstrapOrphans, createBootstrapPath, finishBootstrap } from "./bootstrapOwner"
 import { setTimeout as delay } from "node:timers/promises"
-import { join, resolve } from "node:path"
+import { basename, join, resolve } from "node:path"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
 import {
   BookkeepingBusyError, BookkeepingMaintenanceRequiredError, errorCode, ownedFd, assertSupportedFilesystem,
@@ -188,6 +189,7 @@ function bootstrap(path: string, phase = "READY", provenance?: MigrationJournal)
     }
     try {
       linkSync(temporary, path)
+      crashPoint(`bootstrap:linked:${basename(path)}`)
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error
     }
@@ -366,6 +368,8 @@ export function openHandle(
         }
         if (!migration) throw new BookkeepingMaintenanceRequiredError("database without owned provenance; refuse implicit adoption")
       }
+      if (expectPhase === undefined && lstatSync(path).nlink !== 1)
+        throw new BookkeepingMaintenanceRequiredError("published bootstrap alias requires recover-bootstrap --writers-stopped before runtime")
       cleanupBootstrapOrphans(path)
       const db = openDatabase(path, expectPhase ?? "READY", true, skipRealpathAudit)
       if (expectPhase === undefined) {

@@ -39,7 +39,9 @@ export const digestBytes = (value: string) => createHash("sha256").update(value)
 
 /** Atomic file publication; callers hold the exclusive maintenance guard. */
 export function writeDurably(path: string, value: string): void {
-  const temporary = privateName(path + ".write", randomUUID())
+  // Never derive a write temporary from the destination (which may itself be
+  // a long legacy intent name). Fixed basename bounds every UTF-8 component.
+  const temporary = privateName(join(dirname(path), ".bk-write"), randomUUID())
   const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
   try {
     writeFileSync(fd, value)

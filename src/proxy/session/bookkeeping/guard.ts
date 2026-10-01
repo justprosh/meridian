@@ -11,8 +11,9 @@ import {
   realpathSync,
   statfsSync,
 } from "node:fs"
-import { cleanupBootstrapOrphans, createBootstrapPath, finishBootstrap } from "./bootstrapOwner"
-import { join, resolve } from "node:path"
+import { assertDeadBootstrapAliases, cleanupBootstrapOrphans, createBootstrapPath, finishBootstrap } from "./bootstrapOwner"
+import { basename, join, resolve } from "node:path"
+import { crashPoint } from "./maintenanceJournal"
 import { pathToFileURL } from "node:url"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
 import { pragmaValue } from "./schema"
@@ -152,6 +153,7 @@ function bootstrap(path: string): { dev: number; ino: number } | undefined {
     }
     try {
       linkSync(temporary, path)
+      crashPoint(`bootstrap:linked:${basename(path)}`)
       const published = lstatSync(temporary)
       return { dev: published.dev, ino: published.ino }
     } catch (error) {
@@ -219,9 +221,16 @@ function openGuard(directory: string, mode: State["mode"], recoveringIdentity?: 
     throw new BookkeepingGuardBusyError("maintenance guard is held; stop all proxies before maintenance")
   }
   let createdIdentity: { dev: number; ino: number } | undefined
+  let recoverAlias = false
   if (!existing) {
-    createdIdentity = bootstrap(path)
-    checkFiles(path)
+    if (existsSync(path) && lstatSync(path).nlink === 2) {
+      if (mode !== "exclusive") throw new BookkeepingGuardBusyError("bootstrap alias requires explicit exclusive recovery")
+      assertDeadBootstrapAliases(path)
+      recoverAlias = true
+    } else {
+      createdIdentity = bootstrap(path)
+      checkFiles(path)
+    }
   }
   let db: Database.Database | undefined
   try {
@@ -294,6 +303,14 @@ function openGuard(directory: string, mode: State["mode"], recoveringIdentity?: 
       },
     }
     leases.set(lease, state)
+    if (recoverAlias) {
+      try { cleanupBootstrapOrphans(path) } catch (error) {
+        lease.close()
+        db = undefined
+        throw error
+      }
+      if (lstatSync(path).nlink !== 1) { lease.close(); db = undefined; throw new Error("guard bootstrap alias recovery incomplete") }
+    }
     return lease
   } catch (error) {
     if (db && !connections.has(path)) {
@@ -331,13 +348,16 @@ export function assertGuardRecoveryQuiescent(): void {
   if (connections.size || inspections || terminal.size)
     throw new BookkeepingGuardBusyError("stop local SQLite owners before guard recovery")
 }
+export function assertInspectionQuiescent(): void {
+  if (connections.size || inspections || terminal.size)
+    throw new BookkeepingGuardBusyError("same-process inspection forbidden while SQLite handles are open; use a separate CLI process")
+}
 
 /** Inspection never bootstraps, repairs permissions, increments epochs or creates a journal. */
 export function acquireInspectionGuard(directory: string): GuardLease | undefined {
   // POSIX locks are process-owned: even a readonly auxiliary fd close can revoke
   // SQLite's locks. Reject process-wide, so main/guard hardlink aliases are covered.
-  if (connections.size || inspections || terminal.size)
-    throw new BookkeepingGuardBusyError("same-process inspection forbidden while SQLite handles are open; use a separate CLI process")
+  assertInspectionQuiescent()
   const canonical = realpathSync.native(resolve(directory))
   assertNoGuardRetirement(canonical)
   closeSync(ownedFd(canonical, true, false, true))

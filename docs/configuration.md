@@ -1169,6 +1169,26 @@ inspection refuses while any local SQLite owner exists (including alias paths):
 opening/closing an auxiliary descriptor for a POSIX lock-bearing inode can revoke
 the owner's OS locks even when SQLite still reports an active transaction.
 
+If a crash occurred after bootstrap's temporary-to-public hardlink but before
+private alias retirement, `inspect` reports `temporary.kind=bootstrap-alias`
+without mutating/opening that SQLite inode. This is diagnostic residue, not a
+certification that runtime can serve. Recover through the CLI only:
+
+```sh
+meridian-bookkeeping recover-bootstrap --session-dir /private/session-dir --writers-stopped --json
+meridian-bookkeeping migrate --session-dir /private/session-dir --writers-stopped --json
+```
+
+`migrate --writers-stopped` and `export-json --writers-stopped` can run this
+recovery before their normal phase checks. Recovery locks the published original
+guard exclusively, including the first-guard link window, before alias cleanup;
+it never opens/closes an auxiliary descriptor for that SQLite inode. A valid
+owner record must prove the exact bootstrap process dead; stopped attestation
+does not override live, ambiguous or missing ownership. Inode mismatch/foreign
+hardlinks refuse without deletion/adoption. Public main/guard identities stay
+unchanged. Private capture/intent/write names are bounded to filesystem NAME_MAX
+in UTF-8 bytes; legacy pending names remain readable and resumable.
+
 Use the freshly exported JSON, never the original migrated backups: those omit
 all later publications and fence advances. Do not start an old binary until
 export completes and its barriers have been released. Retain the cycle/archive

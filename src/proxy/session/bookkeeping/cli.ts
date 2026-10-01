@@ -14,8 +14,9 @@ import { preflightLegacyMigration, refuseUnjournaledDatabase } from "./maintenan
 import { SessionStoreLockTimeoutError } from "../storeErrors"
 import { SessionLifecycleLockError } from "../lifecycleErrors"
 import { recoverGuardRetirements } from "./guardRecovery"
+import { recoverBootstrapAliases } from "./bootstrapRecovery"
 
-const HELP = `meridian-bookkeeping <inspect|migrate|export-json|recanonicalize|abort-migration|recover-guard-retirement>
+const HELP = `meridian-bookkeeping <inspect|migrate|export-json|recanonicalize|abort-migration|recover-guard-retirement|recover-bootstrap>
   --session-dir <directory> [--json] [--writers-stopped]
 Stop and drain all writers before maintenance. migrate requires --writers-stopped
 (missing attestation exits 2). inspect is read-only and may run beside a live proxy.
@@ -37,8 +38,12 @@ Published maintenance guards are permanent. Historical guard-retirement intents 
 recover-guard-retirement --writers-stopped cancels intents only after restoring and exclusively locking the ORIGINAL inode;
 a different public guard or missing original inode refuses (operator-approved coherent backup restore, never manual unlink).
 In-process inspect refuses while any local SQLite owner exists; invoke the CLI in a separate process.
+Bootstrap link-window residues are reported read-only as kind=bootstrap-alias (not a READY certification).
+recover-bootstrap --writers-stopped takes exclusive ownership and retires only proven-dead private aliases;
+live/unknown/missing owner or foreign inode refuses even with attestation. migrate/export-json with the
+explicit stopped flag also perform this recovery before their normal phase checks. Never unlink public SQLite names.
 `
-const COMMANDS = ["inspect", "migrate", "export-json", "recanonicalize", "abort-migration", "recover-guard-retirement"]
+const COMMANDS = ["inspect", "migrate", "export-json", "recanonicalize", "abort-migration", "recover-guard-retirement", "recover-bootstrap"]
 class UsageError extends Error {}
 function parse(args: string[]) {
   const command = args[0]
@@ -51,11 +56,11 @@ function parse(args: string[]) {
     if (arg === "--session-dir" && directory === undefined && args[index + 1]
       && !args[index + 1]!.startsWith("--")) directory = args[++index]
     else if (arg === "--json" && !json) json = true
-    else if (arg === "--writers-stopped" && ["migrate", "export-json", "recover-guard-retirement"].includes(command) && !writersStopped) writersStopped = true
+    else if (arg === "--writers-stopped" && ["migrate", "export-json", "recover-guard-retirement", "recover-bootstrap"].includes(command) && !writersStopped) writersStopped = true
     else throw new UsageError(`unexpected argument: ${arg}`)
   }
   if (!directory) throw new UsageError("--session-dir is required")
-  if (["migrate", "recover-guard-retirement"].includes(command) && !writersStopped) throw new UsageError(`${command} requires --writers-stopped`)
+  if (["migrate", "recover-guard-retirement", "recover-bootstrap"].includes(command) && !writersStopped) throw new UsageError(`${command} requires --writers-stopped`)
   return { command, directory, json, writersStopped }
 }
 
@@ -99,6 +104,14 @@ export async function runBookkeepingCli(args: string[], afterMigrationPreflightF
       if (error instanceof BookkeepingBusyError || error instanceof BookkeepingOwnerMismatchError) throw error
     }
     record("inspect")
+    const bootstrap = before?.temporary.filter(row => row.kind === "bootstrap-alias") ?? []
+    if (options.command !== "inspect" && bootstrap.length) {
+      if (!options.writersStopped || bootstrap.some(row => row.verdict !== "dead-incarnation"))
+        throw new BookkeepingMaintenanceRequiredError("bootstrap alias requires dead-owner proof and recover-bootstrap --writers-stopped")
+      recoverBootstrapAliases(directory, { writersStopped: true })
+      before = inspectBookkeeping(directory)
+      record("bootstrap-recovered")
+    }
     if (options.command === "inspect") after = before
     else {
       const active = [...(before?.candidates ?? []), ...(before?.gates ?? []), ...(before?.temporary ?? [])].find((row) =>
@@ -128,6 +141,7 @@ export async function runBookkeepingCli(args: string[], afterMigrationPreflightF
       } else if (options.command === "export-json") result = exportBookkeepingJson(directory, { writersStopped: options.writersStopped })
       else if (options.command === "recanonicalize") result = recanonicalizeBookkeeping(directory)
       else if (options.command === "recover-guard-retirement") recoverGuardRetirements(directory, { writersStopped: options.writersStopped })
+      else if (options.command === "recover-bootstrap") recoverBootstrapAliases(directory, { writersStopped: options.writersStopped })
       else abortBookkeepingMigration(directory)
       // Abort preserves malformed source bytes; a successful abort need not make those bytes parseable.
       if (options.command === "abort-migration") {

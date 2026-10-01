@@ -2,7 +2,7 @@ import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstat
   readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
-import { privateName, unlinkPrivate } from "./privateNames"
+import { privateIntentName, privateName, shortPrivatePrefix, unlinkPrivate } from "./privateNames"
 import type { PrivatePath } from "./privateNames"
 import { errorCode } from "./storagePaths"
 import { crashPoint, writeDurably } from "./maintenanceJournal"
@@ -12,7 +12,8 @@ import { assertGuardNotRetired, assertNoGuardRetirement } from "./guardIdentity"
 
 export class PrivateIdentityError extends Error { readonly exitCode = 5 }
 export interface FileIdentity { dev: number; ino: number }
-interface Intent extends FileIdentity { source: string; private: string; id: string; nativeAlias?: true }
+export interface RetirementIntent extends FileIdentity { source: string; private: string; id: string; nativeAlias?: true }
+type Intent = RetirementIntent
 export interface RetirementHooks {
   beforeRename?: (path: string) => void
   afterRename?: (path: string) => void
@@ -73,24 +74,15 @@ function retire(source: string, id: string, expected: FileIdentity | undefined,
   assertGuardNotRetired(source)
   const directory = dirname(source)
   const prefix = `${basename(source)}.deletion-intent.releasing-`
-  const pending = readdirSync(directory).filter((name) => name.startsWith(prefix))
+  const short = basename(shortPrivatePrefix(source + ".deletion-intent", "i"))
+  const pending = readdirSync(directory).filter((name) => name.startsWith(prefix) || name.startsWith(short))
   for (const name of pending) {
     const path = join(directory, name)
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    let value: unknown
-    try {
-      if (!fstatSync(fd).isFile()) throw new PrivateIdentityError(`invalid deletion intent: ${path}`)
-      value = JSON.parse(readFileSync(fd, "utf8"))
-    } finally { closeSync(fd) }
-    if (!value || typeof value !== "object") throw new PrivateIdentityError(`invalid deletion intent: ${path}`)
-    const row = value as Record<string, unknown>
-    if (row.source !== source || !isUuidV4(row.id)
-      || typeof row.private !== "string" || (row.nativeAlias !== undefined && row.nativeAlias !== true)
-      || ![row.dev, row.ino].every((n) => typeof n === "number"
-        && Number.isSafeInteger(n) && n >= 0)) throw new PrivateIdentityError(`invalid deletion intent: ${path}`)
-    const intent = row as unknown as Intent
+    const row = readRetirementIntent(path)
+    if (row.source !== source) throw new PrivateIdentityError(`invalid deletion intent: ${path}`)
+    const intent = { ...row, ...(nativeAlias ? { nativeAlias: true as const } : {}) }
     if (expected && !sameInode(expected, intent)) throw new PrivateIdentityError(`foreign deletion intent: ${path}`)
-    complete(intent, privateName(source + ".deletion-intent", intent.id, path), hooks, true)
+    complete(intent, privateIntentName(source, intent.id, path), hooks, true)
   }
   if (pending.length || resumeOnly) return
   if (!existsSync(source)) return
@@ -102,7 +94,7 @@ function retire(source: string, id: string, expected: FileIdentity | undefined,
     }
     const identity = { dev: stat.dev, ino: stat.ino }
     const captured = privateName(source, id)
-    const journal = privateName(source + ".deletion-intent", id)
+    const journal = privateIntentName(source, id)
     const intent: Intent = { ...identity, id, source, private: captured,
       ...(nativeAlias ? { nativeAlias: true as const } : {}) }
     const journalFd = openSync(journal, "wx", 0o600)
@@ -134,4 +126,31 @@ export function resumeRetirements(directory: string): void {
   const sources = new Set(readdirSync(directory).filter((name) => name.includes(marker))
     .map((name) => name.slice(0, name.indexOf(marker))))
   for (const name of sources) resumeFileRetirement(join(directory, name))
+  for (const name of readdirSync(directory).filter(name => name.startsWith(".bk-i-"))) {
+    const path = join(directory, name)
+    const row = readRetirementIntent(path)
+    if (dirname(row.source) !== directory) throw new PrivateIdentityError("short retirement source escaped its directory")
+    privateIntentName(row.source, row.id, path)
+    resumeFileRetirement(row.source)
+  }
+}
+
+/** Read only intent metadata, never the lock-bearing source/capture inode. */
+export function readRetirementIntent(path: string): RetirementIntent {
+  const before = lstatSync(path)
+  if (!before.isFile() || before.nlink !== 1 || (process.getuid && before.uid !== process.getuid()))
+    throw new PrivateIdentityError(`invalid retirement intent: ${path}`)
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  let row: unknown
+  try {
+    if (!sameInode(fstatSync(fd), before)) throw new PrivateIdentityError("retirement intent changed")
+    row = JSON.parse(readFileSync(fd, "utf8"))
+  } finally { closeSync(fd) }
+  if (!row || typeof row !== "object") throw new PrivateIdentityError("invalid retirement intent")
+  const value = row as Record<string, unknown>
+  if (typeof value.source !== "string" || typeof value.private !== "string" || !isUuidV4(value.id)
+    || ![value.dev, value.ino].every(n => typeof n === "number" && Number.isSafeInteger(n) && n >= 0)
+    || (value.nativeAlias !== undefined && value.nativeAlias !== true)) throw new PrivateIdentityError("invalid retirement intent")
+  privateName(value.source, value.id, value.private)
+  return value as unknown as RetirementIntent
 }

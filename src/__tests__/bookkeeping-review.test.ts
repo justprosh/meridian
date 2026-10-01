@@ -382,7 +382,7 @@ for (const code of ["SQLITE_NOMEM", "SQLITE_CORRUPT", "SQLITE_CANTOPEN", "SQLITE
   })
 }
 
-it("two simultaneous initializers publish a complete schema and remove dead bootstrap temporary files", async () => {
+it("two simultaneous initializers publish a complete schema; dead linked bootstrap aliases require exclusive recovery", async () => {
   handle.close()
   for (const name of readdirSync(directory)) rmSync(join(directory, name), { recursive: true, force: true })
   const build = await buildNodeFixture("bookkeeping-bootstrap.ts", "bootstrap.mjs", directory)
@@ -423,6 +423,9 @@ it("two simultaneous initializers publish a complete schema and remove dead boot
   expect(safety.success).toBe(true)
   const orphan = spawnSync("node", [join(directory, "safety.mjs"), "orphan", directory])
   expect(orphan.status).toBe(0)
+  expect(() => initializeSessionBookkeeping(directory)).toThrow("recover-bootstrap")
+  const { recoverBootstrapAliases } = await import("../proxy/session/bookkeeping/bootstrapRecovery")
+  recoverBootstrapAliases(directory, { writersStopped: true })
   handle = initializeSessionBookkeeping(directory)
   expect(readdirSync(directory).some((name) => name.includes(".tmp-"))).toBe(false)
   expect(handle.reader.get("PRAGMA user_version")?.user_version).toBe(1)

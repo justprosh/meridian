@@ -37,9 +37,9 @@ function install(name, spec) {
 }
 const childFile = fileURLToPath(new URL("./fixtures/bookkeeping-package-server.mjs", import.meta.url))
 const legacyWriter = fileURLToPath(new URL("./fixtures/bookkeeping-package-legacy-writer.mjs", import.meta.url))
-async function start(packageRoot, sessionDirectory, mode, instances = "1") {
+async function start(packageRoot, sessionDirectory, mode, instances = "1", extraEnv = {}) {
   const child = fork(childFile, [packageRoot, sessionDirectory, mode, instances], {
-    env, stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env: { ...env, ...extraEnv }, stdio: ["ignore", "pipe", "pipe", "ipc"],
   })
   children.push(child)
   let stderr = ""
@@ -151,6 +151,29 @@ try {
   const recoveryJournal = JSON.parse(readFileSync(join(recoveryDirectory, "session-bookkeeping-migration.json"), "utf8"))
   assert(!existsSync(join(recoveryDirectory, gateName)))
   assert.equal(readFileSync(join(recoveryDirectory, "bookkeeping-cycles", recoveryJournal.id, "residue", gateName), "utf8"), "go\n")
+  for (const [kind, name] of [["guard", "session-bookkeeping-maintenance.sqlite"], ["main", "session-bookkeeping.sqlite"], ["fresh", "session-bookkeeping.sqlite"]]) {
+    const interrupted = join(root, `bootstrap-${kind}`)
+    mkdirSync(interrupted, { mode: 0o700 })
+    const point = `bootstrap:linked:${name}`
+    if (kind === "fresh") {
+      await assert.rejects(start(candidate, interrupted, "sqlite", "1", { MERIDIAN_BOOKKEEPING_TEST_CRASH: point }), /exited/)
+    } else {
+      writeFileSync(join(interrupted, "sessions.json"), "{}", { mode: 0o600 })
+      const killed = spawnSync(process.execPath, [cli, "migrate", "--session-dir", interrupted, "--writers-stopped", "--json"],
+        { cwd: root, env: { ...env, MERIDIAN_BOOKKEEPING_TEST_CRASH: point }, encoding: "utf8", timeout: 30_000 })
+      assert.equal(killed.signal, "SIGKILL")
+    }
+    const pub = join(interrupted, name), before = lstatSync(pub)
+    assert.equal(before.nlink, 2)
+    const classified = JSON.parse(run(process.execPath, [cli, "inspect", "--session-dir", interrupted, "--json"], root))
+    assert(classified.temporary.some(row => row.kind === "bootstrap-alias"))
+    assert.equal(lstatSync(pub).nlink, 2, "inspection mutated bootstrap residue")
+    run(process.execPath, [cli, "recover-bootstrap", "--session-dir", interrupted, "--writers-stopped", "--json"], root)
+    run(process.execPath, [cli, "migrate", "--session-dir", interrupted, "--writers-stopped", "--json"], root)
+    assert.equal(lstatSync(pub).ino, before.ino)
+    assert.equal(lstatSync(pub).nlink, 1)
+    assert.equal(JSON.parse(run(process.execPath, [cli, "inspect", "--session-dir", interrupted, "--json"], root)).phase, "ready")
+  }
   console.log(JSON.stringify({ verdict: "PASS", node: process.version, platform: process.platform,
     architecture: process.arch, surface: "packaged runtime, migration, two HTTP processes, restart, export and baseline read",
     liveSdk: false }))

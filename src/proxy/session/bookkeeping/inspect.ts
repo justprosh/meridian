@@ -2,7 +2,9 @@ import Database from "libsql"
 import { closeSync, existsSync, lstatSync, readdirSync, realpathSync } from "node:fs"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
-import { acquireInspectionGuard } from "./guard"
+import { acquireInspectionGuard, assertInspectionQuiescent } from "./guard"
+import { bootstrapResidues } from "./bootstrapOwner"
+import { MAINTENANCE_GUARD_FILENAME } from "./guardIdentity"
 import { barrierBytes, readJournal, SOURCE_NAMES } from "./maintenanceJournal"
 import { protectedBytes, readExportJournal } from "./exportJournal"
 import { CYCLES_DIRECTORY, readTransition } from "./cycles"
@@ -42,8 +44,13 @@ export function inspectionDirectory(input: string): string {
 const bytes = (path: string) => protectedBytes(path, true, true).toString("utf8")
 
 export function inspectBookkeeping(input: string): Inspection {
+  assertInspectionQuiescent()
   const directory = inspectionDirectory(input)
-  const guard = acquireInspectionGuard(directory)
+  const bootstrap = ["session-bookkeeping.sqlite", MAINTENANCE_GUARD_FILENAME]
+    .flatMap(name => bootstrapResidues(join(directory, name)))
+  // An alias is diagnostic residue, NOT READY certification. Inspection never
+  // repairs it or opens/closes its lock-bearing SQLite inode.
+  const guard = bootstrap.length ? undefined : acquireInspectionGuard(directory)
   try {
     const migration = readJournal(directory, true)
     const exported = readExportJournal(directory, true)
@@ -67,13 +74,13 @@ export function inspectBookkeeping(input: string): Inspection {
     const path = join(directory, "session-bookkeeping.sqlite")
     const size = (file: string) => {
       if (!existsSync(file)) return 0
-      closeSync(ownedFd(file, false, false, true))
+      if (!bootstrap.length) closeSync(ownedFd(file, false, false, true))
       return lstatSync(file).size
     }
     const sizes = { main: size(path), wal: size(path + "-wal"), shm: size(path + "-shm") }
     const resources: Record<string, number> = Object.fromEntries(RESOURCE_STATES.map((state) => [state, 0]))
     let mappings = 0
-    if (sizes.main) {
+    if (sizes.main && !bootstrap.length) {
       if (!migration || !guard) throw new Error("database without migration journal/guard")
       if (!sizes.shm && sizes.wal) throw new Error("WAL without shared memory; offline recovery required")
       // libsql's JS readonly option is ignored; enforce read-only in the native SQLite URI.
@@ -96,7 +103,7 @@ export function inspectBookkeeping(input: string): Inspection {
         // snapshot explicitly: an inspection must not leave a read mark behind until GC.
         try { if (db.inTransaction) db.exec("ROLLBACK") } finally { db.close() }
       }
-    } else {
+    } else if (!sizes.main) {
       if (["ready", "imported"].includes(phase)) throw new Error("committed migration database missing")
       const sidecar = join(directory, "session-gc.json")
       const store = join(directory, "sessions.json")
@@ -110,7 +117,8 @@ export function inspectBookkeeping(input: string): Inspection {
       const lock = join(directory, source + ".lock")
       barriers[source] = !existsSync(lock) ? "none" : id && bytes(lock) === barrierBytes(id) ? "own" : "foreign"
     }
+    const artifacts = inspectArtifacts(directory)
     return { phase, migration_id: id, cycle_id: id, cycle_number: archived + 1, archived_cycles: archived,
-      resources, mappings, sizes, barriers, ...inspectArtifacts(directory) }
+      resources, mappings, sizes, barriers, ...artifacts, temporary: [...artifacts.temporary, ...bootstrap] }
   } finally { guard?.close() }
 }
