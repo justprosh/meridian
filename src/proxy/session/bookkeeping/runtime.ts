@@ -9,7 +9,8 @@ import {
   BookkeepingMaintenanceRequiredError, connectionFor,
   initializeSessionBookkeeping, initializeSessionBookkeepingAsync,
 } from "./connection"
-import { checkpointBookkeeping, withBookkeepingWriteAsync } from "./transaction"
+import { checkpointBookkeepingAsync, withBookkeepingWriteAsync } from "./transaction"
+import type { BookkeepingCheckpoint } from "./transaction"
 import type { BookkeepingHandle } from "./connection"
 import type { BookkeepingWriteOptions } from "./types"
 import { retainBookkeepingRuntimeIdentity } from "./runtimeIdentity"
@@ -94,6 +95,6 @@ export function admitSessionStoreWrite<T>(operation: () => T, options: Bookkeepi
   return withBookkeepingWriteAsync(directory, { ...options, scope: "store" }, operation)
 }
 
-export function checkpointProxyBookkeeping(): void {
-  if (runtime) checkpointBookkeeping(runtime.directory)
+export async function checkpointProxyBookkeeping(): Promise<BookkeepingCheckpoint | undefined> {
+  if (runtime) return checkpointBookkeepingAsync(runtime.directory)
 }
