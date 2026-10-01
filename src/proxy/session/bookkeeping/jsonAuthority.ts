@@ -1,18 +1,31 @@
-import { existsSync, readdirSync } from "node:fs"
+import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs"
 import { join } from "node:path"
-import { acquireInspectionGuard } from "./guard"
+import { acquireInspectionGuard, assertGuardRecoveryQuiescent } from "./guard"
 import { CYCLE_TRANSITION_NAME } from "./cycles"
 import { protectedBytes, readExportJournal, verifyFile } from "./exportJournal"
 import { readJournal, SOURCE_NAMES } from "./maintenanceJournal"
-import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
+import { BookkeepingMaintenanceRequiredError, errorCode } from "./storagePaths"
 
 /** Recovery history is not authority, but only a fully proved terminal transition permits JSON. */
 export function assertJsonBookkeepingAuthority(directory: string): void {
   if (!existsSync(directory)) return
   if (!["session-bookkeeping.sqlite", "session-bookkeeping.sqlite-wal", "session-bookkeeping.sqlite-shm", "session-bookkeeping.sqlite-journal",
-    "session-bookkeeping-maintenance.sqlite", "session-bookkeeping-migration.json", "session-bookkeeping-export.json", CYCLE_TRANSITION_NAME,
-    ...SOURCE_NAMES.map(name => name + ".lock")].some(name => existsSync(join(directory, name)))
-    && !readdirSync(directory).some(name => name.includes(".deletion-intent.releasing-"))) return
+    "session-bookkeeping-maintenance.sqlite", "session-bookkeeping-migration.json", "session-bookkeeping-export.json", CYCLE_TRANSITION_NAME]
+    .some(name => existsSync(join(directory, name)))
+    && !readdirSync(directory).some(name => name.includes(".deletion-intent.releasing-"))) {
+    // Plain legacy locks may be directories or temporarily hardlinked during
+    // publication. They are not SQLite control files: preserve JSON semantics.
+    // Check no local native owner before touching an untrusted inode alias.
+    assertGuardRecoveryQuiescent()
+    for (const source of SOURCE_NAMES) {
+      const path = join(directory, source + ".lock")
+      try {
+        if (lstatSync(path).isFile() && readFileSync(path, "utf8").includes("meridian-bookkeeping-barrier-v1"))
+          throw new BookkeepingMaintenanceRequiredError("SQLite barrier requires explicit maintenance before JSON startup")
+      } catch (error) { if (errorCode(error) !== "ENOENT") throw error }
+    }
+    return
+  }
   const guard = acquireInspectionGuard(directory)
   try {
     const refuse = () => { throw new BookkeepingMaintenanceRequiredError("SQLite authority is active/incomplete; resume explicit maintenance before JSON startup") }
@@ -21,7 +34,9 @@ export function assertJsonBookkeepingAuthority(directory: string): void {
       || readdirSync(directory).some(name => name.includes(".deletion-intent.releasing-"))) refuse()
     for (const source of SOURCE_NAMES) {
       const path = join(directory, source + ".lock")
-      if (existsSync(path) && protectedBytes(path, false, true).toString("utf8").includes("meridian-bookkeeping-barrier-v1")) refuse()
+      try {
+        if (lstatSync(path).isFile() && protectedBytes(path, true, true).toString("utf8").includes("meridian-bookkeeping-barrier-v1")) refuse()
+      } catch (error) { if (errorCode(error) !== "ENOENT") throw error }
     }
     const migration = readJournal(directory, true), exported = readExportJournal(directory, true)
     if (!migration && !exported) return

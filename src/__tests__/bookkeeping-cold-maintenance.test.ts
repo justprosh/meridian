@@ -197,6 +197,28 @@ it("R5 terminal export permits same-build JSON, but incomplete/forged authority 
   }
 })
 
+it("JSON startup preserves ordinary legacy lock directories and publication hardlinks, but denies orphan barriers", async () => {
+  const saved = process.env.MERIDIAN_BOOKKEEPING
+  setSessionStoreDir(directory)
+  process.env.MERIDIAN_BOOKKEEPING = "json"
+  try {
+    const lock = join(directory, "session-gc.json.lock"), candidate = join(directory, "legacy-candidate")
+    writeFileSync(candidate, '{"legacy":"owner"}', { mode: 0o600 })
+    linkSync(candidate, lock)
+    expect(await initializeProxyBookkeeping()).toBeUndefined()
+    rmSync(lock)
+    mkdirSync(lock, { mode: 0o700 })
+    expect(await initializeProxyBookkeeping()).toBeUndefined()
+    rmSync(lock, { recursive: true })
+    writeFileSync(lock, 'meridian-bookkeeping-barrier-v1', { mode: 0o600 })
+    await expect(initializeProxyBookkeeping()).rejects.toThrow("explicit maintenance")
+  } finally {
+    setSessionStoreDir(null)
+    if (saved === undefined) delete process.env.MERIDIAN_BOOKKEEPING
+    else process.env.MERIDIAN_BOOKKEEPING = saved
+  }
+})
+
 it("F5 READY unknown go gate requires stopped-child attestation and journaled archival before export", async () => {
   initializeSessionBookkeeping(directory).close()
   mkdirSync(join(directory, "deletion-gates"), { mode: 0o700 })
