@@ -61,7 +61,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_BETA_POLICY` | — | `allow-safe` | Client `anthropic-beta` header handling: `allow-safe`, `strip-all`, or `allow-all` |
 | `MERIDIAN_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | — | canonical ids | Pin the model id the SDK resolves for each tier alias (e.g. `MERIDIAN_DEFAULT_OPUS_MODEL`) |
 | `MERIDIAN_SESSION_DIR` | `CLAUDE_PROXY_SESSION_DIR` | `~/.cache/meridian` | Directory for the persisted session store |
-| `MERIDIAN_NO_UPDATE_CHECK` | — | unset | Set to `1` to disable the once-a-day npm registry lookup that fills in `build.latest` on `/health`. No outbound request is made at all when set. See [Build provenance](#build-provenance-and-staying-current). |
+| `MERIDIAN_NO_UPDATE_CHECK` | — | unset | Set to `1` to force the update check off even when the `checkForUpdates` setting is on. No outbound request is made at all when set. See [Build provenance](#build-provenance-and-staying-current). |
 | `MERIDIAN_UPDATE_CHECK_URL` | — | npm dist-tags | Registry endpoint for the update check. Point it at a mirror on restricted networks; it must return `{"latest":"<version>"}`. |
 | `MERIDIAN_UPDATE_CHECK_PATH` | — | `~/.cache/meridian/update-check.json` | Where the update check caches its result. |
 | `MERIDIAN_BUILD_SOURCE` | — | *(derived from the install path)* | Overrides the `build.source` reported by `/health`: `npm`, `local`, or `dev`. Normally set by [`bin/meridian-launchd.sh`](#running-as-a-service-without-drift), not by hand. |
@@ -152,7 +152,7 @@ second instance pointed at an empty directory starts genuinely empty:
 
 | File | Holds |
 |---|---|
-| `settings.json` | Active profile, routing mode, priority order |
+| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates` |
 | `profiles.json` | Configured profiles ([Multi-Profile Support](profiles.md)) |
 | `profiles/<id>/` | Per-profile `CLAUDE_CONFIG_DIR` (credentials, SDK state) |
 | `adapter-instances.json` | [Adapter instances](agents.md#adapter-instances) |
@@ -281,6 +281,7 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET/POST /v1/design/*` | Claude Design MCP proxy (see [Claude Design MCP](agents.md#claude-design-mcp)) |
 | `GET/POST /design-login` | OAuth flow for the design scopes |
 | `GET /health` | Auth status, mode, plugin status |
+| `GET /inflight` | Client requests in flight per upstream; loopback clients only. See [Restarting when idle](#restarting-when-idle) |
 | `POST /auth/refresh` | Manually refresh the OAuth token |
 | `GET /telemetry` | Performance dashboard |
 | `GET /telemetry/requests` | Recent request metrics (JSON) |
@@ -292,7 +293,8 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `POST /profiles/active` | Switch the active profile |
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
 | `GET /v1/usage/quota/all` | Usage windows for every profile (JSON) |
-| `GET /settings` | SDK feature toggles + model pricing UI |
+| `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage and update-check UI |
+| `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
 
 Illustrative health response excerpt (versions and status vary by installation):
@@ -358,18 +360,66 @@ indistinguishable from one serving the published version.
 |-------|---------|
 | `source` | `npm` — resolved from a `node_modules` install, so `version` is trustworthy. `local` — running from a checkout or a build next to sources. `dev` — explicitly stamped as a development build. |
 | `version` | The `package.json` version. Proof of what is running **only** when `source` is `npm`. |
-| `sha`, `branch`, `dirty` | Present only when the launcher stamped them. `dirty` means uncommitted changes were in the tree. |
+| `sha`, `branch`, `dirty` | Captured from the local tree at build/startup, or from launcher stamps when no Git snapshot is available. `dirty` describes that captured tree, not later edits. |
+| `kind` | Local execution: `artifact` for bundled output, `source` for direct TypeScript execution. |
+| `releaseVersion` | Reachable release tag at build/startup, when available and not older than `package.json` (an older one means newer tags were never fetched). Never an invented next release. |
+| `counter`, `counterScope` | Successful local build ordinal and its worktree-specific history ID. Absent for source runs or unverifiable artifacts. Compare counters only within the same scope. |
+| `attemptId`, `certification` | Embedded artifact identity and its verification result. A process never adopts a newer artifact's identity after startup. |
+| `branchUrl`, `commitUrl` | Public GitHub/GitLab links derived from the checkout's origin, without credentials, query strings or fragments. A dirty build links to its base commit, not its uncommitted edits. |
 | `latest` | Newest published version, from the cached registry check. Absent until the check resolves, and on the first run of a fresh install. |
 | `updateAvailable` | `latest` is strictly newer than `version`. Absent — not `false` — while `latest` is unknown, because "not checked" and "current" are different claims. |
 
-The site header renders this: a blue chip links to the releases page when an
-update is available, and a violet chip marks a non-npm build.
+The site header always shows the running npm version. Local builds show their
+release base, build number (or explicit source/unnumbered status), branch, short
+commit and dirty marker. Branch/commit links are blue; metadata is violet.
 
-**The update check** runs once a day, caches to
+`GET /build-status` is available only for local/dev execution and uses the
+existing optional API-key protection. It returns `{runtime, latest?, state,
+buildsBehind?}` with `Cache-Control: no-store`. Runtime identity is immutable;
+disk state is refreshed separately in a bounded worker, shared across requests
+and refreshed on demand at most every ten seconds. An initial reading may be
+`unknown` until the worker finishes. `behind` reports the difference between
+successful build counters, for example `3 builds behind`. `current`, `rollback`,
+`incomparable`, `source-changed`, `building`, `missing`, `invalid` and `unknown`
+distinguish other outcomes rather than claiming an update without evidence.
+Source edits alone never count as completed builds. npm installs return 404.
+
+`npm run build` certifies output only after bundling, declarations, export fixes
+and Node entrypoint checks succeed. Local records live under the worktree's
+Git directory in `meridian-builds/`; deleting `dist` does not reset the counter.
+Separate worktrees have separate histories. The runtime checks its embedded
+identity against the success record and artifact hashes; missing or altered
+evidence produces an unnumbered artifact, not a guessed number. Git-less source
+archives still build but do not receive local counters.
+
+Builds use owner-PID claim directories under `meridian-builds/`; competing builds
+wait briefly or report contention. Claims belonging to exited processes are
+reclaimed, never by age alone. An unreaped or reused PID can require operator
+inspection. Source changes during a build prevent certification. This is local integrity checking,
+not signed attestation or atomic deployment: do not replace a live `dist` while
+it may still need to load chunks. Direct `bun run bin/cli.ts` execution is labeled
+`source run`, with source drift rather than a build count. Unstamped archive
+builds retain the existing local-build display and cannot claim disk freshness.
+Unavailable Git before certification falls back to an uncertified archive build;
+failed build gates never fall back or consume a successful-build number.
+
+**The update check is off by default.** Nothing contacts the registry until you
+turn it on, either in the **Updates** section of `/settings` or in
+`settings.json`:
+
+```json
+{ "checkForUpdates": true }
+```
+
+Once on, it asks the npm registry's `dist-tags` endpoint (the same source
+`npm install -g @rynfar/meridian@latest` resolves) once a day, caches to
 `~/.cache/meridian/update-check.json`, times out after 5s, and never touches
 the request path. If the registry is unreachable it keeps reporting the last
-version it saw rather than dropping the field. Set `MERIDIAN_NO_UPDATE_CHECK=1`
-to turn it off entirely.
+version it saw rather than dropping the field. Toggling it in the UI applies to
+the running proxy; switching it off also clears `build.latest`.
+`MERIDIAN_NO_UPDATE_CHECK=1` forces it off regardless of the setting, so a
+fleet can refuse the call in one place. The launcher script's own install-time
+check below is separate and has its own switch.
 
 ### Running as a service without drift
 
@@ -447,6 +497,51 @@ Restart=no
 ```
 
 The idle exit setting is optional. It starts a graceful shutdown after the configured period without a model request; the socket unit starts a new process on the next connection. The inherited fd is not passed on to the SDK subprocess. [E59](../E2E.md#e59-node-socket-activation-and-idle-exit) describes the process-level probe.
+
+## Restarting when idle
+
+`GET /inflight` lets a supervisor on the same host observe admitted client
+HTTP requests before requesting a graceful shutdown:
+
+```json
+{
+  "scope": "client-http",
+  "at": "2026-09-28T11:02:03.456Z",
+  "total": 3,
+  "oldestStartedAt": "2026-09-28T11:01:40.012Z",
+  "upstreams": {
+    "claude": { "streams": 1, "requests": 0, "queued": 2 },
+    "antigravity": { "streams": 0, "requests": 0, "queued": 0 }
+  }
+}
+```
+
+- `scope` is `"client-http"`. `total` counts admitted Claude Messages requests
+  (including internal OpenAI translations) and combined Antigravity POSTs; zero
+  means that none of those requests is currently admitted. It does not mean
+  that restarting will interrupt no work. Each request counts once: in `queued`
+  while it waits for its session's turn or a free SDK slot, otherwise in
+  `streams` or `requests` by whether the client asked for a stream. A request
+  stays counted until its application response body is consumed by the HTTP
+  adapter, cancelled or failed. This is not an acknowledgement of remote receipt.
+- `oldestStartedAt` is when the longest-running of them arrived, or `null`.
+- `antigravity` appears only with `MERIDIAN_BACKEND=combined` and counts
+  `POST /antigravity/*` requests. Background Responses jobs that keep running
+  after their `POST` returned and processes waiting for a client tool result
+  are not counted. The standalone
+  `MERIDIAN_BACKEND=antigravity` server does not serve `/inflight`.
+- Meridian's own background work (token refresh, usage polling, session
+  cleanup) is never counted.
+- Only a loopback peer (`127.0.0.0/8`, `::1`) gets an answer, and not through a
+  proxy: a request with `Forwarded`, `X-Forwarded-For` or `X-Real-IP` gets
+  `403`, as does any other address. No API key is needed. The response holds
+  counts only: no session ids, prompts, profiles or accounts.
+
+A request arriving between a probe and the restart is not covered by the
+probe. Use the [graceful shutdown](#graceful-shutdown) drain; this endpoint
+is not an admission barrier. Background Responses jobs are not restart
+resumable, so a supervisor must also wait for those jobs and pending client
+tool continuations to finish through their own lifecycle APIs.
 
 ## Graceful shutdown
 
@@ -1107,6 +1202,15 @@ $env:ANTHROPIC_API_KEY = "x" # Use your Meridian API key if protection is enable
 
 Then follow the [setup instructions for your client](agents.md). The desktop app
 is currently a Mac preview; it is not required for Windows headless use.
+
+Local provenance verification accepts complete fingerprints only. Source and
+artifact scans allow at most 64 MiB per file, 256 MiB total, 10,000 entries,
+and two seconds of scan work; artifact traversal additionally caps depth at 32.
+Git output is capped at 2 MiB, metadata at 4 MiB (package metadata 1 MiB).
+Oversized or unavailable inputs report unavailable/invalid provenance rather
+than certifying a partial hash. A local certified build refuses such inputs;
+Git-less archives retain their uncertified build path.
+
 # SQLite session bookkeeping
 
 Set `MERIDIAN_BOOKKEEPING=sqlite` to explicitly use SQLite for both transcript

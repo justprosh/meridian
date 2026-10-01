@@ -186,6 +186,7 @@ src/
 │   ├── requestAbort.ts        ← HTTP request abort → SDK query abort bridge
 │   ├── sessionTree.ts         ← Live parent→child request registry; subtree cancellation (PURE bookkeeping)
 │   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
+│   ├── inflight.ts            ← Per-upstream in-flight request counts for GET /inflight (PURE bookkeeping)
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
@@ -196,7 +197,16 @@ src/
 │   ├── sseFailureSniff.ts     ← SSE framing/classification and bounded priority stream transport (leaf)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
 │   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
-│   ├── updateCheck.ts         ← Cached npm registry lookup for the newest published version
+│   ├── localBuildInfo.ts      ← Local build comparisons and public forge links (PURE)
+│   ├── buildRuntime.ts        ← Immutable runtime identity and independent disk status
+│   ├── buildSnapshot.ts       ← Git/source snapshot boundary
+│   ├── buildFingerprint.ts    ← Streaming file hashing and bounded metadata reads
+│   ├── buildProvenanceError.ts ← Shared provenance boundary errors
+│   ├── buildArtifacts.ts      ← Serialized build certification and artifact validation
+│   ├── buildLock.ts           ← Local builder owner claims and dead-owner recovery
+│   ├── buildObserver.ts       ← Single-flight bounded disk observation cache
+│   ├── buildObservationWorker.ts ← Off-thread source/artifact observation
+│   ├── updateCheck.ts         ← Opt-in cached npm registry lookup for the newest published version
 │   ├── tools.ts               ← Tool blocking lists, MCP server name, allowed tools
 │   ├── messages.ts            ← Content normalization, message parsing
 │   ├── replay.ts              ← Pure rendering of assistant calls and tool results for SDK replay

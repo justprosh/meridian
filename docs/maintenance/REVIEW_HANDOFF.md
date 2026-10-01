@@ -2,6 +2,23 @@
 
 ## Active authorized backlog (2026-10-01)
 
+**Nowaker priority checkpoint (2026-10-01).** #1171 incorporated with corrections
+as [#1225](https://github.com/rynfar/meridian/pull/1225), merge
+`bd00c164d198a368956c79658897a6360a0cd5ea`; #1190 incorporated with corrections
+as [#1218](https://github.com/rynfar/meridian/pull/1218), merge
+`310dd95698b27484ff5bc0feb88f59f365ef58c0`. Both merged trees equal their
+validated heads, all executed exact-head CI passed, Nowaker co-author credit
+verified, original heads unchanged before closure. Durable records:
+[evidence/1171-build-provenance.md](evidence/1171-build-provenance.md) and
+[evidence/1190-request-activity.md](evidence/1190-request-activity.md).
+#792 draft [#1217](https://github.com/rynfar/meridian/pull/1217) proves new-account
+creation and real OpenCode use; re-authentication still awaits a completed
+human Claude authorization. #1187 remains under concurrency/client review;
+#1176 remains under official-rate/product-flow review. #1175 correction and
+actual bundled HTTP/browser proof are recorded in
+[evidence/1175-update-setting.md](evidence/1175-update-setting.md); final-head
+CI is required before integration. No release authorized.
+
 Owner requested a persistent goal covering PRs/issues, authored cherry-picks,
 maintainer corrections and headless actual-client evidence. Initial paginated
 inventory: Meridian 18 PRs / 11 issues; OpenCode scrub 2 PRs; Pi scrub issue #13;

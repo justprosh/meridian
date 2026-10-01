@@ -13,7 +13,7 @@ bun install --frozen-lockfile
 node scripts/e2e-libsql-package.mjs
 ```
 
-The harness runs the real `npm run build` (including postbuild), creates the
+The harness runs the real `npm run build` (including its entry checks), creates the
 canonical `npm pack` tarball, and installs it with npm in an independent path.
 No source tree or source node_modules is linked into that installation.
 Package installation scripts are deliberately disabled: the native libsql

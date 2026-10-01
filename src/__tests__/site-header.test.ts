@@ -64,21 +64,41 @@ describe("shared site header", () => {
     // Violet = meta: the provenance chip has no href and must not be blue.
     // Swapping these is the single easiest way to break the design language,
     // and it is invisible in a screenshot review.
-    expect(profileBarCss).toContain(".mh-build.update")
-    expect(profileBarCss).toContain(".mh-build.provenance")
+    // The provenance pill is violet, but its branch/commit pieces are links
+    // and must be blue; drift uses the semantic warning hue and nothing else.
+    const rule = (selector: string) => {
+      const start = profileBarCss.indexOf(`.meridian-header ${selector} {`)
+      expect(start, `${selector} rule exists`).toBeGreaterThanOrEqual(0)
+      return profileBarCss.slice(start, profileBarCss.indexOf("}", start))
+    }
 
-    const updateRule = profileBarCss.slice(
-      profileBarCss.indexOf(".meridian-header .mh-build.update"),
-      profileBarCss.indexOf(".meridian-header .mh-build.provenance"),
-    )
+    const updateRule = rule(".mh-update")
     expect(updateRule).toContain("var(--accent, #58a6ff)")
     expect(updateRule).not.toContain("--accent2")
 
-    const provenanceRule = profileBarCss.slice(profileBarCss.indexOf(".meridian-header .mh-build.provenance"))
+    const provenanceRule = rule(".mh-prov")
     expect(provenanceRule).toContain("var(--accent2, #bc8cff)")
-    // Non-interactive: no href is set for this state, so no pointer affordance.
-    expect(provenanceRule).toContain("cursor: default")
-    expect(profileBarJs).toContain("removeAttribute('href')")
+    expect(provenanceRule).not.toContain("var(--accent,")
+
+    const linkRule = rule("a.mh-prov-part")
+    expect(linkRule).toContain("var(--accent, #58a6ff)")
+    expect(linkRule).not.toContain("--accent2")
+
+    const driftWarning = rule(".mh-drift.warning")
+    expect(driftWarning).toContain("var(--yellow, #d29922)")
+    expect(rule(".mh-drift")).not.toContain("--yellow")
+
+    // Pieces without a safe URL render as spans, never as href-less anchors.
+    expect(profileBarJs).toContain("document.createElement(part.href ? 'a' : 'span')")
+    expect(profileBarHtml).toContain('id="mhUpdate"')
+  })
+
+  test("drift is polled only for local builds, never overlapping, and bypasses the cache", () => {
+    expect(profileBarHtml).toContain('id="mhProv"')
+    expect(profileBarHtml).toContain('id="mhDrift"')
+    expect(profileBarJs).toContain("fetch('/build-status', { cache: 'no-store'")
+    expect(profileBarJs).toContain("setDriftTracking(view.mode === 'local')")
+    expect(profileBarJs).toContain("if (!driftTracking || driftInFlight) return;")
   })
 
   test("every page embeds the shared header exactly once", () => {

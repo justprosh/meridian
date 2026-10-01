@@ -5,6 +5,7 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { stream } from "hono/streaming"
 import { serve, createAdaptorServer } from "@hono/node-server"
+import { getConnInfo } from "@hono/node-server/conninfo"
 import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./socketActivation"
 import type { Server } from "node:http"
 import { homedir } from "node:os"
@@ -16,6 +17,7 @@ import { IdleStallCeilingError, IdleStallTracker, idleStallRequestKey } from "./
 import { linkRequestAbort, type RequestAbortLink } from "./requestAbort"
 import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } from "./sessionTree"
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
+import { InflightRegistry, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
 import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
@@ -80,8 +82,9 @@ import {
   DESIGN_UPSTREAM_ORIGIN,
 } from "./design"
 import { checkPluginConfigured, isPluginlessOpenCodeRequest, notePluginlessOpenCodeRequest } from "./setup"
-import { describeBuildDrift, getBuildInfo } from "./buildInfo"
-import { getLatestVersion, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
+import { describeBuildDrift } from "./buildInfo"
+import { buildRuntime } from "./buildRuntime"
+import { getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveClaudeExecutableSync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import type { AnthropicSseEvent } from "./openai"
@@ -308,6 +311,8 @@ interface RequestMeta {
   }
   /** Permanently retain the session lease when mandatory durable cleanup fails. */
   retainSessionTurnFence?: () => void
+  /** This request's `GET /inflight` entry; shared by every failover attempt. */
+  inflight?: InflightHandle
   /**
    * Cancel this request's live session subtree (see `sessionTree.ts`).
    *
@@ -643,6 +648,26 @@ function classifyBookkeepingFailure(error: unknown, message: string, model?: str
     : classifyError(message, model)
 }
 
+/**
+ * Begin the daily registry check, if the operator has asked for one.
+ *
+ * Module scope because two callers need the same banner: the owned server
+ * lifecycle at startup, and the settings route when the toggle is switched on.
+ * Starting is idempotent, and a no-op while the setting is off.
+ */
+function beginUpdateCheck(config: { silent?: boolean; version?: string }): Promise<void> {
+  return startUpdateCheck({
+    onResolved: (latest) => {
+      if (config.silent) return
+      const build = buildRuntime.info(config.version ?? "unknown", latest)
+      if (!build.updateAvailable) return
+      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
+      // A checkout cannot follow "npm install -g"; it pulls and rebuilds instead.
+      if (build.source === "npm") console.log(`  npm install -g @rynfar/meridian@latest`)
+    },
+  })
+}
+
 export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServer {
   if (resolveBackendConfig(config).backend === "antigravity") return createAntigravityServer(resolveBackendConfig(config))
   const finalConfig = resolveBackendConfig(config)
@@ -651,11 +676,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   proxyLogSilent = finalConfig.silent
   const serverVersion = finalConfig.version ?? "unknown"
 
-  // What code is actually running, for /health. Recomputed per request rather
-  // than frozen at startup because `latest` arrives asynchronously from the
-  // registry check — everything else in it is static.
   const currentBuild = () =>
-    getBuildInfo({ version: serverVersion, modulePath: import.meta.url, latest: getLatestVersion() })
+    buildRuntime.info(serverVersion, getLatestVersion())
 
   // Restore persisted active profile from last session
   restoreActiveProfile(finalConfig.profiles)
@@ -844,6 +866,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   let draining = false
   let durableWritesRevoked = false
   let inFlightRequests = 0
+  /** The same requests as inFlightRequests, broken down for GET /inflight. */
+  const inflight = new InflightRegistry()
   const activeRequestAborts = new Set<AbortController>()
   /** Cause-aware shutdown aborts: each entry labels its request's registry
    * before the controller fires, because the shutdown producer aborts the
@@ -933,12 +957,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // proxyOverheadMs — corrupting the one number that says "the proxy is the
     // bottleneck" precisely under the load that makes clients cancel.
     const acquireStartedAt = Date.now()
+    const leaveSdkQueue = requestMeta.inflight?.enterQueue()
     let lease: SemaphoreLease
     try {
       lease = await sdkSemaphore.acquire(signal)
     } catch (error) {
       requestMeta.sdkQueueWaitMs += Date.now() - acquireStartedAt
       throw error
+    } finally {
+      leaveSdkQueue?.()
     }
     requestMeta.sdkQueueWaitMs += lease.waitedMs
     const startedAt = Date.now()
@@ -1018,6 +1045,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/telemetry/*", requireAuth)
   app.use("/telemetry", requireAuth)
   app.use("/metrics", requireAuth)
+  app.use("/build-status", requireAuth)
   app.use("/profiles/*", requireAuth)
   app.use("/profiles", requireAuth)
   app.use("/plugins/*", requireAuth)
@@ -1030,10 +1058,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/antigravity/*", requireAuth)
 
   // Separate provider routes; Claude retains all existing paths and semantics.
-  app.all('/antigravity/*', c => {
+  app.all('/antigravity/*', async c => {
     if (!antigravity) return c.json({ error: { type: 'not_found_error', message: 'Antigravity is not enabled' } }, 404)
     const url = new URL(c.req.url); url.pathname = url.pathname.slice('/antigravity'.length)
-    return antigravity.app.fetch(new Request(url.toString(), c.req.raw))
+    // Model work arrives as POST; reads and polls are not in-flight work.
+    const entry = c.req.method === 'POST' ? inflight.begin('antigravity') : undefined
+    try {
+      const response = await antigravity.app.fetch(new Request(url.toString(), c.req.raw))
+      if (!entry) return response
+      entry.setStream((response.headers.get('content-type') ?? '').includes('text/event-stream'))
+      return onResponseDone(response, entry.end)
+    } catch (error) {
+      entry?.end()
+      throw error
+    }
   })
   app.get('/providers', c => c.html(providerPageHtml))
   for (const route of ['/providers/status', '/providers/view']) app.get(route, async c => {
@@ -2408,6 +2446,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
         // Allow transform pipeline to override streaming preference (e.g. LiteLLM requires non-streaming)
         const stream = pipelineCtx.prefersStreaming !== undefined ? pipelineCtx.prefersStreaming : (body.stream ?? false)
+        requestMeta.inflight?.setStream(stream === true)
 
         // --- SDK parameter passthrough ---
         // Extract effort, thinking, taskBudget, and native structured output
@@ -7888,6 +7927,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let retainSessionTurnFence = false
     let leaseWatchdog: ReturnType<typeof setTimeout> | undefined
     inFlightRequests++
+    const inflightEntry = inflight.begin("claude", queueEnteredAt)
+    const finishHttpEntry = () => {
+      inflightEntry.end()
+      c.req.raw.signal.removeEventListener("abort", finishHttpEntry)
+    }
+    if (c.req.raw.signal.aborted) finishHttpEntry()
+    else c.req.raw.signal.addEventListener("abort", finishHttpEntry, { once: true })
+    const trackedResponse = (response: Response) => {
+      const tracked = onResponseDone(response, finishHttpEntry)
+      // Internal OpenAI/priority relays still await the SDK publication promise.
+      const completion = responseCompletions.get(response)
+      if (completion) responseCompletions.set(tracked, completion)
+      return tracked
+    }
     // Releasing the lease is deliberately separate from finishing the request:
     // the watchdog must be able to unblock the session without also corrupting
     // the in-flight count that the shutdown drain reads.
@@ -7946,17 +7999,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } catch (error) {
         if (c.req.raw.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
           finishRequest()
-          return new Response(JSON.stringify({
+          return trackedResponse(new Response(JSON.stringify({
             type: "error",
             error: { type: "request_cancelled", message: "The request was cancelled" },
-          }), { status: 499, headers: { "Content-Type": "application/json" } })
+          }), { status: 499, headers: { "Content-Type": "application/json" } }))
         }
         finishRequest()
-        return new Response(JSON.stringify({
+        return trackedResponse(new Response(JSON.stringify({
           type: "error",
           error: { type: "invalid_request_error", message: "Request body must be valid JSON" },
-        }), { status: 400, headers: { "Content-Type": "application/json" } })
+        }), { status: 400, headers: { "Content-Type": "application/json" } }))
       }
+      inflightEntry.setStream(body?.stream === true)
 
       // Fingerprints are intentionally excluded here: they only hash the first
       // user message + cwd and cannot distinguish independent headerless chats.
@@ -8014,8 +8068,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             }, SESSION_TURN_MAX_HOLD_MS)
             leaseWatchdog.unref?.()
             const acquireSignal = AbortSignal.any([c.req.raw.signal, turnWatchdogAbort.signal])
-            sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
-            crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+            const leaveTurnQueue = inflightEntry.enterQueue()
+            try {
+              sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
+              crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+            } finally {
+              leaveTurnQueue()
+            }
           } catch (error) {
             if (
               c.req.raw.signal.aborted
@@ -8056,23 +8115,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 error: "request_cancelled",
               })
               finishRequest()
-              return new Response(JSON.stringify({
+              return trackedResponse(new Response(JSON.stringify({
                 type: "error",
                 error: { type: "request_cancelled", message: "The request was cancelled" },
-              }), { status: 499, headers: { "Content-Type": "application/json" } })
+              }), { status: 499, headers: { "Content-Type": "application/json" } }))
             }
             // The local lease may already be held when the cross-process
             // acquisition fails. Never leave it wedged until the watchdog.
             releaseSessionTurn(false)
             if (error instanceof CrossProcessTurnAcquireTimeoutError) {
               finishRequest()
-              return new Response(JSON.stringify({
+              return trackedResponse(new Response(JSON.stringify({
                 type: "error",
                 error: {
                   type: "overloaded_error",
                   message: "Timed out waiting for another process to finish this session turn",
                 },
-              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } })
+              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } }))
             }
             throw error
           }
@@ -8091,6 +8150,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         routingTurnIdentity,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
         cascadeSubtreeCancel,
+        inflight: inflightEntry,
       }
       const response = await handleMessages(c, requestMeta, {
         body,
@@ -8106,9 +8166,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } else {
         finishRequest()
       }
-      return response
+      return trackedResponse(response)
     } catch (error) {
       finishRequest()
+      finishHttpEntry()
       throw error
     }
   }
@@ -8309,6 +8370,42 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, restartRequired: true, supervision: detectSupervision() })
   })
 
+  function updateSettingsState() {
+    return {
+      checkForUpdates: getSetting("checkForUpdates") === true,
+      envOptOut: envBool("NO_UPDATE_CHECK"),
+      enabled: isUpdateCheckEnabled(),
+      build: currentBuild(),
+    }
+  }
+
+  app.get("/settings/api/updates", (c) => c.json(updateSettingsState()))
+  app.put("/settings/api/updates", async (c) => {
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Settings must be a JSON object" }, 400)
+    }
+    const body = input as Record<string, unknown>
+
+    if (body.checkForUpdates !== undefined) {
+      if (body.checkForUpdates !== null && typeof body.checkForUpdates !== "boolean") {
+        return c.json({ error: "checkForUpdates must be a boolean, or null to unset" }, 400)
+      }
+      setSetting("checkForUpdates", body.checkForUpdates ?? undefined)
+    }
+
+    // Takes effect now rather than on the next start: the checker is one
+    // unref'd timer with no store to swap out from under in-flight work, so
+    // there is nothing to justify making someone restart for it. Switching on
+    // waits for the first answer (bounded by the fetch timeout) so the reply
+    // already says whether an update exists.
+    if (isUpdateCheckEnabled()) await beginUpdateCheck(finalConfig)
+    else stopUpdateCheck()
+
+    return c.json(updateSettingsState())
+  })
+
   app.get("/settings/api/pricing", (c) => {
     const { BUILTIN_MODEL_PRICING } = require("../telemetry/pricing") as typeof import("../telemetry/pricing")
     const { getPricingOverrides } = require("../telemetry/pricingStore") as typeof import("../telemetry/pricingStore")
@@ -8345,6 +8442,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
   })
 
+  // Observed client HTTP requests only, not an atomic restart/drain barrier.
+  // Background jobs and pending backend continuations are outside this scope. Open like
+  // /health (no API key), but answered only to a loopback peer: the counts say
+  // when this machine is being used, which nobody off the host needs to know.
+  app.get("/inflight", (c) => {
+    let remoteAddress: string | undefined
+    try {
+      remoteAddress = getConnInfo(c).remote.address
+    } catch {
+      // Served by something other than @hono/node-server: no peer to trust.
+      remoteAddress = undefined
+    }
+    if (!isLoopbackPeer(remoteAddress, c.req.raw.headers)) {
+      return c.json({ error: { type: "forbidden", message: "/inflight is answered only to loopback clients" } }, 403)
+    }
+    c.header("Cache-Control", "no-store")
+    return c.json(inflight.snapshot(antigravity ? ["claude", "antigravity"] : ["claude"]))
+  })
+
   // Liveness — would restarting this process help? Answered without touching
   // anything: no subprocess, no credential read, no upstream. /health is NOT
   // this, and pointing a supervisor at it is a restart loop, because it 503s
@@ -8373,6 +8489,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   })
 
   // Health check endpoint — verifies auth status
+  app.get("/build-status", (c) => {
+    c.header("Cache-Control", "no-store")
+    return buildRuntime.local ? c.json(buildRuntime.status()) : c.notFound()
+  })
+
   app.get("/health", async (c) => {
     // Checked first and unconditionally: a fleet manager routing on this
     // endpoint (e.g. a gateway's account-pool scheduler) needs to learn
@@ -9712,22 +9833,10 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   sessionGcInterval?.unref?.()
   if (sweepSessionGc) void sweepSessionGc()
 
-  // Cached, once a day, never on the request path. Opt out with
-  // MERIDIAN_NO_UPDATE_CHECK=1. The banner below reports build-source drift
+  // Cached, once a day, never on the request path, and only when the
+  // checkForUpdates setting is on. The banner below reports build-source drift
   // synchronously; this callback reports version drift whenever it resolves.
-  startUpdateCheck({
-    onResolved: (latest) => {
-      if (finalConfig.silent) return
-      const build = getBuildInfo({
-        version: finalConfig.version ?? "unknown",
-        modulePath: import.meta.url,
-        latest,
-      })
-      if (build.source !== "npm" || !build.updateAvailable) return
-      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
-      console.log(`  npm install -g @rynfar/meridian@latest`)
-    },
-  })
+  void beginUpdateCheck(finalConfig)
 
   if (finalConfig.installProcessErrorHandlers) {
     // Opt-in (a configured DSN) and idempotent: the CLI installs it earlier so
@@ -9758,11 +9867,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       // A build that did not come from npm reports the tree's last released
       // version, which is indistinguishable from the real thing. Say so once,
       // at startup, rather than letting the version string imply otherwise.
-      const buildDrift = describeBuildDrift(getBuildInfo({
-        version: finalConfig.version ?? "unknown",
-        modulePath: import.meta.url,
-        latest: getLatestVersion(),
-      }))
+      const buildDrift = describeBuildDrift(buildRuntime.info(finalConfig.version ?? "unknown", getLatestVersion()))
       if (buildDrift) console.log(`Build: ${buildDrift}`)
       console.log(`\nPoint any Anthropic-compatible tool at this endpoint:`)
       console.log(`  ANTHROPIC_API_KEY=x ANTHROPIC_BASE_URL=http://${finalConfig.host}:${port}`)

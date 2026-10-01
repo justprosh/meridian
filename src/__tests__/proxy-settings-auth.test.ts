@@ -107,7 +107,16 @@ describe("auth audit: every registered prefix is protected when MERIDIAN_API_KEY
   //                   unhealthy the moment MERIDIAN_API_KEY is set, so an auth
   //                   setting would become a total outage of whatever sits in
   //                   front - the failure this pair exists to prevent.
-  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz"])
+  //
+  // The review for `/inflight`:
+  //
+  //   what it emits   request COUNTS per upstream and two timestamps. No
+  //                   session id, prompt, profile, account or token.
+  //   why not gated   its reader is a restart supervisor on the same host,
+  //                   which has no reason to hold the API key. It is instead
+  //                   answered only to a loopback socket peer without
+  //                   forwarding headers, so it returns 403, not 401, here.
+  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/inflight"])
 
   it("rejects unauthenticated requests to every non-public route prefix", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })

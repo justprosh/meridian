@@ -50,6 +50,32 @@ See [durable evidence](docs/maintenance/evidence/1197-auth-refresh.md).
 This demonstrates a controlled auth-subprocess delay, not a reproduction of
 the contributor's entire overloaded Linux deployment or Windows behavior.
 
+## Local build provenance
+
+```sh
+npm run build
+node scripts/e2e-build-provenance.mjs
+```
+
+Run only in an isolated Git checkout, not the checkout of a running service:
+the harness rebuilds `dist` three times. It uses the bundled Node HTTP server
+on an ephemeral loopback port with temporary home state. No model calls or
+service restarts are needed. It verifies the bundled observation worker,
+`current`, three successful counter increments, `3 builds behind`, unchanged
+runtime identity and 30 concurrent cached status requests. Unit tests cover
+dirty/source state, failed certification, rollback, independent worktrees,
+unavailable metadata and safe provenance links. Browser fixture QA covers
+the shared header at 375, 768 and 1280 pixels and npm unchanged behavior.
+
+**Verified 2026-09-26:** Linux, Node bundled server: runtime build #8 remained
+immutable while actual builds #9, #10 and #11 completed. `/build-status` reported
+`behind` with `buildsBehind: 3`; all 30 concurrent requests returned 200.
+Typecheck and build passed. Full `npm test` timed out in session-lifecycle
+tests; an untouched upstream worktree also timed out, and targeted upstream
+retry tests reproduced four idle/busy/extra-usage timing failures. This is not
+a green full-suite claim. Deployment and browser verification on meridian-dev
+remain gated on its owner's source-versus-bundled runtime decision.
+
 ## Antigravity subscription CLI backend
 
 ```sh
@@ -832,6 +858,44 @@ the main/title overlap using their real shared session metadata, then verifies
 that the title parses and the client copies a random fixture value through its
 tool loop. It does not mock client or model responses or exercise the terminal
 UI. Both fixtures isolate Meridian state and work only in temporary directories.
+
+### Update check consent
+
+The registry check behind `build.latest` and the header's **update available**
+badge is off until `checkForUpdates` is set. A loopback stand-in registry that
+counts requests proves "off" as zero rather than as silence:
+
+```bash
+BASE=/tmp/meridian-e2e-update; rm -rf $BASE; mkdir -p $BASE
+cat > $BASE/registry.mjs <<'EOF'
+let hits = 0
+Bun.serve({ port: 3472, hostname: "127.0.0.1", fetch(req) {
+  if (new URL(req.url).pathname === "/_hits") return Response.json({ hits })
+  hits++
+  return Response.json({ latest: "1.99.0" })
+} })
+EOF
+bun $BASE/registry.mjs &
+MERIDIAN_PORT=3471 MERIDIAN_CONFIG_DIR=$BASE/config MERIDIAN_SESSION_DIR=$BASE/sessions \
+MERIDIAN_TELEMETRY_DB=$BASE/telemetry.db MERIDIAN_UPDATE_CHECK_PATH=$BASE/update-check.json \
+MERIDIAN_UPDATE_CHECK_URL=http://127.0.0.1:3472/dist-tags MERIDIAN_CREDENTIALS_READONLY=1 \
+  node dist/cli.js > $BASE/proxy.log 2>&1 &
+until curl -sf http://127.0.0.1:3471/health >/dev/null; do sleep 1; done
+S=http://127.0.0.1:3471/settings/api/updates
+curl -s http://127.0.0.1:3472/_hits    # {"hits":0}
+curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":true}' $S
+curl -s http://127.0.0.1:3472/_hits    # {"hits":1}
+curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":false}' $S
+```
+
+**Pass criteria:**
+- No registry request from start until the check is switched on; `$BASE/update-check.json` does not exist.
+- Switching on returns `build.latest: "1.99.0"` and `updateAvailable: true` for a 1.x checkout, and writes `"checkForUpdates": true` to `$BASE/config/settings.json`.
+- Switching off returns no `build.latest`, and `/health` drops it too.
+- In a browser at 375 and 1280 px, the header reads Operational, then the
+  version (`v1.77.1 local` for a checkout), then a blue **update available**
+  link to the releases page. Clearing the Updates toggle on `/settings` hides
+  the link and leaves the version.
 
 ## Test Index
 
@@ -7039,6 +7103,29 @@ Use the live companion with the same client/CLI and installed Pi scrub entry:
 `E2E_MERIDIAN_ROOT=<built checkout> E2E_PI_CLI=<cli.js> E2E_CLAUDE_BIN=<2.1.283> E2E_PLUGIN_PATH=<entrypoint> node scripts/e2e-pi-live-idle-control.mjs`.
 The controlled upstream is not a live model; the companion uses actual Opus 5.5
 and proves a real read receipt and Pi session continuation.
+
+For synthetic build-header state inspection, run
+`bun scripts/e2e-build-header-fixture.ts` and open loopback port 42213 with
+`?state=current`, `behind`, `rollback`, `source-changed`, `invalid`, `unknown`,
+`failure` or `npm`. Inspect identity, drift, health, safe links and focus after
+a repeated poll. `/fixture-observations` counts drift requests; the npm state
+must stay at zero. This fixture uses the actual shared header but supplies
+synthetic API states; it does not prove real artifact certification, which
+requires `node scripts/e2e-build-provenance.mjs` separately. It uses no model or
+credentials. [Incorporation evidence](docs/maintenance/evidence/1171-build-provenance.md)
+records the platform and measured preview viewport.
+
+## Client HTTP activity (#1190)
+
+After build, run `E2E_AUTH_FILE=<private access-only JSON snapshot>
+E2E_PLUGIN_PATH=<independently installed scrub entrypoint> bun
+scripts/e2e-inflight-client.mjs`. The actual OpenCode/SDK/model gate launches two
+independent clients, observes active/queued/idle counts over real sockets, checks
+forwarding refusal, and resumes one client's conversation. The snapshot contains
+`accessToken` and `expiresAt`, never a refresh token, and must stay mode 0600.
+The proxy uses a read-only isolated OAuth-token profile. The endpoint describes
+`scope: client-http`; zero cannot establish background-job, pending-continuation
+or post-probe restart safety. See the durable [evidence](docs/maintenance/evidence/1190-request-activity.md).
 
 # Packaged SQLite bookkeeping gate
 

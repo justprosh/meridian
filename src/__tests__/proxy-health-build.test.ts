@@ -36,6 +36,7 @@ mock.module("../proxy/models", () => ({
 
 const { createProxyServer } = await import("../proxy/server")
 const { startUpdateCheck, stopUpdateCheck } = await import("../proxy/updateCheck")
+const { setSetting } = await import("../settings")
 
 interface HealthBuild {
   source?: string
@@ -64,6 +65,7 @@ afterEach(() => {
   for (const key of STAMPS) delete process.env[key]
   authCalls.length = 0
   stopUpdateCheck()
+  setSetting("checkForUpdates", undefined)
 })
 
 describe("/v1/models profile auth context", () => {
@@ -119,6 +121,21 @@ describe("/v1/models profile auth context", () => {
 })
 
 describe("/health build provenance", () => {
+  it("refreshes local status behind the existing optional API-key gate", async () => {
+    const previous = process.env.MERIDIAN_API_KEY
+    process.env.MERIDIAN_API_KEY = "test-local-build-key"
+    try {
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      expect((await app.fetch(new Request("http://tailnet-proxy/build-status"))).status).toBe(401)
+      const response = await app.fetch(new Request("http://tailnet-proxy/build-status", { headers: { "x-api-key": "test-local-build-key" } }))
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ runtime: { kind: "source" }, state: "unknown" })
+    } finally {
+      if (previous === undefined) delete process.env.MERIDIAN_API_KEY
+      else process.env.MERIDIAN_API_KEY = previous
+    }
+  })
+
   it("reports source and version on a healthy response", async () => {
     const { status, body } = await health()
     expect(status).toBe(200)
@@ -137,23 +154,25 @@ describe("/health build provenance", () => {
     expect(build.updateAvailable).toBeUndefined()
   })
 
-  it("surfaces launcher stamps so a dev build is visible, not disguised", async () => {
+  it("keeps the loaded provenance immutable after launcher environment changes", async () => {
+    const before = (await health()).body.build as HealthBuild
     process.env.MERIDIAN_BUILD_SOURCE = "dev"
     process.env.MERIDIAN_BUILD_SHA = "abc1234def"
     process.env.MERIDIAN_BUILD_BRANCH = "feat/experiment"
     process.env.MERIDIAN_BUILD_DIRTY = "1"
 
     const build = (await health()).body.build as HealthBuild
-    expect(build.source).toBe("dev")
-    expect(build.sha).toBe("abc1234def")
-    expect(build.branch).toBe("feat/experiment")
-    expect(build.dirty).toBe(true)
+    expect(build.source).toBe(before.source)
+    expect(build.sha).toBe(before.sha)
+    expect(build.branch).toBe(before.branch)
+    expect(build.dirty).toBe(before.dirty)
     // The headline version is unchanged — that is exactly the trap `build` exists
     // to expose, so it must still be reported alongside, not corrected.
     expect(build.version).toBe("1.62.7")
   })
 
   it("reports an available update once the check resolves", async () => {
+    setSetting("checkForUpdates", true)
     await startUpdateCheck({
       cachePath: `/tmp/meridian-health-build-${process.pid}.json`,
       fetchLatest: async () => "1.99.0",

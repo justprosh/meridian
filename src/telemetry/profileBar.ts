@@ -10,6 +10,8 @@
  * bar (profileBarCss/Html/Js) so every page picks the header up unchanged.
  */
 
+import { buildDriftView, buildIdentityView } from "./buildBadge"
+
 /**
  * Canonical Meridian theme.
  *
@@ -109,7 +111,8 @@ export const profileBarCss = `
   .meridian-header .mh-nav a:hover { color: var(--text, #e6edf3); background: var(--surface, #161b22); }
   .meridian-header .mh-nav a.active { color: var(--accent, #58a6ff); background: var(--surface, #161b22); }
   .meridian-header .mh-right {
-    margin-left: auto; display: flex; align-items: center; gap: 10px;
+    margin-left: auto; display: flex; align-items: center; gap: 6px 10px;
+    flex-wrap: wrap; justify-content: flex-end; min-width: 0; max-width: 100%;
   }
   .meridian-header .mh-profile {
     display: none; align-items: center; gap: 6px;
@@ -123,29 +126,67 @@ export const profileBarCss = `
   .meridian-header .mh-profile .mh-profile-type {
     color: var(--muted, #8b949e); font-size: 10px;
   }
-  /* Build chip — two mutually exclusive states, and the colour is not a
-     style choice: "update available" is a link to the releases page, so it
-     is blue (interactive); "local/dev build" is a meta annotation with no
-     href, so it is violet. Swapping them would break the DESIGN.md rule. */
+  /* npm update chip — a link to the releases page, so it is blue
+     (interactive). Local/dev provenance is the separate .mh-prov pill. */
   .meridian-header .mh-build {
     display: none; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 500; white-space: nowrap;
-    padding: 3px 10px; border-radius: 20px; text-decoration: none;
-    transition: background 0.15s;
+    padding: 3px 10px; border-radius: 20px;
+    color: var(--muted, #8b949e);
+    background: var(--surface, #161b22);
+    border: 1px solid var(--border, #30363d);
+    cursor: default;
   }
   .meridian-header .mh-build.visible { display: inline-flex; }
-  .meridian-header .mh-build.update {
-    color: var(--accent, #58a6ff);
-    background: rgba(88,166,255,0.12);
-    border: 1px solid rgba(88,166,255,0.35);
-  }
-  .meridian-header .mh-build.update:hover { background: rgba(88,166,255,0.18); }
-  .meridian-header .mh-build.provenance {
+  /* Local/dev build identity: a violet meta pill whose branch and commit
+     pieces become blue links only when the backend supplied a safe URL.
+     Drift sits beside it as its own chip, because it is refreshed from a
+     different endpoint and must be able to say "unknown" on its own. */
+  .meridian-header .mh-prov {
+    display: none; align-items: center; gap: 6px;
+    min-width: 0; max-width: 100%;
+    font-size: 11px; font-weight: 500; line-height: 16px;
+    padding: 3px 10px; border-radius: 12px;
     color: var(--accent2, #bc8cff);
     background: rgba(188,140,255,0.12);
     border: 1px solid rgba(188,140,255,0.35);
-    cursor: default;
   }
+  .meridian-header .mh-prov.visible { display: inline-flex; }
+  .meridian-header .mh-prov-part { white-space: nowrap; flex: none; }
+  .meridian-header .mh-prov-part + .mh-prov-part::before {
+    content: "·"; margin-right: 6px; color: var(--muted, #8b949e);
+  }
+  .meridian-header .mh-prov-branch {
+    flex: 0 1 auto; min-width: 6ch; max-width: 22ch; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .meridian-header .mh-prov-commit { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; }
+  .meridian-header a.mh-prov-part { color: var(--accent, #58a6ff); text-decoration: none; }
+  .meridian-header a.mh-prov-part:hover { text-decoration: underline; }
+  .meridian-header a.mh-prov-part:focus-visible { outline: 2px solid var(--accent, #58a6ff); outline-offset: 1px; border-radius: 3px; }
+  .meridian-header .mh-drift {
+    display: inline-flex; align-items: center; white-space: nowrap;
+    font-size: 11px; font-weight: 500; line-height: 16px;
+    padding: 3px 8px; border-radius: 12px;
+    color: var(--muted, #8b949e); border: 1px solid transparent;
+  }
+  .meridian-header .mh-drift[hidden] { display: none; }
+  .meridian-header .mh-drift.warning {
+    color: var(--yellow, #d29922);
+    background: rgba(210,153,34,0.12);
+    border-color: rgba(210,153,34,0.35);
+  }
+  .meridian-header .mh-update {
+    display: none; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+    padding: 3px 10px; border-radius: 20px; text-decoration: none;
+    color: var(--accent, #58a6ff);
+    background: rgba(88,166,255,0.12);
+    border: 1px solid rgba(88,166,255,0.35);
+    transition: background 0.15s;
+  }
+  .meridian-header .mh-update.visible { display: inline-flex; }
+  .meridian-header .mh-update:hover { background: rgba(88,166,255,0.18); }
   .meridian-header .mh-profile.following { border-color: var(--accent2, #bc8cff); }
   .meridian-header .mh-profile .mh-profile-follow {
     color: var(--accent2, #bc8cff); font-size: 10px;
@@ -168,6 +209,7 @@ export const profileBarCss = `
     .meridian-header .mh-name { display: none; }
     .meridian-header .mh-nav { order: 3; flex-basis: 100%; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
     .meridian-header .mh-nav a { flex-shrink: 0; }
+    .meridian-header .mh-right { flex: 1 1 0; }
     .meridian-header .mh-status .mh-status-text { display: none; }
   }
 `
@@ -187,9 +229,12 @@ export const profileBarHtml = `
     <a href="/plugins" id="nav-plugins">Plugins</a>
   </nav>
   <div class="mh-right">
-    <a class="mh-build" id="mhBuild" target="_blank" rel="noopener"></a>
+    <span class="mh-prov" id="mhProv" role="group"></span>
+    <span class="mh-drift" id="mhDrift" role="status" hidden></span>
     <a class="mh-profile" id="mhProfile" href="/" title="Active profile — switch from the home page"></a>
     <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span></span>
+    <span class="mh-build" id="mhBuild"></span>
+    <a class="mh-update" id="mhUpdate" href="https://github.com/rynfar/meridian/releases" target="_blank" rel="noopener"></a>
   </div>
 </header>
 `
@@ -198,6 +243,7 @@ export const profileBarJs = `
 (function() {
   var profileChip = document.getElementById('mhProfile');
   var buildChip = document.getElementById('mhBuild');
+  var updateChip = document.getElementById('mhUpdate');
   var statusDot = document.getElementById('mhDot');
   var statusText = document.getElementById('mhStatusText');
 
@@ -212,30 +258,106 @@ export const profileBarJs = `
 
   function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-  // Build provenance chip. Hidden entirely for a current npm install, which
-  // is the case that needs no comment.
+  // Inlined from src/telemetry/buildBadge.ts, unit-tested in build-badge.test.ts.
+  var buildIdentityView = ${buildIdentityView.toString()};
+  var buildDriftView = ${buildDriftView.toString()};
+  var provChip = document.getElementById('mhProv');
+  var driftChip = document.getElementById('mhDrift');
+  var provKey = '';
+  var driftKey = '';
+
+  // Build chips. Hidden entirely for a current npm install, which is the case
+  // that needs no comment. Rebuilt only when the view changes, so a poll never
+  // yanks a link out from under the pointer or keyboard focus.
   function renderBuild(build) {
-    if (!buildChip) return;
-    if (!build) { buildChip.className = 'mh-build'; return; }
-    if (build.source !== 'npm') {
-      buildChip.textContent = (build.source === 'dev' ? 'dev build' : 'local build') + (build.dirty ? ' *' : '');
-      buildChip.removeAttribute('href');
-      buildChip.title = 'Not an npm release — the reported version ' + build.version +
-        ' is the tree\\'s last release, not proof of what is running' +
-        (build.branch ? '\\nbranch: ' + build.branch : '') +
-        (build.sha ? '\\ncommit: ' + build.sha.slice(0, 8) : '') +
-        (build.dirty ? '\\nuncommitted changes present' : '');
-      buildChip.className = 'mh-build provenance visible';
-      return;
+    var view = buildIdentityView(build);
+    var known = build && build.version && build.version !== 'unknown';
+    buildChip.textContent = known ? 'v' + build.version : '';
+    buildChip.title = known ? 'Running Meridian ' + build.version : '';
+    // Local provenance already includes release/package version and run identity.
+    buildChip.className = known && build.source === 'npm' ? 'mh-build visible' : 'mh-build';
+    if (build && build.updateAvailable && build.latest) {
+      updateChip.textContent = 'update available';
+      updateChip.title = build.latest + ' is published, running ' + build.version + ' — ' +
+        (build.source === 'npm' ? 'update with:\\nnpm install -g @rynfar/meridian@latest' : 'pull and rebuild this checkout');
+      updateChip.className = 'mh-update visible';
+    } else {
+      updateChip.className = 'mh-update';
     }
-    if (build.updateAvailable) {
-      buildChip.textContent = build.latest + ' available';
-      buildChip.href = 'https://github.com/rynfar/meridian/releases';
-      buildChip.title = 'Running ' + build.version + ' — update with:\\nnpm install -g @rynfar/meridian@latest';
-      buildChip.className = 'mh-build update visible';
-      return;
+    var key = JSON.stringify(view);
+    if (key !== provKey) {
+      provKey = key;
+      if (view.mode === 'local') {
+        provChip.replaceChildren.apply(provChip, view.parts.map(function(part) {
+          var piece = document.createElement(part.href ? 'a' : 'span');
+          piece.className = 'mh-prov-part mh-prov-' + part.kind;
+          piece.textContent = part.text;
+          piece.title = part.title;
+          if (part.href) { piece.href = part.href; piece.target = '_blank'; piece.rel = 'noopener noreferrer'; }
+          return piece;
+        }));
+        provChip.title = view.title;
+        provChip.setAttribute('aria-label', view.label);
+        provChip.className = 'mh-prov visible';
+      } else {
+        provChip.replaceChildren();
+        provChip.removeAttribute('title');
+        provChip.removeAttribute('aria-label');
+        provChip.className = 'mh-prov';
+      }
     }
-    buildChip.className = 'mh-build';
+    setDriftTracking(view.mode === 'local');
+  }
+
+  // Drift comes from /build-status, which only local/dev builds serve. It has
+  // its own chained timer: the next request is scheduled only after the last
+  // one settles, so slow responses cannot overlap or land out of order. A
+  // failed request replaces the previous claim with an explicit unknown and
+  // never touches the health pill.
+  var driftTracking = false;
+  var driftInFlight = false;
+  var driftTimer = null;
+  var driftGeneration = 0;
+
+  function renderDrift(status) {
+    var view = buildDriftView(status);
+    var key = JSON.stringify(view);
+    if (key === driftKey) return;
+    driftKey = key;
+    driftChip.textContent = view.text;
+    driftChip.title = view.title;
+    driftChip.className = 'mh-drift ' + view.tone;
+    driftChip.hidden = false;
+  }
+
+  function pollDrift() {
+    clearTimeout(driftTimer);
+    driftTimer = null;
+    if (!driftTracking || driftInFlight) return;
+    driftInFlight = true;
+    var generation = driftGeneration;
+    fetch('/build-status', { cache: 'no-store', headers: { Accept: 'application/json' } })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .catch(function() { return null; })
+      .then(function(status) {
+        driftInFlight = false;
+        if (!driftTracking) return;
+        var fresh = generation === driftGeneration;
+        if (fresh) renderDrift(status);
+        driftTimer = setTimeout(pollDrift, fresh ? 10000 : 0);
+      });
+  }
+
+  function setDriftTracking(tracking) {
+    if (tracking === driftTracking) return;
+    driftTracking = tracking;
+    driftGeneration++;
+    if (tracking) { pollDrift(); return; }
+    clearTimeout(driftTimer);
+    driftTimer = null;
+    driftKey = '';
+    driftChip.hidden = true;
+    driftChip.textContent = '';
   }
 
   function loadHeader() {
@@ -278,7 +400,7 @@ export const profileBarJs = `
   setInterval(loadHeader, 10000);
   // Pages call this after mutating state (e.g. switching the active profile)
   // so the header chip updates immediately instead of on the next poll.
-  window.meridianHeaderRefresh = loadHeader;
+  window.meridianHeaderRefresh = function() { loadHeader(); pollDrift(); };
 })();
 `
 
