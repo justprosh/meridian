@@ -371,6 +371,11 @@ bounded pages and PASSIVE checkpoints; explicit offline commands own migration,
 export and TRUNCATE. See [configuration](docs/configuration.md#sqlite-session-bookkeeping)
 and the runtime/COMMIT integration tests for the executable contract (graph #202–207).
 
+PASSIVE maintenance joins the same local FIFO with a bounded admission deadline,
+but takes no write transaction. It retains connection ownership until settlement
+and reports external checkpoint debt separately from GC success. A failed/deferred
+checkpoint never erases the already observed sweep result (graph #202).
+
 Sessions map an agent's conversation ID to a Claude SDK session ID. Two caches work in tandem:
 
 - **Session cache**: keyed by agent header (`x-opencode-session`)

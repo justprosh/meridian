@@ -57,3 +57,12 @@ behavior, real model traffic or production readiness. Final combined artifact
 must include the separately coordinated OpusB checkpoint fix before final gate,
 independent OpusA rerun and affected Linux installed-package acceptance. Earlier
 19ad/1f57 artifacts remain intact and are not claimed fixed for this case.
+
+The coordinated checkpoint change is now included from source
+`7a4fd2bce4309314e61c6d1e5a8ef7821212759f`: PASSIVE gets a bounded FIFO-head
+opportunity outside BEGIN, retaining pending ownership until settlement.
+Later write admissions cannot overtake that opportunity. GC's result is
+published independently of checkpoint outcome; checkpoint deferral/failure has
+distinct diagnostics and frame-count debt. External readers/writers can still
+prevent WAL progress, so neither this mechanism nor focused tests claim that
+every sweep shrinks WAL. Offline TRUNCATE remains exclusive and unchanged.
