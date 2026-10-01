@@ -317,15 +317,64 @@ export interface BookkeepingCheckpoint {
   log: number
   checkpointed: number
 }
-function checkpoint(directory: string, mode: "PASSIVE" | "TRUNCATE"): BookkeepingCheckpoint {
-  const connection = addressed(directory)
-  if (active || connection.pending) throw new Error("checkpoint requires idle bookkeeping connection")
+function checkpointIdle(connection: Connection, mode: "PASSIVE" | "TRUNCATE"): BookkeepingCheckpoint {
+  if (active) throw new Error("checkpoint requires idle bookkeeping connection")
   if (mode === "TRUNCATE" && connection.refs !== 1)
     throw new Error("offline checkpoint requires sole local handle")
   recover(connection)
-  const rows = database(connection).pragma(`wal_checkpoint(${mode})`) as BookkeepingCheckpoint[]
+  const db = database(connection)
+  if (db.inTransaction) throw new Error("checkpoint requires idle bookkeeping connection")
+  let rows: BookkeepingCheckpoint[]
+  try {
+    rows = db.pragma(`wal_checkpoint(${mode})`) as BookkeepingCheckpoint[]
+  } catch (error) {
+    if (busy(error)) throw new BookkeepingBusyError("bookkeeping checkpoint busy", { cause: error })
+    throw error
+  }
   if (!rows[0]) throw new Error("missing checkpoint result")
   return rows[0]
+}
+function checkpoint(directory: string, mode: "PASSIVE" | "TRUNCATE"): BookkeepingCheckpoint {
+  const connection = addressed(directory)
+  if (connection.pending) throw new Error("checkpoint requires idle bookkeeping connection")
+  return checkpointIdle(connection, mode)
+}
+
+/** One PASSIVE opportunity at the FIFO head, outside BEGIN; later arrivals cannot overtake it.
+ * The whole queue wait is bounded, and pending retains the handle until settlement (graph #202).
+ * External readers/writers may still prevent progress: the returned frame counts expose that debt. */
+export function checkpointBookkeepingAsync(
+  directory: string,
+  options: Pick<BookkeepingWriteOptions, "lockWaitMs" | "admissionSignal"> = {},
+): Promise<BookkeepingCheckpoint> {
+  const connection = addressed(directory)
+  if (active) throw new SessionLifecycleReentrancyError("checkpoint admission inside bookkeeping transaction")
+  const budget = options.lockWaitMs ?? getBookkeepingLockWaitMs()
+  if (!Number.isSafeInteger(budget) || budget < 0) throw new RangeError("invalid checkpoint admission budget")
+  const deadline = performance.now() + budget
+  const controller = new AbortController()
+  const timeout = new SessionLifecycleLockError("bookkeeping checkpoint admission expired")
+  const abort = () => controller.abort(options.admissionSignal?.reason)
+  options.admissionSignal?.addEventListener("abort", abort, { once: true })
+  if (options.admissionSignal?.aborted) abort()
+  const expire = () => {
+    const remaining = deadline - performance.now()
+    if (remaining > 0) timer = setTimeout(expire, Math.max(1, remaining))
+    else controller.abort(timeout)
+  }
+  let timer = setTimeout(expire, budget)
+  connection.pending++
+  return lifecycleLockQueue.run(connection.path, controller.signal, async () => {
+    controller.signal.throwIfAborted()
+    if (budget && performance.now() >= deadline) throw timeout
+    // pending includes this holder and later waiters; exclusion comes from owning the FIFO,
+    // not from pretending those admissions do not exist. Never acquire a write transaction.
+    return checkpointIdle(connection, "PASSIVE")
+  }).finally(() => {
+    connection.pending--
+    clearTimeout(timer)
+    options.admissionSignal?.removeEventListener("abort", abort)
+  })
 }
 export function checkpointBookkeeping(directory: string, mode: "PASSIVE" = "PASSIVE"): BookkeepingCheckpoint {
   if (mode !== "PASSIVE") throw new Error("TRUNCATE requires explicit offline checkpoint")
