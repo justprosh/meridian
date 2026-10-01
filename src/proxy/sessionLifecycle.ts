@@ -112,20 +112,13 @@ export interface SessionLifecycleOptions {
   retryBaseMs?: number
   retryMaxMs?: number
   deletionTimeoutMs?: number
-  /**
-   * Budget for one deletion executor handshake: the durable attach of the
-   * child's incarnation under the sidecar lock, measured from after the
-   * synchronous incarnation capture. Covers the FIFO wait for the lock and
-   * the durable write, never the gated execution itself.
-   */
+  /** Budget for the executor's durable attach under the sidecar lock (FIFO wait
+   * plus write), counted after incarnation capture; never the gated execution. */
   deletionHandshakeTimeoutMs?: number
   /** Refresh durable mapping pins before each destructive claim. */
   pinProvider?: () => readonly TranscriptLocator[]
-  /**
-   * Forbids beginning the next deletion claim once elapsed. An already
-   * started claim is never truncated by it: it finishes with its own budgets
-   * (deletionTimeoutMs plus deletionHandshakeTimeoutMs).
-   */
+  /** Stops new deletion claims once elapsed; a started claim keeps its own
+   * budgets (deletionTimeoutMs plus deletionHandshakeTimeoutMs). */
   runTimeoutMs?: number
   /** Test seam. Overrides the resolved @anthropic-ai/claude-agent-sdk module the
    * deletion child imports, so the fenced-delete path can run against a stub. */
@@ -771,10 +764,7 @@ export async function runGc(
     let notFound = false
     let deletionStillRunning = false
     try {
-      // The full deletion budget belongs to the claim in flight: the run
-      // deadline above only decides whether the next claim may begin, so a
-      // claim that started before the deadline always carries its complete
-      // execution and handshake budgets.
+      // The run deadline only gates the next claim; this one keeps its full budgets.
       const deletionTimeout = option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs")
       if (options.deleter) {
         await awaitCustomDeleter(options.deleter(candidate.locator), deletionTimeout)
@@ -863,10 +853,8 @@ async function attachDeletionExecutor(
   signal: AbortSignal,
   options: SessionLifecycleOptions,
 ): Promise<void> {
-  // The handshake signal fences admission only: once the durable write below
-  // has started it runs to completion, so the executor fields can never be
-  // published half-written and finishDeletion (queued behind this holder)
-  // always observes either the complete attach or none of it.
+  // The signal fences admission only: a started write runs to completion, so
+  // finishDeletion (queued behind this holder) sees the whole attach or none of it.
   signal.throwIfAborted()
   await withSidecarLock({ ...options, admissionSignal: signal }, async (paths) => {
     const sidecar = await readSidecar(paths.sidecar)
@@ -935,8 +923,7 @@ class DeletionStillRunningError extends Error {}
 /** The SDK reported the transcript already gone: there is nothing left to delete. */
 class TranscriptAlreadyAbsentError extends Error {}
 
-/** @internal Bridge for the SQL deletion phase (bookkeeping/lifecycleDeletionSql,
- * lifecycleReconcileSql) into the one deletion runtime; not part of the package API.
+/** @internal Bridge from the SQL deletion phase into the one deletion runtime; not package API.
  * Frozen so that neither a consumer nor a test can swap a member under the JSON path. */
 export const sessionDeletionRuntime = Object.freeze({
   processGroupIsEmpty,
@@ -1105,13 +1092,9 @@ try {
       // The child counts its gate deadline from its own start, but the parent
       // opens the gate only after capturing the child's incarnation — a
       // PowerShell round trip on win32 that may consume its entire probe
-      // budget — and after the durable executor handshake, which waits in the
-      // lifecycle FIFO behind other holders before its own durable write
-      // lands. The handshake budget is the allowance for that whole
-      // publication path; the full execution budget still belongs to the
-      // deletion itself. Without either allowance the child exits 75 before
-      // the gate ever appears, turning every deletion into a retryable
-      // failure on a loaded host.
+      // budget — and after the durable executor handshake. Without both
+      // allowances the child exits 75 before the gate ever appears, turning
+      // every deletion into a retryable failure on a loaded host.
       MERIDIAN_GC_GATE_TIMEOUT_MS: String(
         timeoutMs
         + handshakeTimeoutMs
@@ -1153,11 +1136,8 @@ try {
     if (!processGroupId) throw new Error("session deletion child has no PID")
     const executor = captureProcessIncarnation(processGroupId)
     if (!executor) throw new Error("cannot capture session deletion executor incarnation")
-    // The handshake budget starts only now — after the synchronous
-    // incarnation capture — and covers exactly the durable executor attach:
-    // the FIFO wait for the sidecar lock plus the durable write. Losing the
-    // race never opens the gate, and the execution timer below stays the
-    // full deletion budget.
+    // The handshake budget starts after incarnation capture and covers only the
+    // durable attach; losing the race never opens the gate.
     const handshakeDeadline = performance.now() + handshakeTimeoutMs
     const handshake = new AbortController()
     // Admission cancellation joins the handshake fence when the runtime

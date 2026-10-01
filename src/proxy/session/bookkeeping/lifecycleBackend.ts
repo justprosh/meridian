@@ -26,10 +26,10 @@ export const lifecycleBackendMethods = [
   "abandonFork", "reconcile", "runGc",
 ] as const satisfies readonly (keyof SessionLifecycleBackend)[]
 
-export class SessionLifecyclePortionNotImplementedError extends Error {
+export class SessionLifecycleOperationUnavailableError extends Error {
   constructor(readonly method: keyof SessionLifecycleBackend) {
-    super(`lifecycle ${method}: not implemented in this portion`)
-    this.name = "SessionLifecyclePortionNotImplementedError"
+    super(`lifecycle ${method}: not available in this backend`)
+    this.name = "SessionLifecycleOperationUnavailableError"
   }
 }
 
@@ -66,6 +66,6 @@ export function setSessionLifecycleBackendForTest(
   // Copy the validated properties themselves, including prototype methods of an explicit test backend.
   selected = Object.fromEntries(lifecycleBackendMethods.map((name) => [name,
     typeof backend[name] === "function" ? backend[name]
-      : () => { throw new SessionLifecyclePortionNotImplementedError(name) },
+      : () => { throw new SessionLifecycleOperationUnavailableError(name) },
   ])) as unknown as SessionLifecycleBackend
 }

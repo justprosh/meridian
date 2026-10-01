@@ -17,7 +17,7 @@ import { writeMappingRow } from "../proxy/session/bookkeeping/mappings"
 import { claimDeletion, attachDeletionExecutor, finishDeletion, runDeletionPhase }
   from "../proxy/session/bookkeeping/lifecycleDeletionSql"
 import { sqliteLifecycleLeases, releaseJoinedTranscriptLease } from "../proxy/session/bookkeeping/lifecycleLeasesSql"
-import { lifecycleBackendMethods, SessionLifecyclePortionNotImplementedError }
+import { lifecycleBackendMethods, SessionLifecycleOperationUnavailableError }
   from "../proxy/session/bookkeeping/lifecycleBackend"
 import type { TranscriptLocator, TranscriptResourceState } from "../proxy/session/bookkeeping/types"
 
@@ -61,7 +61,7 @@ function lease(locator: TranscriptLocator) {
 
 it("an explicitly empty partial backend still refuses public runGc rather than falling through to JSON", async () => {
   facade.setSessionLifecycleBackendForTest({}, lifecycleBackendMethods)
-  await expect(facade.runGc([], options)).rejects.toBeInstanceOf(SessionLifecyclePortionNotImplementedError)
+  await expect(facade.runGc([], options)).rejects.toBeInstanceOf(SessionLifecycleOperationUnavailableError)
 })
 
 for (const mode of ["null", "exact", "foreign"] as const) {

@@ -12,7 +12,7 @@ import { connectionFor, BookkeepingTextParameterError } from "../proxy/session/b
 import { allocateResource, insertResourceLease, readResource, readResourceLease }
   from "../proxy/session/bookkeeping/resources"
 import { canonicalizeLocator } from "../proxy/session/bookkeeping/locator"
-import { activeLifecycleBackend, lifecycleBackendMethods, SessionLifecyclePortionNotImplementedError }
+import { activeLifecycleBackend, lifecycleBackendMethods, SessionLifecycleOperationUnavailableError }
   from "../proxy/session/bookkeeping/lifecycleBackend"
 import { sqliteLifecycleLeases, retryDeferredLeaseReleases } from "../proxy/session/bookkeeping/lifecycleLeasesSql"
 import { assertAdmissionHeartbeat, measureAdmissionHeartbeat } from "./fixtures/bookkeeping-heartbeat"
@@ -62,7 +62,7 @@ it("dispatches into SQLite, never silently completes an unavailable operation or
   expect(readResourceLease(handle.reader, resource(locator).key, lease.token)?.owner.pid).toBe(process.pid)
   expect(existsSync(join(directory, "session-gc.json"))).toBe(false)
   await expect(facade.prepareFork({ sessionId: "b", configDir: directory }, options))
-    .rejects.toBeInstanceOf(SessionLifecyclePortionNotImplementedError)
+    .rejects.toBeInstanceOf(SessionLifecycleOperationUnavailableError)
   expect(() => facade.setSessionLifecycleBackendForTest(sqliteLifecycleLeases, []))
     .toThrow("exact list")
   expect(() => facade.setSessionLifecycleBackendForTest({}, [...lifecycleBackendMethods, "runGc"]))

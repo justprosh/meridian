@@ -43,9 +43,8 @@ export class BookkeepingAdmissionSeamError extends Error {
 let admissionWaitForTest: AdmissionWait | undefined
 let admissionWaitInstalled = false
 let admissionStarted = false
-/** Internal negative-control seam, not part of the package's public API: production always uses the
- * abortable asynchronous timer. Installable once per process and only before its first async admission,
- * so it can never change the waits of a process that already admitted work; clearing is always allowed. */
+/** Internal test seam, not public API; production always uses the abortable timer. Installable once,
+ * only before the first async admission, so it never changes waits already admitted; clearing is always allowed. */
 export function setBookkeepingAdmissionWaitForTest(wait: AdmissionWait | undefined): void {
   if (active) throw new SessionLifecycleReentrancyError("cannot change admission wait inside a transaction")
   if (wait === undefined) {
