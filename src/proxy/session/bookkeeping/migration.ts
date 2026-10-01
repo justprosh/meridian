@@ -171,11 +171,6 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
       throw new BookkeepingMaintenanceRequiredError("migration aborted; finish abort-migration before any new transition")
     }
     if (!journal && existsSync(join(directory, BOOKKEEPING_FILENAME))) {
-      if (guard.createdIdentity) {
-        const identity = guard.createdIdentity
-        guard.close()
-        retireFile(guard.path, randomUUID(), identity)
-      }
       throw new BookkeepingMaintenanceRequiredError("database without migration journal; refuse implicit adoption")
     }
     const residues = journal ? journal.residues ?? [] : planResidueArchive(directory)
@@ -183,6 +178,7 @@ export async function migrateBookkeeping(input: string, options: MigrationOption
     const barriers = () => {
       if (journal && journal.phase !== "PREPARED") return
       const before = sources(directory, journal)
+      prepareImport(before[0]?.raw, before[1]?.raw)
       if (before[0]?.raw !== undefined) assertQuiescent(parseLegacySidecar(before[0].raw))
       ensureSpace(directory, before.reduce((n, entry) => n + entry.identity.bytes, 0), options)
       if (!journal) {

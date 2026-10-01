@@ -31,7 +31,9 @@ import {
 } from "./guard"
 import type { GuardLease, MaintenanceGuardLease } from "./guard"
 import type { BookkeepingReader, SqlRow, SqlValue } from "./types"
-import { readJournal, requireBarriers } from "./maintenanceJournal"
+import { crashPoint, readJournal, requireBarriers, saveJournal } from "./maintenanceJournal"
+import type { MigrationJournal } from "./maintenanceJournal"
+import { prepareFreshBootstrap } from "./freshBootstrap"
 import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 
 export const BOOKKEEPING_FILENAME = "session-bookkeeping.sqlite"
@@ -152,7 +154,7 @@ function pragmas(db: Database.Database, journal: "WAL" | "DELETE"): void {
   }
 }
 
-function bootstrap(path: string, phase = "READY"): void {
+function bootstrap(path: string, phase = "READY", provenance?: MigrationJournal): void {
   cleanupBootstrapOrphans(path)
   if (existsSync(path)) return
   const temporary = createBootstrapPath(path)
@@ -174,6 +176,8 @@ function bootstrap(path: string, phase = "READY"): void {
     db.exec("BEGIN IMMEDIATE")
     initializeBookkeepingSchema(db, true)
     db.prepare("UPDATE schema_meta SET phase=?").run(phase)
+    if (provenance) db.prepare("UPDATE schema_meta SET migration_id=?,source_digests_json=?")
+      .run(provenance.id, JSON.stringify(provenance.finalSources))
     db.exec("COMMIT")
     close()
     const fd = ownedFd(temporary)
@@ -316,12 +320,26 @@ export function openHandle(
     if (connection.phase !== (expectPhase ?? "READY"))
       throw new BookkeepingMaintenanceRequiredError("phase mismatch")
   } else {
+    const freshGuard = expectPhase === undefined && !existsSync(path) && !readJournal(canonical)
+      ? acquireMaintenanceGuard(canonical) : undefined
     const guard =
-      maintenanceGuard ??
+      maintenanceGuard ?? freshGuard ??
       (expectPhase === undefined ? acquireRuntimeGuard(canonical) : acquireMaintenanceGuard(canonical))
     const ownsGuard = maintenanceGuard === undefined
     let releaseGuardReference: (() => void) | undefined
     try {
+      if (freshGuard) {
+        const provenance = prepareFreshBootstrap(canonical, freshGuard)
+        bootstrap(path, "READY", provenance)
+        crashPoint("fresh:database-published")
+        provenance.phase = "READY"
+        saveJournal(canonical, provenance)
+        crashPoint("fresh:READY")
+        freshGuard.toShared(() => {
+          if (readJournal(canonical)?.phase !== "READY") throw new Error("fresh handoff lost READY")
+          requireBarriers(canonical, provenance.id)
+        })
+      }
       assertGuardLease(guard, canonical, expectPhase === undefined ? "shared" : "exclusive")
       releaseGuardReference = retainGuardLease(guard, expectPhase === undefined ? "shared" : "exclusive")
       const migration = expectPhase === undefined ? readJournal(canonical) : undefined
@@ -346,8 +364,9 @@ export function openHandle(
             throw new BookkeepingMaintenanceRequiredError("legacy bookkeeping requires offline migration")
           }
         }
-        bootstrap(path)
+        if (!migration) throw new BookkeepingMaintenanceRequiredError("database without owned provenance; refuse implicit adoption")
       }
+      cleanupBootstrapOrphans(path)
       const db = openDatabase(path, expectPhase ?? "READY", true, skipRealpathAudit)
       if (expectPhase === undefined) {
         const meta = getRow(db, "SELECT migration_id,source_digests_json FROM schema_meta", [])

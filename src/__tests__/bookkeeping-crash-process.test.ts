@@ -169,8 +169,11 @@ for (const point of ["ABORTING", "released:session-gc.json", "released:sessions.
   it(`SIGKILL abort ${point}`, async () => {
     const directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-crash-abort-")))
     try {
+      writeFileSync(join(directory, "sessions.json"), "{}", { mode: 0o600 })
+      child("migrate", directory, "BARRIERS")
+      // Materialize the historical preflight bug's malformed protected input.
+      // New migrations reject it before any barrier; abort must still recover old states.
       writeFileSync(join(directory, "sessions.json"), "invalid", { mode: 0o600 })
-      await expect(migrateBookkeeping(directory, { writersStopped: true })).rejects.toThrow()
       child("abort", directory, `abort:${point}`)
       abortBookkeepingMigration(directory)
       expect(readJournal(directory)?.phase).toBe("ABORTED")

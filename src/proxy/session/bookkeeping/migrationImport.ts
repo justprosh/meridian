@@ -11,6 +11,7 @@ import type { BookkeepingResource, CanonicalStoredSession, BookkeepingTransactio
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { preserveLegacyExport } from "./legacyExport"
 import { mappingGeneration, legacyUserDenial } from "./mappingMetadata"
+import { validateImportTransaction } from "./importValidation"
 
 export interface ImportPlan {
   sidecar: SessionGcSidecar
@@ -61,7 +62,13 @@ export function prepareImport(sidecarRaw: string | undefined, storeRaw: string |
       ...(entry.previousTranscript ? { previousTranscript: canonicalizeLocator(entry.previousTranscript, paths) } : {}),
     } as CanonicalStoredSession,
   }))
-  return { sidecar, store, resources, mappings }
+  const plan = { sidecar, store, resources, mappings }
+  try { validateImportTransaction(tx => importPlan(tx, plan, "preflight", "[]")) } catch (cause) {
+    throw new BookkeepingMaintenanceRequiredError(
+      `legacy import is not SQL-representable: ${cause instanceof Error ? cause.message : String(cause)}`, { cause },
+    )
+  }
+  return plan
 }
 
 export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: string, digests: string): void {
@@ -83,7 +90,9 @@ export function importPlan(tx: BookkeepingTransaction, plan: ImportPlan, id: str
     }
   }
   for (const { key, canonical, original } of plan.mappings) {
-    writeMappingRow(tx, key, canonical)
+    try { writeMappingRow(tx, key, canonical) } catch (cause) {
+      throw new TypeError(`mapping ${JSON.stringify(key)}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+    }
     if (canonical.generationId === undefined) {
       tx.run("UPDATE mapping_history SET history_json=? WHERE mapping_key=?", original, key)
       const entry = plan.store.sessions[key]!

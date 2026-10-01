@@ -8,6 +8,7 @@ import { errorCode } from "./storagePaths"
 import { crashPoint, writeDurably } from "./maintenanceJournal"
 import { randomUUID } from "node:crypto"
 import { isUuidV4 } from "./uuid"
+import { assertGuardNotRetired, assertNoGuardRetirement } from "./guardIdentity"
 
 export class PrivateIdentityError extends Error { readonly exitCode = 5 }
 export interface FileIdentity { dev: number; ino: number }
@@ -69,6 +70,7 @@ function complete(intent: Intent, journal: PrivatePath, hooks: RetirementHooks, 
 /** Every public-name retirement has its own durable, private intent; intents retire themselves privately. */
 function retire(source: string, id: string, expected: FileIdentity | undefined,
   hooks: RetirementHooks, nativeAlias = false, resumeOnly = false): void {
+  assertGuardNotRetired(source)
   const directory = dirname(source)
   const prefix = `${basename(source)}.deletion-intent.releasing-`
   const pending = readdirSync(directory).filter((name) => name.startsWith(prefix))
@@ -127,6 +129,7 @@ export function resumeFileRetirement(source: string): void {
 
 /** Explicit maintenance only; resume private captures before interpreting possibly retired control journals. */
 export function resumeRetirements(directory: string): void {
+  assertNoGuardRetirement(directory)
   const marker = ".deletion-intent.releasing-"
   const sources = new Set(readdirSync(directory).filter((name) => name.includes(marker))
     .map((name) => name.slice(0, name.indexOf(marker))))

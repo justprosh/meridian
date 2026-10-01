@@ -3,7 +3,7 @@ import { checkpointBookkeepingOffline } from "./transaction"
 import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 
 /** Synchronous maintenance only; one idle main handle, separate exclusive guard. */
-export function truncateOffline(directory: string, operation: "export" | "migration"): void {
+export function truncateOffline(directory: string, operation: "export" | "migration" | "abort"): void {
   const connection = connectionFor(directory)
   const budget = getBookkeepingLockWaitMs()
   const deadline = performance.now() + budget

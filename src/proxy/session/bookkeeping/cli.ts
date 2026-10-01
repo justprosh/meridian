@@ -13,15 +13,16 @@ import { BookkeepingBarrierReplacedError } from "./barrier"
 import { preflightLegacyMigration, refuseUnjournaledDatabase } from "./maintenancePreflight"
 import { SessionStoreLockTimeoutError } from "../storeErrors"
 import { SessionLifecycleLockError } from "../lifecycleErrors"
+import { recoverGuardRetirements } from "./guardRecovery"
 
-const HELP = `meridian-bookkeeping <inspect|migrate|export-json|recanonicalize|abort-migration>
+const HELP = `meridian-bookkeeping <inspect|migrate|export-json|recanonicalize|abort-migration|recover-guard-retirement>
   --session-dir <directory> [--json] [--writers-stopped]
 Stop and drain all writers before maintenance. migrate requires --writers-stopped
 (missing attestation exits 2). inspect is read-only and may run beside a live proxy.
 Exit codes: 0 done/already target; 2 usage; 3 refused before transition (old binary safe
 only if the starting state was legacy); 4 barriers/export active: do NOT start an old
 binary; 5 corrupt/unreadable state or replaced barrier; 6 caller/directory uid mismatch.
-After 4: resume migrate, abort-migration before database creation, or resume export-json.
+After 4: resume migrate, abort-migration for pre-database or provably empty PREPARED state, or resume export-json.
 Never remove barriers manually. Both *.json.lock files contain a JSON line:
 {"backend":"sqlite","migration_id":"<uuid>","format":"meridian-bookkeeping-barrier-v1",
 "instruction":"Stop all writers; use meridian-bookkeeping export-json. Never delete this barrier manually."}
@@ -31,8 +32,13 @@ Gate files without incarnations are unknown. Both documents' .tmp-<pid>-<uuid> f
 are inventoried with bytes/digest, empty or not: a live local PID refuses; otherwise unknown.
 migrate --writers-stopped archives unknown/dead residues under bookkeeping-cycles/<migration_id>/residue/;
 the attestation includes stopped deletion/SDK children. Live candidates refuse with their path.
+Post-READY unknown gates require export-json --writers-stopped; this journals and archives them, never infers child death.
+Published maintenance guards are permanent. Historical guard-retirement intents refuse all ordinary commands.
+recover-guard-retirement --writers-stopped cancels intents only after restoring and exclusively locking the ORIGINAL inode;
+a different public guard or missing original inode refuses (operator-approved coherent backup restore, never manual unlink).
+In-process inspect refuses while any local SQLite owner exists; invoke the CLI in a separate process.
 `
-const COMMANDS = ["inspect", "migrate", "export-json", "recanonicalize", "abort-migration"]
+const COMMANDS = ["inspect", "migrate", "export-json", "recanonicalize", "abort-migration", "recover-guard-retirement"]
 class UsageError extends Error {}
 function parse(args: string[]) {
   const command = args[0]
@@ -45,11 +51,11 @@ function parse(args: string[]) {
     if (arg === "--session-dir" && directory === undefined && args[index + 1]
       && !args[index + 1]!.startsWith("--")) directory = args[++index]
     else if (arg === "--json" && !json) json = true
-    else if (arg === "--writers-stopped" && command === "migrate" && !writersStopped) writersStopped = true
+    else if (arg === "--writers-stopped" && ["migrate", "export-json", "recover-guard-retirement"].includes(command) && !writersStopped) writersStopped = true
     else throw new UsageError(`unexpected argument: ${arg}`)
   }
   if (!directory) throw new UsageError("--session-dir is required")
-  if (command === "migrate" && !writersStopped) throw new UsageError("migrate requires --writers-stopped")
+  if (["migrate", "recover-guard-retirement"].includes(command) && !writersStopped) throw new UsageError(`${command} requires --writers-stopped`)
   return { command, directory, json, writersStopped }
 }
 
@@ -88,7 +94,7 @@ export async function runBookkeepingCli(args: string[], afterMigrationPreflightF
     directory = inspectionDirectory(options.directory)
     if (options.command === "migrate") refuseUnjournaledDatabase(directory)
     try { before = inspectBookkeeping(directory) } catch (error) {
-      if (options.command !== "abort-migration") throw error
+      if (!["abort-migration", "recover-guard-retirement"].includes(options.command)) throw error
       // Invalid legacy JSON is the main reason to abort a pre-database migration.
       if (error instanceof BookkeepingBusyError || error instanceof BookkeepingOwnerMismatchError) throw error
     }
@@ -96,7 +102,7 @@ export async function runBookkeepingCli(args: string[], afterMigrationPreflightF
     if (options.command === "inspect") after = before
     else {
       const active = [...(before?.candidates ?? []), ...(before?.gates ?? []), ...(before?.temporary ?? [])].find((row) =>
-        row.verdict === "live" || (row.verdict === "unknown" && options.command !== "migrate"))
+        row.verdict === "live" || (row.verdict === "unknown" && !options.writersStopped))
       if (active && !(options.command === "migrate" && before?.phase === "ready")) {
         throw new BookkeepingMaintenanceRequiredError(`${active.verdict} candidate/gate/temporary residue: ${active.path}`)
       }
@@ -119,8 +125,9 @@ export async function runBookkeepingCli(args: string[], afterMigrationPreflightF
         result = before?.phase === "ready" ? { already_ready: true }
           : await migrateBookkeeping(directory, { writersStopped: options.writersStopped,
             afterPreflightForTest: afterMigrationPreflightForTest })
-      } else if (options.command === "export-json") result = exportBookkeepingJson(directory)
+      } else if (options.command === "export-json") result = exportBookkeepingJson(directory, { writersStopped: options.writersStopped })
       else if (options.command === "recanonicalize") result = recanonicalizeBookkeeping(directory)
+      else if (options.command === "recover-guard-retirement") recoverGuardRetirements(directory, { writersStopped: options.writersStopped })
       else abortBookkeepingMigration(directory)
       // Abort preserves malformed source bytes; a successful abort need not make those bytes parseable.
       if (options.command === "abort-migration") {

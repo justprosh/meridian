@@ -1118,6 +1118,57 @@ package's command **before replacing the package**:
 meridian-bookkeeping export-json --session-dir /private/session-dir --json
 ```
 
+Fresh SQLite directories use the same durable migration identity and both legacy
+lock barriers as an empty-input migration. READY is inspectable/exportable;
+interrupted fresh bootstrap requires explicit `migrate --writers-stopped` (or a
+safe abort), never implicit adoption of an unjournaled database. Import planning
+executes the actual codecs/DDL in a disposable memory transaction before changing
+authority and repeats under maintenance ownership. Invalid scalar NUL, unsafe
+integers or row/constraint violations leave legacy source bytes, journals and
+barriers unchanged. Historical failed imports can be aborted only if their
+PREPARED database is provably empty: no mappings/resources/leases/history/fences
+or imported provenance. READY/nonempty authority is never discarded by abort.
+
+After successful export or abort, this same build may start with
+`MERIDIAN_BOOKKEEPING=json` only with validated terminal history, completed barrier
+release and no active SQLite main/WAL/SHM/journal. Export archives are checked;
+incomplete, substituted or foreign history does not authorize JSON fallback.
+
+Post-READY crash gates contain no incarnation proving the child dead. Ordinary
+export refuses unknown gates. After explicitly stopping/draining **all** SDK and
+deletion children, use:
+
+```sh
+meridian-bookkeeping export-json --session-dir /private/session-dir --writers-stopped --json
+```
+
+This records archive intent in the migration journal and uses the existing
+no-clobber/inode-checked residue archive. It resumes interrupted archival, including
+private captures within gate directories. A positively live or indeterminate
+ledger owner still refuses; attestation is not permission to invent process death.
+
+The published maintenance guard is permanent; refused operations never retire it.
+Historical guard-retirement intents/captures block ordinary commands **before**
+opening the guard or bootstrapping a replacement. Only after stopping every old
+runtime and maintainer (including children), the following explicit recovery can
+restore/link and exclusively lock the **original recorded inode**, then cancel
+only its private retirement intent/aliases:
+
+```sh
+meridian-bookkeeping recover-guard-retirement --session-dir /private/session-dir --writers-stopped --json
+```
+
+A different public inode, conflicting intents, missing original inode or invalid
+guard format refuses. Keep writers stopped and use an operator-approved coherent
+backup restore; never unlink/replace the public guard, change recorded dev/ino,
+or delete barriers manually. Recovery after copying an intent to a different
+filesystem is not implicit permission to rehome that identity.
+
+Run inspection through a **separate CLI process** beside a live proxy. In-process
+inspection refuses while any local SQLite owner exists (including alias paths):
+opening/closing an auxiliary descriptor for a POSIX lock-bearing inode can revoke
+the owner's OS locks even when SQLite still reports an active transaction.
+
 Use the freshly exported JSON, never the original migrated backups: those omit
 all later publications and fence advances. Do not start an old binary until
 export completes and its barriers have been released. Retain the cycle/archive

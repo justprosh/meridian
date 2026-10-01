@@ -19,10 +19,12 @@ import { BookkeepingMaintenanceRequiredError } from "./storagePaths"
 import { assertQuiescent } from "./migrationImport"
 import { parseLegacySidecar } from "./legacyCodec"
 import { resumeRetirements } from "./privateRetirement"
+import { archiveStoppedResidues } from "./residueArchive"
+import { inspectArtifacts } from "./residueInventory"
 
 const stageName = (journal: ExportJournal, name: string) => `${name}.export-${journal.id}`
 
-export function exportBookkeepingJson(input: string): ExportJournal {
+export function exportBookkeepingJson(input: string, options: { writersStopped?: boolean } = {}): ExportJournal {
   const guard = acquireMaintenanceGuard(input)
   const directory = dirname(guard.path)
   try {
@@ -32,6 +34,10 @@ export function exportBookkeepingJson(input: string): ExportJournal {
       throw new BookkeepingMaintenanceRequiredError("export requires a READY migration journal")
     }
     let journal = readExportJournal(directory)
+    const inventory = inspectArtifacts(directory)
+    const unsafe = [...inventory.candidates, ...inventory.gates, ...inventory.temporary]
+      .find(row => row.verdict === "live" || row.verdict === "unknown" && !options.writersStopped)
+    if (unsafe) throw new BookkeepingMaintenanceRequiredError(`${unsafe.verdict} residue ${unsafe.path}; stop all children and use export-json --writers-stopped`)
     if (journal && journal.migrationId !== migration.id) throw new Error("export migration identity mismatch")
     if (journal?.phase !== "EXPORTED") requireBarriers(directory, migration.id)
     if (!journal || ["PREPARED", "STAGED", "INSTALLED"].includes(journal.phase)) {
@@ -45,6 +51,7 @@ export function exportBookkeepingJson(input: string): ExportJournal {
         // Incarnation probes run after COMMIT, never while a SQL snapshot transaction is held.
         const snapshot = withBookkeepingRead(directory, snapshotForExport)
         assertQuiescent(parseLegacySidecar(snapshot.sidecar))
+        if (options.writersStopped) archiveStoppedResidues(directory, migration)
         const documents = SOURCE_NAMES.map((name, index) => {
           const bytes = index === 0 ? snapshot.sidecar : snapshot.store
           return { name, digest: digestBytes(bytes), bytes: Buffer.byteLength(bytes) }
@@ -96,6 +103,10 @@ export function exportBookkeepingJson(input: string): ExportJournal {
       saveExportJournal(directory, journal, "CHECKPOINTED")
     }
     if (!journal) throw new Error("export journal missing")
+    if (options.writersStopped && ["CHECKPOINTED", "ARCHIVED", "EXPORTED"].includes(journal.phase)) {
+      assertQuiescent(parseLegacySidecar(protectedBytes(join(directory, SOURCE_NAMES[0])).toString("utf8")))
+      archiveStoppedResidues(directory, migration)
+    }
     if (journal.phase === "CHECKPOINTED") {
       verifyInstalled(directory, journal)
       for (const file of journal.archive!) {

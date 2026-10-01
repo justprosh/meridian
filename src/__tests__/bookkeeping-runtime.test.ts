@@ -96,7 +96,7 @@ it("does not import legacy data implicitly and permits only explicit offline mig
   expect(lookupSharedSession("legacy")?.claudeSessionId).toBe("sdk-legacy")
   handle.close()
   process.env.MERIDIAN_BOOKKEEPING = "json"
-  expect(() => retainProxyBookkeeping()).toThrow("export-json")
+  expect(() => retainProxyBookkeeping()).toThrow("explicit maintenance")
 })
 
 it("refuses corrupt SQLite rather than creating JSON or a fresh database", async () => {

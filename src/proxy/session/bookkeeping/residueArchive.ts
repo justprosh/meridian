@@ -2,13 +2,23 @@ import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync } fr
 import { dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../durableFileSystem"
 import { fileIdentity, verifyFile } from "./exportJournal"
-import { crashPoint, digestBytes } from "./maintenanceJournal"
+import { crashPoint, digestBytes, saveJournal } from "./maintenanceJournal"
+import type { MigrationJournal } from "./maintenanceJournal"
 import { archiveIncompleteDirectory } from "./residueDirectory"
 import { candidateVerdict, inspectArtifacts, temporaryVerdict } from "./residueInventory"
 import { isLegacyTemporaryName } from "./residueTypes"
 import type { ArchivedResidue } from "./residueTypes"
 import { BookkeepingMaintenanceRequiredError, ownedFd } from "./storagePaths"
-import { retireFile } from "./privateRetirement"
+import { retireFile, resumeRetirements } from "./privateRetirement"
+
+function resumeGateRetirements(directory: string): void {
+  for (const name of ["deletion-gates", "sdk-process-gates"]) {
+    const path = join(directory, name)
+    if (!existsSync(path)) continue
+    closeSync(ownedFd(path, true))
+    resumeRetirements(path)
+  }
+}
 
 /** Called only under maintenance ownership and explicit operator stop/drain attestation. */
 export function planResidueArchive(directory: string): ArchivedResidue[] {
@@ -26,9 +36,26 @@ export function planResidueArchive(directory: string): ArchivedResidue[] {
   })
 }
 
+/** Post-READY recovery uses the same durable archive, under explicit stopped-child attestation. */
+export function archiveStoppedResidues(directory: string, journal: MigrationJournal): void {
+  resumeGateRetirements(directory)
+  const planned = planResidueArchive(directory)
+  const rows = [...(journal.residues ?? [])]
+  for (const row of planned) {
+    const prior = rows.find(item => item.path === row.path)
+    if (prior && (prior.dev !== row.dev || prior.ino !== row.ino || prior.digest !== row.digest))
+      throw new Error(`previously archived residue path reused: ${row.path}`)
+    if (!prior) rows.push(row)
+  }
+  journal.residues = rows
+  saveJournal(directory, journal) // archive intent precedes every physical move
+  archiveResidues(directory, journal.id, rows)
+}
+
 /** Intent is already in PREPARED. Hardlink + fsync + unlink resumes on either side of a crash. */
 export function archiveResidues(directory: string, id: string, residues: ArchivedResidue[]): void {
   if (!residues.length) return
+  resumeGateRetirements(directory)
   const root = join(directory, "bookkeeping-cycles")
   const cycle = join(root, id)
   const archive = join(cycle, "residue")

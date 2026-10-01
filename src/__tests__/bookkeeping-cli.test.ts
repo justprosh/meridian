@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, expect, it } from "bun:test"
 import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import Database from "libsql"
 import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
 import { runBookkeepingCli } from "../proxy/session/bookkeeping/cli"
@@ -318,7 +318,10 @@ for (const preexisting of [false, true]) it(`foreign SQLite race preserves files
   })
   expect(code).toBe(3)
   expect(before).toBeDefined()
+  // A missing guard beside existing authority cannot be replaced; an already
+  // published guard is permanent. Neither refusal may retire a coordination inode.
   expect(snapshot()).toEqual(before!)
+  expect(existsSync(join(directory, "session-bookkeeping-maintenance.sqlite"))).toBe(preexisting)
   expect(cli("migrate", ["--writers-stopped"]).status).toBe(3)
   expect(snapshot()).toEqual(before!)
 })

@@ -1,12 +1,12 @@
-import { existsSync, realpathSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { realpathSync } from "node:fs"
+import { resolve } from "node:path"
 import { getSessionStoreDir } from "../../sessionStore"
 import { activeStoreBackend, installSessionStoreBackend } from "./storeBackend"
 import { installSessionLifecycleBackend } from "./lifecycleBackend"
 import { sqliteSessionStoreBackend } from "./sqliteStoreBackend"
 import { sqliteLifecycleBackend } from "./lifecycleSql"
 import {
-  BOOKKEEPING_FILENAME, BookkeepingMaintenanceRequiredError, connectionFor,
+  BookkeepingMaintenanceRequiredError, connectionFor,
   initializeSessionBookkeeping, initializeSessionBookkeepingAsync,
 } from "./connection"
 import { checkpointBookkeeping, withBookkeepingWriteAsync } from "./transaction"
@@ -14,6 +14,7 @@ import type { BookkeepingHandle } from "./connection"
 import type { BookkeepingWriteOptions } from "./types"
 import { retainBookkeepingRuntimeIdentity } from "./runtimeIdentity"
 import { maintainBookkeepingBeforeListen } from "./startupMaintenance"
+import { assertJsonBookkeepingAuthority } from "./jsonAuthority"
 
 export type BookkeepingMode = "json" | "sqlite"
 
@@ -25,10 +26,7 @@ export function bookkeepingMode(env: NodeJS.ProcessEnv = process.env): Bookkeepi
 }
 
 function assertJsonDirectory(directory: string): void {
-  if ([BOOKKEEPING_FILENAME, "session-bookkeeping-migration.json", "session-bookkeeping-export.json"]
-    .some((name) => existsSync(join(directory, name)))) {
-    throw new BookkeepingMaintenanceRequiredError("SQLite bookkeeping requires explicit export-json before JSON startup")
-  }
+  assertJsonBookkeepingAuthority(directory)
 }
 
 let runtime: { directory: string; refs: number; releaseIdentity: () => void } | undefined

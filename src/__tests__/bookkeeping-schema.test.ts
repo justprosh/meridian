@@ -123,6 +123,7 @@ it("opens private FULL/WAL/foreign-key database and reuses canonical directory i
 
 it("rejects symlinks, nonregular DBs and unsafe companion files without modifying their targets", () => {
   handle.close()
+  const original = readFileSync(handle.path)
   rmSync(handle.path)
   const target = join(directory, "target")
   writeFileSync(target, "untouched")
@@ -132,6 +133,7 @@ it("rejects symlinks, nonregular DBs and unsafe companion files without modifyin
   mkdirSync(handle.path)
   expect(() => initializeSessionBookkeeping(directory)).toThrow("regular")
   rmSync(handle.path, { recursive: true })
+  writeFileSync(handle.path, original, { mode: 0o600 })
   rmSync(handle.path + "-wal", { force: true })
   symlinkSync(target, handle.path + "-wal")
   expect(() => initializeSessionBookkeeping(directory)).toThrow("regular")

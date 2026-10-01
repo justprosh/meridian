@@ -92,7 +92,10 @@ for (const raw of ["", "not json", "[]", '{"entry":{}}']) {
     writeFileSync(join(directory, "sessions.json"), raw, { mode: 0o600 })
     await expect(migrate()).rejects.toThrow()
     expect(readFileSync(join(directory, "sessions.json"), "utf8")).toBe(raw)
-    expect(readJournal(directory)?.phase).toBe("BARRIERS")
+    expect(readJournal(directory)).toBeUndefined()
+    expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
+    expect(existsSync(join(directory, "sessions.json.lock"))).toBe(false)
+    expect(existsSync(join(directory, "session-gc.json.lock"))).toBe(false)
     await expect(migrate()).rejects.toThrow()
   })
 }

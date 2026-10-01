@@ -33,6 +33,7 @@ export interface MigrationJournal {
   finalSources?: SourceIdentity[]
   residues?: ArchivedResidue[]
   releases?: Partial<Record<SourceName, { name: string; dev: number; ino: number }>>
+  abortDatabase?: Array<{ name: string; dev: number; ino: number }>
 }
 export const digestBytes = (value: string) => createHash("sha256").update(value).digest("hex")
 
@@ -100,6 +101,13 @@ export function readJournal(directory: string, readOnly = false): MigrationJourn
     || !validSources(row.sources) || (row.finalSources !== undefined && !validSources(row.finalSources))
     || (row.residues !== undefined && !validResidues(row.residues))
     || (row.releases !== undefined && !validReleases(row.releases, String(row.id)))
+    || (row.abortDatabase !== undefined && (!Array.isArray(row.abortDatabase)
+      || !row.abortDatabase.every((file: unknown) => {
+        if (!file || typeof file !== "object") return false
+        const entry = file as Record<string, unknown>
+        return ["session-bookkeeping.sqlite", "session-bookkeeping.sqlite-wal", "session-bookkeeping.sqlite-shm", "session-bookkeeping.sqlite-journal"].includes(String(entry.name))
+          && [entry.dev, entry.ino].every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+      })))
     || (row.phase !== "PREPARED" && !row.finalSources)) throw new BookkeepingFormatError("invalid migration journal")
   return row as unknown as MigrationJournal
 }

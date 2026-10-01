@@ -20,7 +20,8 @@ import {
   assertSupportedFilesystem, BookkeepingBusyError, BookkeepingMaintenanceRequiredError, errorCode, ownedFd,
 } from "./storagePaths"
 
-export const MAINTENANCE_GUARD_FILENAME = "session-bookkeeping-maintenance.sqlite"
+import { MAINTENANCE_GUARD_FILENAME, assertNoGuardRetirement } from "./guardIdentity"
+export { MAINTENANCE_GUARD_FILENAME } from "./guardIdentity"
 const GUARD_APPLICATION_ID = 0x4d534247
 const GUARD_SCHEMA = `CREATE TABLE maintenance_guard (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -53,6 +54,7 @@ interface State {
 const leases = new WeakMap<GuardLease, State>()
 const connections = new Map<string, State>()
 const terminal = new Set<string>()
+let inspections = 0
 
 function busyError(error: unknown): boolean {
   return (
@@ -195,12 +197,22 @@ export function assertGuardLease(lease: GuardLease, directory: string, mode: Sta
   }
 }
 
-function openGuard(directory: string, mode: State["mode"]): MaintenanceGuardLease {
+function openGuard(directory: string, mode: State["mode"], recoveringIdentity?: { dev: number; ino: number }): MaintenanceGuardLease {
+  if (inspections) throw new BookkeepingGuardBusyError("same-process inspection guard is held")
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   const canonical = realpathSync.native(resolve(directory))
+  if (!recoveringIdentity) assertNoGuardRetirement(canonical)
+  else {
+    const identity = lstatSync(join(canonical, MAINTENANCE_GUARD_FILENAME))
+    if (!identity.isFile() || identity.dev !== recoveringIdentity.dev || identity.ino !== recoveringIdentity.ino)
+      throw new BookkeepingMaintenanceRequiredError("guard recovery identity changed; nothing retired")
+  }
   closeSync(ownedFd(canonical, true))
   assertSupportedFilesystem(Number(statfsSync(canonical).type))
   const path = join(canonical, MAINTENANCE_GUARD_FILENAME)
+  if (!existsSync(path) && ["session-bookkeeping.sqlite", "session-bookkeeping-migration.json",
+    "session-bookkeeping-export.json", "session-bookkeeping-cycle.json"].some(name => existsSync(join(canonical, name))))
+    throw new BookkeepingMaintenanceRequiredError("published maintenance guard missing for existing authority; refuse replacement; recover original identity")
   if (terminal.has(path)) throw new BookkeepingMaintenanceRequiredError("guard close failed; restart process")
   const existing = connections.get(path)
   if (existing && (mode !== "shared" || existing.mode !== "shared")) {
@@ -311,9 +323,23 @@ export function acquireMaintenanceGuard(directory: string): MaintenanceGuardLeas
   return openGuard(directory, "exclusive")
 }
 
+/** Recovery may lock only the independently validated ORIGINAL inode, never bootstrap a replacement. */
+export function acquireGuardRetirementRecovery(directory: string, identity: { dev: number; ino: number }): MaintenanceGuardLease {
+  return openGuard(directory, "exclusive", identity)
+}
+export function assertGuardRecoveryQuiescent(): void {
+  if (connections.size || inspections || terminal.size)
+    throw new BookkeepingGuardBusyError("stop local SQLite owners before guard recovery")
+}
+
 /** Inspection never bootstraps, repairs permissions, increments epochs or creates a journal. */
 export function acquireInspectionGuard(directory: string): GuardLease | undefined {
+  // POSIX locks are process-owned: even a readonly auxiliary fd close can revoke
+  // SQLite's locks. Reject process-wide, so main/guard hardlink aliases are covered.
+  if (connections.size || inspections || terminal.size)
+    throw new BookkeepingGuardBusyError("same-process inspection forbidden while SQLite handles are open; use a separate CLI process")
   const canonical = realpathSync.native(resolve(directory))
+  assertNoGuardRetirement(canonical)
   closeSync(ownedFd(canonical, true, false, true))
   const path = join(canonical, MAINTENANCE_GUARD_FILENAME)
   if (!existsSync(path)) return undefined
@@ -326,7 +352,14 @@ export function acquireInspectionGuard(directory: string): GuardLease | undefine
     db.pragma("busy_timeout=0")
     db.exec("BEGIN")
     validate(db)
-    return { path, mode: "shared", close: () => closeDatabase(db) }
+    inspections++
+    let closed = false
+    return { path, mode: "shared", close() {
+      if (closed) return
+      closeDatabase(db)
+      closed = true
+      inspections--
+    } }
   } catch (error) {
     closeDatabase(db)
     if (busyError(error)) throw new BookkeepingGuardBusyError("maintenance guard is held", { cause: error })

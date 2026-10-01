@@ -2,10 +2,12 @@
 // Independently installed artifacts only. This is a storage/server smoke, not a live model E2E.
 import assert from "node:assert/strict"
 import { fork, spawnSync } from "node:child_process"
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { once } from "node:events"
+import { randomUUID } from "node:crypto"
+import { lstatSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 const argument = process.argv.indexOf("--package")
@@ -34,6 +36,7 @@ function install(name, spec) {
   return join(directory, "node_modules", "@rynfar", "meridian")
 }
 const childFile = fileURLToPath(new URL("./fixtures/bookkeeping-package-server.mjs", import.meta.url))
+const legacyWriter = fileURLToPath(new URL("./fixtures/bookkeeping-package-legacy-writer.mjs", import.meta.url))
 async function start(packageRoot, sessionDirectory, mode, instances = "1") {
   const child = fork(childFile, [packageRoot, sessionDirectory, mode, instances], {
     env, stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -98,12 +101,56 @@ try {
   const fresh = await start(candidate, freshDirectory, "sqlite")
   assert.equal((await fetch(`${fresh.url}/health`)).status, 200)
   await usage(fresh.url, 404)
+  const legacyControl = join(root, "legacy-writer-control")
+  mkdirSync(legacyControl, { mode: 0o700 })
+  run(process.execPath, [legacyWriter, baseline, legacyControl], root)
+  assert(existsSync(join(legacyControl, "sessions.json")), "old writer control must actually write JSON")
+  run(process.execPath, [legacyWriter, baseline, freshDirectory], root, 73)
+  assert(!existsSync(join(freshDirectory, "sessions.json")), "old writer bypassed fresh SQL barriers")
+  const inspected = JSON.parse(run(process.execPath, [cli, "inspect", "--session-dir", freshDirectory, "--json"], root))
+  assert.equal(inspected.phase, "ready")
   await stop(fresh.child)
+  run(process.execPath, [cli, "export-json", "--session-dir", freshDirectory, "--json"], root)
+  const sameBuildJson = await start(candidate, freshDirectory, "json")
+  assert.equal((await fetch(`${sameBuildJson.url}/health`)).status, 200)
+  await stop(sameBuildJson.child)
+  for (const [key, createdAt, messageCount] of [["bad\u0000key", 1, 0], ["key", 1.5, 0], ["key", 1, 1.5]]) {
+    const invalid = join(root, `invalid-${createdAt}-${messageCount}-${key.length}`)
+    mkdirSync(invalid, { mode: 0o700 })
+    const bytes = JSON.stringify({ [key]: { claudeSessionId: "sdk", createdAt, lastUsedAt: 2, messageCount } })
+    writeFileSync(join(invalid, "sessions.json"), bytes, { mode: 0o600 })
+    run(process.execPath, [cli, "migrate", "--session-dir", invalid, "--writers-stopped", "--json"], root, 3)
+    assert.equal(readFileSync(join(invalid, "sessions.json"), "utf8"), bytes)
+    for (const name of ["session-bookkeeping.sqlite", "session-bookkeeping-migration.json", "session-gc.json.lock", "sessions.json.lock"])
+      assert(!existsSync(join(invalid, name)), `invalid import changed authority: ${name}`)
+  }
   for (const sharedDirectory of ["default", join(root, "explicit-two")]) {
     const two = await start(candidate, sharedDirectory, "sqlite", "2")
     assert.equal((await fetch(`${two.url}/health`)).status, 200)
     await stop(two.child)
   }
+  const recoveryDirectory = join(root, "recovery")
+  const recovery = await start(candidate, recoveryDirectory, "sqlite")
+  await stop(recovery.child)
+  const guardPath = join(realpathSync(recoveryDirectory), "session-bookkeeping-maintenance.sqlite")
+  const identity = lstatSync(guardPath), intentId = randomUUID()
+  writeFileSync(`${guardPath}.deletion-intent.releasing-${intentId}-${randomUUID()}`, JSON.stringify({
+    source: guardPath, id: intentId, dev: identity.dev, ino: identity.ino,
+    private: `${guardPath}.releasing-${intentId}-${randomUUID()}`,
+  }), { mode: 0o600 })
+  run(process.execPath, [cli, "inspect", "--session-dir", recoveryDirectory, "--json"], root, 4)
+  await assert.rejects(start(candidate, recoveryDirectory, "sqlite"), /unsafe legacy maintenance-guard retirement/)
+  run(process.execPath, [cli, "recover-guard-retirement", "--session-dir", recoveryDirectory, "--json"], root, 2)
+  run(process.execPath, [cli, "recover-guard-retirement", "--session-dir", recoveryDirectory, "--writers-stopped", "--json"], root)
+  assert.equal(lstatSync(guardPath).ino, identity.ino, "recovery replaced the published coordination inode")
+  mkdirSync(join(recoveryDirectory, "deletion-gates"), { mode: 0o700 })
+  const gateName = `deletion-gates/${randomUUID()}.go`
+  writeFileSync(join(recoveryDirectory, gateName), "go\n", { mode: 0o600 })
+  run(process.execPath, [cli, "export-json", "--session-dir", recoveryDirectory, "--json"], root, 4)
+  run(process.execPath, [cli, "export-json", "--session-dir", recoveryDirectory, "--writers-stopped", "--json"], root)
+  const recoveryJournal = JSON.parse(readFileSync(join(recoveryDirectory, "session-bookkeeping-migration.json"), "utf8"))
+  assert(!existsSync(join(recoveryDirectory, gateName)))
+  assert.equal(readFileSync(join(recoveryDirectory, "bookkeeping-cycles", recoveryJournal.id, "residue", gateName), "utf8"), "go\n")
   console.log(JSON.stringify({ verdict: "PASS", node: process.version, platform: process.platform,
     architecture: process.arch, surface: "packaged runtime, migration, two HTTP processes, restart, export and baseline read",
     liveSdk: false }))

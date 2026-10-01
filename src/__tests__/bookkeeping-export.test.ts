@@ -10,6 +10,11 @@ import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
 import { exportBookkeepingJson } from "../proxy/session/bookkeeping/exportJson"
 import { abortBookkeepingMigration } from "../proxy/session/bookkeeping/abortMigration"
 import { initializeSessionBookkeeping, withBookkeepingWrite } from "../proxy/session/bookkeeping/database"
+import { createMaintenanceDatabase } from "../proxy/session/bookkeeping/connection"
+import { openForMaintenance } from "../proxy/session/bookkeeping/maintenance"
+import { acquireMaintenanceGuard } from "../proxy/session/bookkeeping/guard"
+import { initializeProxyBookkeeping } from "../proxy/session/bookkeeping/runtime"
+import { setSessionStoreDir } from "../proxy/sessionStore"
 import { insertMapping } from "../proxy/session/bookkeeping/resourceImport"
 import { canonicalizeLocator, resourceKey } from "../proxy/session/bookkeeping/locator"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
@@ -17,7 +22,7 @@ import { insertResourceLease } from "../proxy/session/bookkeeping/resources"
 import {
   getStoredSessionGeneration, parseLegacySidecar, parseLegacyStoreForMaintenance, STORE_META_KEY,
 } from "../proxy/session/bookkeeping/legacyCodec"
-import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
+import { barrierBytes, observeSource, readJournal, requireBarriers, saveJournal, SOURCE_NAMES, writeDurably } from "../proxy/session/bookkeeping/maintenanceJournal"
 import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
 import { validateBookkeepingSchema } from "../proxy/session/bookkeeping/schema"
 import { enrichFixture } from "./fixtures/bookkeeping-rich-fixture"
@@ -32,6 +37,16 @@ const entry = () => ({ unknown: { z: 1, a: 2 }, claudeSessionId: "session", crea
   messageCount: 2, sdkMessageUuids: [null, "uuid"], messageHashes: [] })
 function source(name: string, value: unknown): void {
   writeFileSync(join(directory, name), JSON.stringify(value), { mode: 0o600 })
+}
+function historicalBarriers(database = false): void {
+  const guard = acquireMaintenanceGuard(directory)
+  try {
+    const id = randomUUID(), sources = SOURCE_NAMES.map(name => observeSource(directory, name).identity)
+    saveJournal(directory, { format: "meridian-bookkeeping-migration", version: 1, targetVersion: 1,
+      id, phase: "BARRIERS", sources, finalSources: sources })
+    for (const name of SOURCE_NAMES) writeDurably(join(directory, name + ".lock"), barrierBytes(id))
+    if (database) createMaintenanceDatabase(directory, guard)
+  } finally { guard.close() }
 }
 function resource(sessionId = "session") {
   const locator = canonicalizeLocator({ configDir: directory, sessionId })
@@ -156,9 +171,9 @@ it("does not overwrite foreign JSON or remove foreign barriers", async () => {
   expect(readFileSync(join(directory, "sessions.json.lock"), "utf8")).toBe('{"foreign":true}')
 })
 
-it("aborts malformed sources only before database creation and keeps originals untouched", async () => {
+it("aborts historical malformed pre-database sources and keeps originals untouched", async () => {
   source("sessions.json", { invalid: {} })
-  await expect(migrate()).rejects.toThrow()
+  historicalBarriers()
   expect(readJournal(directory)?.phase).toBe("BARRIERS")
   expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
   abortBookkeepingMigration(directory)
@@ -173,11 +188,41 @@ it("aborts malformed sources only before database creation and keeps originals u
 })
 it("refuses abort of committed authority or another operation's barrier", async () => {
   source("sessions.json", { invalid: {} })
-  await expect(migrate()).rejects.toThrow()
+  historicalBarriers()
   source("sessions.json.lock", { foreign: true })
   expect(() => abortBookkeepingMigration(directory)).toThrow("foreign barrier")
   expect(readJournal(directory)?.phase).toBe("BARRIERS")
   expect(readFileSync(join(directory, "sessions.json.lock"), "utf8")).toBe('{"foreign":true}')
+})
+it("R3 aborts a historical failed import only after proving its PREPARED database exactly empty", async () => {
+  source("sessions.json", { "bad\u0000key": entry() })
+  historicalBarriers(true)
+  const bytes = readFileSync(join(directory, "sessions.json"), "utf8")
+  abortBookkeepingMigration(directory)
+  expect(readJournal(directory)?.phase).toBe("ABORTED")
+  expect(readFileSync(join(directory, "sessions.json"), "utf8")).toBe(bytes)
+  expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
+  expect(existsSync(join(directory, "sessions.json.lock"))).toBe(false)
+  const saved = process.env.MERIDIAN_BOOKKEEPING
+  setSessionStoreDir(directory)
+  process.env.MERIDIAN_BOOKKEEPING = "json"
+  try { expect(await initializeProxyBookkeeping()).toBeUndefined() } finally {
+    setSessionStoreDir(null)
+    if (saved === undefined) delete process.env.MERIDIAN_BOOKKEEPING
+    else process.env.MERIDIAN_BOOKKEEPING = saved
+  }
+})
+it("R3 never aborts a nonempty PREPARED database or drops its fences", () => {
+  source("sessions.json", { entry: entry() })
+  historicalBarriers(true)
+  const guard = acquireMaintenanceGuard(directory)
+  const handle = openForMaintenance(directory, { expectPhase: "PREPARED", guard })
+  try { withBookkeepingWrite(directory, {}, tx => tx.run("INSERT INTO fence_slots VALUES('store','owned',1)")) }
+  finally { handle.close(); guard.close() }
+  expect(() => abortBookkeepingMigration(directory)).toThrow("provably empty")
+  expect(readJournal(directory)?.phase).toBe("BARRIERS")
+  expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(true)
+  requireBarriers(directory, readJournal(directory)!.id)
 })
 it("refuses abort after a successful migration", async () => {
   const result = await migrate()

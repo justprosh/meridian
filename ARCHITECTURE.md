@@ -329,6 +329,18 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 
 ### SQLite bookkeeping boundary
 
+Maintenance correctness: published guard identity is permanent, and pending
+historical guard retirement refuses before native opens (explicit original-inode
+recovery only). Same-process inspection never opens auxiliary main/guard aliases
+while local owners exist; standalone CLI inspection remains supported. Fresh
+creation is the empty-input durable journal/barrier protocol, not a separate
+unjournaled authority. Legacy import representability is exercised through exact
+row codecs, triggers and schema in a disposable transaction before barriers, then
+rechecked under ownership. Terminal export/abort history is validated rather than
+treated as active authority merely because journals remain. Post-READY residue
+archival requires explicit stopped-child attestation and preserves the existing
+no-clobber archive protocol. See configuration and cold-maintenance regressions.
+
 `MERIDIAN_BOOKKEEPING=sqlite` explicitly selects the shared row-based backend
 for both lifecycle and session mappings. JSON remains the default for legacy
 installations; a SQLite directory never falls back to JSON. One database per
