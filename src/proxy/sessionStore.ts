@@ -1654,6 +1654,118 @@ export function evictSharedSession(
   return evicted
 }
 
+/**
+ * How long a superseded copy stays resumable. A conversation that moves to
+ * another account and comes back - typically once the first account's 5-hour
+ * usage window has reset - resumes that account's own SDK session while its
+ * copy exists, and is replayed as flattened, window-trimmed history after.
+ */
+export const DEFAULT_PROFILE_COPY_GRACE_MS = 24 * 60 * 60_000
+
+export interface ProfileCopyPruneOptions {
+  /** Configured non-default profile IDs; only their `${id}:` prefixes are recognized. */
+  profileIds: Iterable<string>
+  /** Copies used within this window are kept alongside the newest one. */
+  graceMs: number
+  /** Most transcripts the removed mappings may stop pinning in this call. */
+  maxUnpinnedTranscripts: number
+  /** A conversation with a request arrived or running keeps every copy. */
+  isConversationActive: (conversationId: string) => boolean
+}
+
+function pinnedTranscriptCount(session: StoredSession): number {
+  let count = 0
+  if (session.currentTranscript?.sessionId === session.claudeSessionId) count++
+  if (session.previousTranscript && session.previousTranscript.sessionId === session.previousClaudeSessionId) count++
+  return count
+}
+
+function selectSupersededProfileCopies(
+  document: SessionStoreDocument,
+  options: ProfileCopyPruneOptions,
+  now: number,
+): string[] {
+  const profileIds = new Set(options.profileIds)
+  profileIds.delete("default")
+  const protectedKeys = new Set(document.meta.version === PRIORITY_STORE_META_VERSION
+    ? [
+        ...Object.values(document.meta.priorityAssignments).map((assignment) => assignment.mappingKey),
+        ...Object.values(document.meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
+      ]
+    : [])
+  const copiesByConversation = new Map<string, string[]>()
+  for (const key of Object.keys(document.sessions)) {
+    const separator = key.indexOf(":")
+    const conversationId = separator > 0 && profileIds.has(key.slice(0, separator))
+      ? key.slice(separator + 1)
+      : key
+    const copies = copiesByConversation.get(conversationId)
+    if (copies) copies.push(key)
+    else copiesByConversation.set(conversationId, [key])
+  }
+
+  const lastUsed = (key: string): number => document.sessions[key]!.lastUsedAt || 0
+  const candidates: string[] = []
+  for (const [conversationId, copies] of copiesByConversation) {
+    if (copies.length < 2) continue
+    const newest = copies.reduce((best, key) => (lastUsed(key) > lastUsed(best) ? key : best))
+    const superseded = copies.filter((key) => (
+      key !== newest && !protectedKeys.has(key) && now - lastUsed(key) > options.graceMs
+    ))
+    if (superseded.length > 0 && !options.isConversationActive(conversationId)) candidates.push(...superseded)
+  }
+  candidates.sort((left, right) => lastUsed(left) - lastUsed(right))
+
+  const victims: string[] = []
+  let remaining = options.maxUnpinnedTranscripts
+  for (const key of candidates) {
+    const cost = pinnedTranscriptCount(document.sessions[key]!)
+    if (cost > remaining) continue
+    remaining -= cost
+    victims.push(key)
+  }
+  return victims
+}
+
+/** Candidate conversations only; callers must fence turns before deleting their mappings. */
+export function listSupersededProfileConversations(options: ProfileCopyPruneOptions): string[] {
+  const profileIds = new Set(options.profileIds)
+  const candidates = selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()),
+    { ...options, profileIds }, Date.now())
+  return [...new Set(candidates.map(key => {
+    const separator = key.indexOf(":")
+    return separator > 0 && key.slice(0, separator) !== "default" && profileIds.has(key.slice(0, separator))
+      ? key.slice(separator + 1) : key
+  }))]
+}
+
+/**
+ * Remove mappings superseded by a newer copy of the same conversation under
+ * another profile, oldest first. Past the grace window a copy is rarely
+ * returned to, yet it keeps its per-message hashes in every store write and
+ * its transcript pinned. Removal unpins those transcripts; lifecycle
+ * reconciliation retires them through the normal bounded backlog.
+ * Returns the number of mappings removed.
+ */
+export function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): number {
+  // Select from the cached document first so the common no-op sweep takes no
+  // lock and writes nothing.
+  if (selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()), options, Date.now()).length === 0) {
+    return 0
+  }
+  let pruned = 0
+  mutateStore(({ sessions, meta }) => {
+    const victims = selectSupersededProfileCopies({ sessions, meta }, options, Date.now())
+    for (const key of victims) {
+      delete sessions[key]
+      advanceKeySlot(key, meta)
+    }
+    pruned = victims.length
+    return pruned > 0
+  })
+  return pruned
+}
+
 /** Look up recovery information for a session key.
  *  Returns the current and previous Claude session IDs, plus derived
  *  file paths and CLI commands for conversation recovery. */

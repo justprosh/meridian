@@ -1,6 +1,19 @@
 # Upstream review handoff
 
-## Active authorized backlog (2026-10-01)
+## Takeover checkpoint (2026-10-02)
+
+[Current dispositions and proof](BACKLOG_TAKEOVER_2026-10-02.md) supersede the
+October 1 status leads below. #1187 incorporated with corrections as #1235,
+merge `c0af34eaa`, verified exact tree/CI/Nowaker credit and source closure.
+#1221 correction and actual macOS/Linux proof merged as #1236, `e1f8bc473`;
+exact tested tree/CI/Nowaker credit and source closure verified. #1217 rebased head `eb0c2b9e` has all executed
+CI passing, but remains draft pending real existing-account re-authentication.
+#1234 exact plugin pins and a reproduced `/inflight` queue-fixture correction
+are in #1237; final-head checks remain required before merge. General CI flake
+issues remain open. #1176 is deferred until a supported OpenAI-serving backend exists. #1175 already
+merged as #1227 (`3cb65df0c`). No release or external community messages.
+
+## Prior active authorized backlog (2026-10-01)
 
 **Nowaker priority checkpoint (2026-10-01).** #1171 incorporated with corrections
 as [#1225](https://github.com/rynfar/meridian/pull/1225), merge

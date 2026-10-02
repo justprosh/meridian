@@ -209,7 +209,12 @@ describe("GET /inflight", () => {
     const streamed = await app.fetch(messages("inflight-a", true))
     await waitFor(() => controls.length === 1, "the stream to reach the SDK")
     await controls[0]!.started
-    const sameSession = app.fetch(messages("inflight-a", false))
+    // A queued duplicate of the initial user turn is stale once that turn
+    // publishes. Declare the concurrent fork flow this queue-observation test
+    // needs, rather than racing the intentional session-conflict refusal.
+    const sameSessionRequest = messages("inflight-a", false)
+    sameSessionRequest.headers.set("x-meridian-source", "fork-inflight-test")
+    const sameSession = app.fetch(sameSessionRequest)
     const otherSession = app.fetch(messages("inflight-b", false))
     let seen = await snapshot()
     // Both are counted from arrival (as requests) and move to queued once waiting.
@@ -240,6 +245,7 @@ describe("GET /inflight", () => {
       await Bun.sleep(5)
     }
     const buffered = await both
+    expect(buffered.map(response => response.status)).toEqual([200, 200])
     expect((await snapshot()).total).toBe(2)
     await Promise.all(buffered.map(response => response.text()))
     seen = await snapshot()
