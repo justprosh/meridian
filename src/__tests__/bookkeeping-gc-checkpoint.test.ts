@@ -25,9 +25,10 @@ function sweepHarness(run: () => Promise<object>, checkpoint: () => Promise<unkn
   const rows: Array<{ name: string; data: Record<string, unknown> }> = []
   const warnings: string[] = []
   const create = new Function("runSessionGc", "checkpointProxyBookkeeping", "collectSessionGcPins", "sessionGcOptions",
+    "profileCopyPruningEnabled", "pruneSupersededProfileCopies",
     "claudeLog", "plog", "SessionLifecycleLockError", "SessionLifecycleQueueCapacityError", "SessionLifecycleQueueStalledError", "BookkeepingBusyError",
     code + "return sweep;")
-  const sweep: () => Promise<void> = create(run, checkpoint, () => [], {},
+  const sweep: () => Promise<void> = create(run, checkpoint, () => [], {}, false, async () => {},
     (name: string, data: Record<string, unknown>) => rows.push({ name, data }),
     (message: string) => warnings.push(message),
     SessionLifecycleLockError, SessionLifecycleQueueCapacityError, SessionLifecycleQueueStalledError, BookkeepingBusyError)
