@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:te
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
-import { progressBody, PROGRESS_FIRST_PROMPT, PROGRESS_WORK } from "./fixtures/claude-code-progress"
+import { progressBody, PROGRESS_FIRST_PROMPT, PROGRESS_PROMPT, PROGRESS_WORK } from "./fixtures/claude-code-progress"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -26,7 +26,7 @@ let activeQueries = 0
 let maxActiveQueries = 0
 let queryCalls = 0
 let controls: AttemptControl[] = []
-let capturedParams: Array<{ options?: { resume?: string; resumeSessionAt?: string; sessionId?: string; env?: Record<string, string> } }> = []
+let capturedParams: Array<{ prompt?: unknown; options?: { resume?: string; resumeSessionAt?: string; sessionId?: string; env?: Record<string, string> } }> = []
 let rateLimitWorkQueries = false
 
 function deferredAttempt(): AttemptControl & { wait: Promise<void>; markStarted: () => void } {
@@ -666,6 +666,30 @@ describe("SDK and Session concurrency coordination", () => {
       [...work.slice(0, -1), { role: "user", content: [...lastUser, { type: "text", text: PROGRESS_FIRST_PROMPT }] }],
       [...work, { role: "assistant", content: "ok" }, { role: "user", content: "continue" }],
     )
+  })
+
+  it("replays a progress caption as one cacheable SDK input and leaves working turns unchanged", async () => {
+    const app = createProxyServer({ port: 0, host: "127.0.0.1", silent: true }).app
+    const sessionId = `progress-layout-${crypto.randomUUID()}`
+    const agentId = "progress-agent"
+    const workP = app.fetch(claudeCodeSubagentRequest(PROGRESS_WORK, sessionId, agentId))
+    ;(await waitForControl(0)).release()
+    await (await workP).text()
+    expect(typeof capturedParams[0]?.prompt).toBe("string")
+    expect(capturedParams[0]?.options?.env?.FORCE_PROMPT_CACHING_5M).toBeUndefined()
+
+    const captionP = app.fetch(claudeCodeCaptionRequest(progressBody(sessionId).messages, sessionId, agentId))
+    ;(await waitForControl(1)).release()
+    await (await captionP).text()
+    const inputs: Array<{ message: { content: Array<{ text: string; cache_control?: unknown }> } }> = []
+    for await (const input of capturedParams[1]!.prompt as AsyncIterable<any>) inputs.push(input)
+    expect(inputs).toHaveLength(1)
+    const blocks = inputs[0]!.message.content
+    expect(blocks.filter(block => block.cache_control)).toHaveLength(1)
+    expect(blocks.at(-1)!.text.endsWith(PROGRESS_PROMPT)).toBe(true)
+    // No client breakpoint in this body: the marker closes the history.
+    expect(blocks.find(block => block.cache_control)!.text).toContain("Previously called tool")
+    expect(capturedParams[1]?.options?.env?.FORCE_PROMPT_CACHING_5M).toBe("1")
   })
 
   it("does not queue a progress summary behind its subagent's running turn", async () => {

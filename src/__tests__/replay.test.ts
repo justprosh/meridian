@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders } from "../proxy/replay"
+import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders, layoutReplayBlocks, type ReplayPart } from "../proxy/replay"
+import { frameReplayTurns } from "../proxy/messages"
 
 describe("trailing system reminders in a live user turn", () => {
   it("keeps earlier history and combines multiple terminal reminders in order without editing input", () => {
@@ -191,5 +192,61 @@ describe("faithful tool history rendering", () => {
     expect(textOf(blocks.at(-1))).toContain("current client turn contains exactly 1 image, 0 documents, and 0 files")
     expect(textOf(blocks.at(-1))).toContain("Earlier replayed turns contain 1 image, 1 document, and 1 file")
     expect(source).toEqual(before)
+  })
+})
+
+describe("cache-friendly replay layout", () => {
+  const part = (text: string, clientMarked = false): ReplayPart => ({ text, clientMarked })
+  const joined = (turns: Array<{ role: string; parts: ReplayPart[] }>) =>
+    frameReplayTurns(turns.map(t => ({ role: t.role, text: t.parts.map(p => p.text).filter(Boolean).join("\n") })))
+  const text = (blocks: ReturnType<typeof layoutReplayBlocks>) => blocks.map(b => b.text).join("")
+  const marked = (blocks: ReturnType<typeof layoutReplayBlocks>) => blocks.flatMap((b, i) => b.cache_control ? [i] : [])
+  // Working history whose last assistant turn the client marked, then a
+  // caption appended to the tool result of the live turn.
+  const caption = (steps: number, captionText: string) => {
+    const turns: Array<{ role: string; parts: ReplayPart[] }> = [{ role: "user", parts: [part("Read the files.")] }]
+    for (let i = 1; i <= steps; i++) {
+      turns.push({ role: "assistant", parts: [part(`[Assistant: Read f${i}]`, i === steps)] })
+      if (i < steps) turns.push({ role: "user", parts: [part(`result ${i}`)] })
+    }
+    turns.push({ role: "user", parts: [part(`result ${steps}`), part(captionText)] })
+    return turns
+  }
+
+  it("renders exactly the text of the single-string replay", () => {
+    const framed = caption(3, "Describe...")
+    expect(text(layoutReplayBlocks(framed))).toBe(joined(framed))
+    const single = [{ role: "user", parts: [part("<transcript>"), part("", true), part("step", true), part("action", true)] }]
+    expect(text(layoutReplayBlocks(single))).toBe(joined(single))
+    const assistantLast = [{ role: "user", parts: [part("q")] }, { role: "assistant", parts: [part("a")] }]
+    expect(text(layoutReplayBlocks(assistantLast))).toBe(joined(assistantLast))
+  })
+
+  it("marks the client's history breakpoint and keeps that prefix when the tail changes or history grows", () => {
+    const first = layoutReplayBlocks(caption(3, "Describe..."))
+    const [at] = marked(first)
+    expect(marked(first)).toHaveLength(1)
+    expect(first[at!]!.text).toContain("Read f3")
+    const strip = (bs: typeof first) => bs.map(({ cache_control: _cc, ...b }) => b)
+    for (const next of [layoutReplayBlocks(caption(3, "Previous: changed")), layoutReplayBlocks(caption(6, "Previous: grown"))]) {
+      expect(strip(next).slice(0, at! + 1)).toEqual(strip(first).slice(0, at! + 1))
+    }
+  })
+
+  it("marks the first client breakpoint inside the live turn, not its volatile last marker", () => {
+    const classifier = (steps: number) => [
+      { role: "user", parts: [part("CLAUDE.md", true)] },
+      { role: "user", parts: [part("<transcript>"), ...Array.from({ length: steps }, (_, i) => part(`step ${i}`, i === steps - 1)), part("new action", true), part("</transcript>"), part("Err on the side of blocking.")] },
+    ]
+    const blocks = layoutReplayBlocks(classifier(2))
+    expect(marked(blocks)).toEqual([3])
+    expect(blocks[3]!.text).toBe("\nstep 1")
+    expect(blocks.slice(0, 4).map(b => b.text)).toEqual(layoutReplayBlocks(classifier(4)).slice(0, 4).map(b => b.text))
+  })
+
+  it("falls back to the end of the history without client markers, and to no marker without history", () => {
+    const turns = [{ role: "user", parts: [part("q1")] }, { role: "assistant", parts: [part("a1")] }, { role: "user", parts: [part("caption")] }]
+    expect(marked(layoutReplayBlocks(turns))).toEqual([1])
+    expect(marked(layoutReplayBlocks([{ role: "user", parts: [part("only"), part("tail", true)] }]))).toEqual([])
   })
 })

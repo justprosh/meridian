@@ -94,7 +94,7 @@ import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapter
 import { isClaudeCodeClient } from "./adapters/claudecode"
 import { openAiAdapter, deriveToolLoopSessionId, SYNTHESIZED_SESSION_HEADER } from "./adapters/openai"
 import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, buildResponsesToolAliases, resolveCodexThreadIdentity, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
-import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders } from "./replay"
+import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders, layoutReplayBlocks, type ReplayPart } from "./replay"
 import { unstreamedAssistantBlockFrames } from "./unstreamedAssistant"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
@@ -459,33 +459,43 @@ function flattenUserContent(
   sanitizeOpts: import("./sanitize").SanitizeOptions = {},
   toolIndex?: Map<string, import("./messages").ToolCallInfo>
 ): string {
-  if (typeof content === "string") return sanitizeTextContent(content, sanitizeOpts)
-  if (!Array.isArray(content)) return String(content ?? "")
+  return flattenUserContentParts(content, sanitizeOpts, toolIndex).map((part) => part.text).join("\n")
+}
+
+/** flattenUserContent, one part per non-empty content block. */
+function flattenUserContentParts(
+  content: any,
+  sanitizeOpts: import("./sanitize").SanitizeOptions = {},
+  toolIndex?: Map<string, import("./messages").ToolCallInfo>
+): ReplayPart[] {
+  if (typeof content === "string") return [{ text: sanitizeTextContent(content, sanitizeOpts), clientMarked: false }]
+  if (!Array.isArray(content)) return [{ text: String(content ?? ""), clientMarked: false }]
   return content
-    .map((b: any) => {
-      if (b?.type === "text" && b.text) return sanitizeTextContent(b.text, sanitizeOpts)
-      if (b?.type === "tool_result") {
-        const info = toolIndex?.get(b.tool_use_id)
-        const label = replayToolResultHeader(b, info)
-        const inner = b.content
-        let flat = ""
-        if (typeof inner === "string") flat = inner
-        else if (Array.isArray(inner)) {
-          flat = inner
-            .map((ib: any) => (ib?.type === "text" && ib.text ? ib.text : ""))
-            .filter(Boolean)
-            .join("\n")
-        }
-        if (label) return flat ? `${label}:\n${flat}` : label
-        return flat
+    .map((b: any): ReplayPart => ({ text: renderUserBlock(b), clientMarked: Boolean(b?.cache_control) }))
+    .filter((part) => part.text)
+
+  function renderUserBlock(b: any): string {
+    if (b?.type === "text" && b.text) return sanitizeTextContent(b.text, sanitizeOpts)
+    if (b?.type === "tool_result") {
+      const info = toolIndex?.get(b.tool_use_id)
+      const label = replayToolResultHeader(b, info)
+      const inner = b.content
+      let flat = ""
+      if (typeof inner === "string") flat = inner
+      else if (Array.isArray(inner)) {
+        flat = inner
+          .map((ib: any) => (ib?.type === "text" && ib.text ? ib.text : ""))
+          .filter(Boolean)
+          .join("\n")
       }
-      if (b?.type === "image") return "[Image attached]"
-      if (b?.type === "document") return "[Document attached]"
-      if (b?.type === "file") return "[File attached]"
-      return ""
-    })
-    .filter(Boolean)
-    .join("\n")
+      if (label) return flat ? `${label}:\n${flat}` : label
+      return flat
+    }
+    if (b?.type === "image") return "[Image attached]"
+    if (b?.type === "document") return "[Document attached]"
+    if (b?.type === "file") return "[File attached]"
+    return ""
+  }
 }
 
 
@@ -2382,7 +2392,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // this request (spread last in query.ts env, so they also beat
         // operator env) — a proxy must never substitute models. Bare aliases
         // keep the canonical pins. See explicitModelPin for the rules.
-        const envOverrides = explicitModelPin(requestedModel)
+        // An auxiliary replay carries a 5-minute breakpoint of its own
+        // (layoutReplayBlocks). The API rejects a longer-lived breakpoint
+        // after a shorter one, and the CLI may choose 1h for its own, so pin
+        // the CLI to 5 minutes for these requests.
+        const envOverrides = requestMeta.auxiliaryRequest
+          ? { ...explicitModelPin(requestedModel), FORCE_PROMPT_CACHING_5M: "1" }
+          : explicitModelPin(requestedModel)
         // workingDirectory = SDK subprocess cwd (must exist on the proxy host).
         // clientWorkingDirectory = the client's local path (may not exist here);
         // used for per-project fingerprint bucketing and a system-prompt hint.
@@ -3632,6 +3648,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // Resume deltas are tail-only and stay bare.
           const resumeDelta = promptTurns.map((t: { text: string }) => t.text).filter(Boolean).join("\n\n") || ""
           textPrompt = isResume ? resumeDelta : frameReplayTurns(promptTurns)
+          // An auxiliary request always replays fresh, often every few
+          // seconds over the same growing history. The same text split into
+          // blocks, with one breakpoint at the client's reusable prefix, lets
+          // the next one read that prefix from cache instead of rewriting it.
+          // One SDK input: several would be answered as several turns.
+          if (!isResume && independentCause === "auxiliary-request") {
+            const blocks = layoutReplayBlocks(replayMessages.map((m: { role: string; content: any }) => {
+              if (m.role !== "assistant") return { role: m.role, parts: flattenUserContentParts(m.content, sanitizeOpts, toolIndex) }
+              const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
+              const clientMarked = Array.isArray(m.content) && m.content.some((block: any) => Boolean(block?.cache_control))
+              return { role: "assistant", parts: assistantText ? [{ text: `[Assistant: ${assistantText}]`, clientMarked }] : [] }
+            }))
+            if (blocks.some((block) => block.cache_control)) {
+              structuredMessages = [{ type: "user", message: { role: "user", content: blocks }, parent_tool_use_id: null }]
+            }
+          }
         }
       }
       rebuildReplayPrompt()
