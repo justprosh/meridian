@@ -34,6 +34,23 @@ describe("trailing system reminders in a live user turn", () => {
     expect(messages[0]!.content).toEqual([image, result])
   })
 
+  it("folds metadata-only system messages into the current turn without adding empty text", () => {
+    const result = { type: "tool_result", tool_use_id: "current-call", content: "CURRENT_RESULT" }
+    const messages = [
+      { role: "user", content: [result] },
+      { role: "system", content: "", output_config: { effort: "high" } },
+      { role: "system", content: [], output_config: { effort: "high" } },
+      { role: "system", output_config: { effort: "high" } } as unknown as { role: string; content: unknown },
+      { role: "system", content: [{ type: "text", text: " " }], output_config: { effort: "high" } },
+    ]
+    expect(coalesceTrailingSystemReminders(messages)).toEqual([{ role: "user", content: [result] }])
+    expect(coalesceTrailingSystemReminders([
+      { role: "user", content: "CURRENT" },
+      { role: "system", content: "" },
+      { role: "system", content: "REMINDER" },
+    ])).toEqual([{ role: "user", content: "CURRENT\n\nREMINDER" }])
+  })
+
   it("leaves assistant-ending history, system-only input, and middle reminders alone", () => {
     for (const messages of [
       [{ role: "user", content: "BEFORE" }, { role: "assistant", content: "ANSWER" }, { role: "system", content: "METADATA" }],

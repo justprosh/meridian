@@ -15,13 +15,22 @@ export function coalesceTrailingSystemReminders(messages: readonly ReplayMessage
   while (boundary >= 0 && messages[boundary]?.role === "system") boundary--
   if (boundary < 0 || boundary === messages.length - 1 || messages[boundary]?.role !== "user") return [...messages]
   const current = messages[boundary]!
-  const currentAndReminders = messages.slice(boundary)
+  // Metadata-only system messages (e.g. an effort `output_config` with no
+  // text) add nothing to the turn and would otherwise become empty text blocks.
+  const currentAndReminders = [current, ...messages.slice(boundary + 1).filter(message => !isBlankContent(message.content))]
   if (!currentAndReminders.every(message => typeof message.content === "string" || Array.isArray(message.content))) return [...messages]
   const content = currentAndReminders.every(message => typeof message.content === "string")
     ? currentAndReminders.map(message => message.content).join("\n\n")
     : currentAndReminders.flatMap(message => Array.isArray(message.content)
       ? message.content : [{ type: "text", text: message.content }])
   return [...messages.slice(0, boundary), { ...current, content }]
+}
+
+function isBlankContent(content: unknown): boolean {
+  if (content === undefined || content === null) return true
+  if (typeof content === "string") return content.trim() === ""
+  return Array.isArray(content) && content.every(block =>
+    record(block) && block.type === "text" && (typeof block.text !== "string" || block.text.trim() === ""))
 }
 
 function record(value: unknown): value is Record<string, unknown> {
