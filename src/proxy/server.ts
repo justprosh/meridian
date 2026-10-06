@@ -1611,6 +1611,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let recoveryPublishedTarget: TranscriptLocator | undefined
       let priorityRollbackRetirement: Promise<void> | undefined
       const evictSession = (...args: Parameters<typeof evictCachedSession>): boolean => {
+        // Auxiliary failures have no authority over the working mapping (#1288).
+        if (requestMeta.auxiliaryRequest) return true
         try {
           if (priorityTerminalCommitted && options.priorityPublication) return true
           if (options.priorityPublication?.rollback) {
@@ -2713,7 +2715,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const trailingSystemReminderOptions = adapterBase === "claude-code" || adapterBase === "pi"
           ? { allowTrailingSystemReminder: true }
           : undefined
-        const durableCheckpointContinuation = durableCheckpointIds?.length
+        // Independent side calls must never borrow the working checkpoint (#1288).
+        const durableCheckpointContinuation = !isIndependentSession && durableCheckpointIds?.length
           && durableMappingAtTurn.status === "found"
           && matchesStoredLineagePrefix(durableMappingAtTurn.session, lineageMessages)
           ? coalesceCompleteToolResultContinuation(
@@ -4042,7 +4045,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // is gone whatever the last attempt was refused with, so a
                   // wording that alternates cannot escape to the client. Evict
                   // and replay the history as a fresh session (one-shot).
-                  if (refusal === "missing-message" || sawUnresumableRefusal) {
+                  if (!isIndependentSession && (refusal === "missing-message" || sawUnresumableRefusal)) {
                     claudeLog("session.resume_replay", {
                       mode: "non_stream",
                       refusal,
@@ -5211,7 +5214,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // The session cannot serve this turn — evict and replay
                     // the history as a fresh session (one-shot). See the
                     // non-stream branch above for the full rationale.
-                    if (refusal === "missing-message" || sawUnresumableRefusal) {
+                    if (!isIndependentSession && (refusal === "missing-message" || sawUnresumableRefusal)) {
                       claudeLog("session.resume_replay", {
                         mode: "stream",
                         refusal,
