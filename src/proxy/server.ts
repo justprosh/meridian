@@ -1794,7 +1794,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let recoveryPublishedTarget: TranscriptLocator | undefined
       let priorityRollbackRetirement: Promise<void> | undefined
       const evictSession = async (...args: Parameters<typeof evictCachedSession>): Promise<boolean> => {
-        // Auxiliary failures have no authority over the working mapping (graph r161 #239).
+        // An auxiliary request never owned the working mapping, so its
+        // failure has nothing to invalidate.
         if (requestMeta.auxiliaryRequest) return true
         try {
           if (priorityTerminalCommitted && options.priorityPublication) return true
@@ -2925,8 +2926,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const trailingSystemReminderOptions = adapterBase === "claude-code" || adapterBase === "pi"
           ? { allowTrailingSystemReminder: true }
           : undefined
-        // Independent side calls must never borrow the working checkpoint (graph r161 #239).
-        const durableCheckpointContinuation = !isIndependentSession && durableCheckpointIds?.length
+        // An auxiliary request carries the working session key but must not
+        // continue its pending tool checkpoint.
+        const durableCheckpointContinuation = independentCause !== "auxiliary-request" && durableCheckpointIds?.length
           && durableMappingAtTurn.status === "found"
           && matchesStoredLineagePrefix(durableMappingAtTurn.session, lineageMessages)
           ? coalesceCompleteToolResultContinuation(
@@ -4262,7 +4264,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // is gone whatever the last attempt was refused with, so a
                   // wording that alternates cannot escape to the client. Evict
                   // and replay the history as a fresh session (one-shot).
-                  if (!isIndependentSession && (refusal === "missing-message" || sawUnresumableRefusal)) {
+                  // An auxiliary request never resumed the session, so it has no
+                  // mapping to evict or history to replay.
+                  if (independentCause !== "auxiliary-request" && (refusal === "missing-message" || sawUnresumableRefusal)) {
                     claudeLog("session.resume_replay", {
                       mode: "non_stream",
                       refusal,
@@ -5431,7 +5435,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // The session cannot serve this turn — evict and replay
                     // the history as a fresh session (one-shot). See the
                     // non-stream branch above for the full rationale.
-                    if (!isIndependentSession && (refusal === "missing-message" || sawUnresumableRefusal)) {
+                    // An auxiliary request never resumed the session, so it has no
+                    // mapping to evict or history to replay.
+                    if (independentCause !== "auxiliary-request" && (refusal === "missing-message" || sawUnresumableRefusal)) {
                       claudeLog("session.resume_replay", {
                         mode: "stream",
                         refusal,
@@ -8110,7 +8116,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               turnWatchdogAbort.abort(reason)
             },
           })
-          subtreeSessionKey = agentSessionId
+          // An auxiliary request stays cancellable by its parent, but its own
+          // abort must not cancel the working session's children.
+          subtreeSessionKey = auxiliaryRequest ? undefined : agentSessionId
           const clientSignal = c.req.raw.signal
           if (clientSignal.aborted) {
             cascadeSubtreeCancel("client_abort")
