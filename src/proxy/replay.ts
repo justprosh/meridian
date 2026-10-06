@@ -132,11 +132,18 @@ export interface ReplayTextBlock {
  * looks them up at block boundaries. Separators lead each block, so a block
  * never changes when later turns are appended.
  *
- * The breakpoint goes where the client placed its own reusable one: the first
- * client-marked block of the live turn other than its last block, otherwise
- * the last client-marked block of the history, otherwise the end of the
- * history. Claude Code marks the end of the shared prefix this way for its
- * side calls; the volatile tail keeps the breakpoint the SDK adds itself.
+ * The breakpoint follows the client's own markers. History (everything up to
+ * the last assistant turn) never changes once sent, so its last client marker,
+ * or failing that its last block, is reusable. After the last assistant turn,
+ * Claude Code's permission classifier marks the item under review as well as
+ * the end of the transcript before it, and leaves the final instruction
+ * unmarked; the item changes on every call. So in that live section, when the
+ * client did not mark the final block, its last marker is taken as volatile
+ * and the marker before it is used. This holds whether the classifier sends
+ * its transcript as one message or as one message per entry. Without such a
+ * marker the history choice applies; without history no breakpoint is added
+ * and the caller keeps the plain replay. The final block always keeps the
+ * breakpoint the SDK adds itself.
  */
 export function layoutReplayBlocks(turns: Array<{ role: string; parts: ReplayPart[] }>): ReplayTextBlock[] {
   const nonEmpty = turns
@@ -144,6 +151,7 @@ export function layoutReplayBlocks(turns: Array<{ role: string; parts: ReplayPar
     .filter(turn => turn.parts.length > 0)
   const lastTurn = nonEmpty.length - 1
   const framed = nonEmpty.length >= 2 && nonEmpty[lastTurn]!.role === "user"
+  const lastAssistant = nonEmpty.findLastIndex(turn => turn.role === "assistant")
   const blocks: Array<ReplayTextBlock & { turn: number; clientMarked: boolean }> = []
   nonEmpty.forEach((turn, index) => turn.parts.forEach((part, partIndex) => {
     let lead = partIndex > 0 ? "\n" : index > 0 ? "\n\n" : ""
@@ -152,12 +160,14 @@ export function layoutReplayBlocks(turns: Array<{ role: string; parts: ReplayPar
     blocks.push({ type: "text", text: lead + part.text, turn: index, clientMarked: part.clientMarked })
   }))
   const lastBlock = blocks.length - 1
-  const live = blocks.findIndex((block, index) => block.turn === lastTurn && block.clientMarked && index < lastBlock)
-  const history = blocks.findLastIndex(block => block.turn < lastTurn && block.clientMarked)
-  const historyEnd = framed ? blocks.findLastIndex(block => block.turn < lastTurn) : -1
-  const marker = live >= 0 ? live : history >= 0 ? history : historyEnd
+  const liveMarked = blocks.flatMap((block, index) =>
+    block.turn > lastAssistant && block.clientMarked && index < lastBlock ? [index] : [])
+  const live = blocks[lastBlock]?.clientMarked ? liveMarked.at(-1) : liveMarked.at(-2)
+  const history = blocks.findLastIndex(block => block.turn <= lastAssistant && block.clientMarked)
+  const historyEnd = blocks.findLastIndex(block => block.turn <= lastAssistant)
+  const marker = live ?? (history >= 0 ? history : historyEnd)
   return blocks.map(({ turn: _turn, clientMarked: _marked, ...block }, index) =>
-    index === marker ? { ...block, cache_control: { type: "ephemeral" as const } } : block)
+    index === marker && index < lastBlock ? { ...block, cache_control: { type: "ephemeral" as const } } : block)
 }
 
 /** Keep completed calls as context, including their exact identity and input.
