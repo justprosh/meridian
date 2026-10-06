@@ -1,4 +1,7 @@
-// The client-generated final text block observed alongside a tool_result.
+// A Claude Code subagent progress-caption request (#1288). PROGRESS_PROMPT is
+// the client's instruction verbatim. The client appends it to the last user
+// message: after its tool results and other text, or as a user message of its
+// own after an assistant reply.
 export const PROGRESS_PROMPT = `Describe your most recent action in 3-5 words using present tense (-ing). Name the file or function, not the branch. Do not use tools.
 
 Previous: "Reading the adjudicate track in review.js" — say something NEW.
@@ -12,6 +15,9 @@ Bad (past tense): "Analyzed the branch diff"
 Bad (too vague): "Investigating the issue"
 Bad (too long): "Reviewing full branch diff and AgentTool.tsx integration"
 Bad (branch name): "Analyzed adam/background-summary branch diff"`
+
+// The first caption of a subagent quotes no previous caption.
+export const PROGRESS_FIRST_PROMPT = PROGRESS_PROMPT.replace(/Previous: .*\n\n/, "")
 
 export const PROGRESS_WORK = [
   { role: "user", content: "Read alpha.txt" },
