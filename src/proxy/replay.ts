@@ -109,6 +109,57 @@ export function frameStructuredReplay<T extends { message: { content: unknown } 
   return coalesceStructuredUserMessages(framed)
 }
 
+/** One rendered piece of replay text, and whether the client put a cache
+ * breakpoint on the block it came from. */
+export interface ReplayPart {
+  text: string
+  clientMarked: boolean
+}
+
+export interface ReplayTextBlock {
+  type: "text"
+  text: string
+  cache_control?: { type: "ephemeral" }
+}
+
+/**
+ * Lay out a fresh replay as text blocks whose concatenation is exactly the
+ * string `frameReplayTurns` would produce for the same turns, with one cache
+ * breakpoint where the prefix is expected to recur.
+ *
+ * A single replay string cannot be cached across requests that share history
+ * but differ at the tail: the API writes cache entries only at breakpoints and
+ * looks them up at block boundaries. Separators lead each block, so a block
+ * never changes when later turns are appended.
+ *
+ * The breakpoint goes where the client placed its own reusable one: the first
+ * client-marked block of the live turn other than its last block, otherwise
+ * the last client-marked block of the history, otherwise the end of the
+ * history. Claude Code marks the end of the shared prefix this way for its
+ * side calls; the volatile tail keeps the breakpoint the SDK adds itself.
+ */
+export function layoutReplayBlocks(turns: Array<{ role: string; parts: ReplayPart[] }>): ReplayTextBlock[] {
+  const nonEmpty = turns
+    .map(turn => ({ role: turn.role, parts: turn.parts.filter(part => part.text) }))
+    .filter(turn => turn.parts.length > 0)
+  const lastTurn = nonEmpty.length - 1
+  const framed = nonEmpty.length >= 2 && nonEmpty[lastTurn]!.role === "user"
+  const blocks: Array<ReplayTextBlock & { turn: number; clientMarked: boolean }> = []
+  nonEmpty.forEach((turn, index) => turn.parts.forEach((part, partIndex) => {
+    let lead = partIndex > 0 ? "\n" : index > 0 ? "\n\n" : ""
+    if (framed && partIndex === 0 && index === 0) lead = REPLAY_CONTEXT_OPEN
+    if (framed && partIndex === 0 && index === lastTurn) lead = REPLAY_CONTEXT_CLOSE
+    blocks.push({ type: "text", text: lead + part.text, turn: index, clientMarked: part.clientMarked })
+  }))
+  const lastBlock = blocks.length - 1
+  const live = blocks.findIndex((block, index) => block.turn === lastTurn && block.clientMarked && index < lastBlock)
+  const history = blocks.findLastIndex(block => block.turn < lastTurn && block.clientMarked)
+  const historyEnd = framed ? blocks.findLastIndex(block => block.turn < lastTurn) : -1
+  const marker = live >= 0 ? live : history >= 0 ? history : historyEnd
+  return blocks.map(({ turn: _turn, clientMarked: _marked, ...block }, index) =>
+    index === marker ? { ...block, cache_control: { type: "ephemeral" as const } } : block)
+}
+
 /** Keep completed calls as context, including their exact identity and input.
  * Native assistant messages cannot be supplied to a fresh SDK query. */
 export function flattenAssistantContent(content: unknown, renderToolName?: (name: string) => string): string {
