@@ -216,7 +216,7 @@ describe("cache-friendly replay layout", () => {
     }
   })
 
-  it("marks the first client breakpoint inside the live turn, not its volatile last marker", () => {
+  it("marks the boundary before the classifier's volatile action in the live turn", () => {
     const classifier = (steps: number) => [
       { role: "user", parts: [part("CLAUDE.md", true)] },
       { role: "user", parts: [part("<transcript>"), ...Array.from({ length: steps }, (_, i) => part(`step ${i}`, i === steps - 1)), part("new action", true), part("</transcript>"), part("Err on the side of blocking.")] },
