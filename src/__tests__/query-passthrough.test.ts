@@ -2,7 +2,7 @@
  * Tests for SDK parameter passthrough fields in buildQueryOptions.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
-import { buildQueryOptions, SCRATCHPAD_COUNTER_INSTRUCTION, type QueryContext } from "../proxy/query"
+import { buildQueryOptions, promptCachingDisabled, SCRATCHPAD_COUNTER_INSTRUCTION, type QueryContext } from "../proxy/query"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME, ALLOWED_MCP_TOOLS } from "../proxy/tools"
 
 function makeContext(overrides: Partial<QueryContext> = {}): QueryContext {
@@ -198,5 +198,21 @@ describe("scratchpad suppression (#627, #1049)", () => {
       ? result.options.systemPrompt
       : (result.options.systemPrompt as any)?.append
     expect(prompt ?? "").not.toContain(SCRATCHPAD_COUNTER_INSTRUCTION)
+  })
+})
+
+describe("promptCachingDisabled", () => {
+  it("honors the global and the per-family switch for the resolved model", () => {
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "1" }, "sonnet")).toBe(true)
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "true" }, "claude-opus-4-6")).toBe(true)
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING_OPUS: "1" }, "opus[1m]")).toBe(true)
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING_OPUS: "1" }, "claude-sonnet-4-6")).toBe(false)
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING_HAIKU: "yes" }, "claude-haiku-4-5-20251001")).toBe(true)
+  })
+
+  it("treats unset, empty and false values as caching on", () => {
+    expect(promptCachingDisabled({}, "sonnet")).toBe(false)
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "" }, "sonnet")).toBe(false)
+    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "0", DISABLE_PROMPT_CACHING_SONNET: "false" }, "sonnet")).toBe(false)
   })
 })

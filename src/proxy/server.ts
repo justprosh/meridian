@@ -100,7 +100,7 @@ import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdviso
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
 import { rootSessionIdOf } from "./adapter"
-import { buildQueryOptions, isCliThinkingDisplay, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
+import { buildQueryOptions, isCliThinkingDisplay, promptCachingDisabled, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -3439,7 +3439,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // blocks, with one breakpoint at the client's reusable prefix, lets
           // the next one read that prefix from cache instead of rewriting it.
           // One SDK input: several would be answered as several turns.
-          if (!isResume && independentCause === "auxiliary-request") {
+          if (!isResume && independentCause === "auxiliary-request" && !promptCachingDisabled({ ...profileEnv, ...envOverrides }, model)) {
             const blocks = layoutReplayBlocks(replayMessages.map((m: { role: string; content: any }) => {
               if (m.role !== "assistant") return { role: m.role, parts: flattenUserContentParts(m.content, sanitizeOpts, toolIndex) }
               const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
