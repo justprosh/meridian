@@ -4,7 +4,7 @@
 // own after an assistant reply.
 export const PROGRESS_PROMPT = `Describe your most recent action in 3-5 words using present tense (-ing). Name the file or function, not the branch. Do not use tools.
 
-Previous: "Reading the adjudicate track in review.js" — say something NEW.
+Previous: "Reading the parser in config.ts" — say something NEW.
 
 Good: "Reading runAgent.ts"
 Good: "Fixing null check in validate.ts"

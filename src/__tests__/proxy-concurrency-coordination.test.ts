@@ -154,9 +154,6 @@ function claudeCodeRequest(
       model: "claude-sonnet-4-6",
       max_tokens: 128,
       stream: false,
-      // Conversation turns carry the client's tools; tool-less unstreamed
-      // requests are the CLI's side calls (isClaudeCodeAuxiliaryRequest).
-      tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } }],
       messages,
       metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
     }),
@@ -215,7 +212,11 @@ function claudeCodeSubagentKey(sessionId: string, agentId: string): string {
 function claudeCodeStateCardRequest(sessionId: string): Request {
   return new Request("http://localhost/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "user-agent": "claude-cli/2.1.291" },
+    headers: {
+      "Content-Type": "application/json",
+      "user-agent": "claude-cli/2.1.291",
+      "x-claude-code-session-id": "b2004dfc-6042-48d9-9c23-b4475f64b6f5",
+    },
     body: JSON.stringify({
       model: "claude-opus-4-8",
       max_tokens: 1024,

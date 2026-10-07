@@ -157,6 +157,9 @@ export function claudeCodeSessionKey(agentId: string | undefined, body: unknown)
 /** Claude Code's own request classification (`main`, `auxiliary`, `compaction`, …). */
 export const CLAUDE_CODE_REQUEST_CLASS_HEADER = "x-claude-code-request-class"
 
+/** The auto-mode classifier's XML verdicts end at these tags. */
+const CLASSIFIER_STOP_SEQUENCES = new Set(["</block>", "</severity>"])
+
 /**
  * Is this a Claude Code side call under the conversation's session id?
  *
@@ -174,18 +177,33 @@ export const CLAUDE_CODE_REQUEST_CLASS_HEADER = "x-claude-code-request-class"
  * not streamed. Both classifiers go through the CLI's unstreamed side-query
  * helper without tools, while the conversation loop streams its turns and
  * keeps their tools when it retries one unstreamed. The streamed session-start
- * request, compaction and main turns all fall outside the shape. An identified
+ * request, compaction and main turns all fall outside the shape.
+ *
+ * Other clients can reach this adapter with the same tool-less unstreamed
+ * shape for real turns, so the shape alone counts only for a request from the
+ * CLI itself (`fromCli`, see isClaudeCodeClient). Otherwise it also needs a
+ * stop sequence closing the auto-mode classifier's verdict tag; if a future CLI
+ * changes those, detection falls back to treating the request as a turn rather
+ * than isolating a real one. An identified
  * subagent's streaming progress caption has its own narrow shape in
  * claudecodeProgress; it must also stay out of the working mapping.
  */
-export function isClaudeCodeAuxiliaryRequest(requestClass: string | undefined, body: unknown, agentId?: string): boolean {
+export function isClaudeCodeAuxiliaryRequest(
+  requestClass: string | undefined,
+  body: unknown,
+  agentId?: string,
+  fromCli = false,
+): boolean {
   if (requestClass !== undefined) return requestClass === "auxiliary"
   if (!body || typeof body !== "object") return false
   if (extractClaudeCodeSessionId(body) === undefined) return false
   if (agentId !== undefined && CLAUDE_CODE_AGENT_ID.test(agentId) && isClaudeCodeProgressSummary(body)) return true
-  const request = body as { tools?: unknown; stream?: unknown }
+  const request = body as { tools?: unknown; stream?: unknown; stop_sequences?: unknown }
   if (Array.isArray(request.tools) && request.tools.length > 0) return false
-  return request.stream !== true
+  if (request.stream === true) return false
+  if (fromCli) return true
+  return Array.isArray(request.stop_sequences)
+    && request.stop_sequences.some(stop => typeof stop === "string" && CLASSIFIER_STOP_SEQUENCES.has(stop))
 }
 
 /**
@@ -260,7 +278,12 @@ export const claudeCodeAdapter: AgentAdapter = {
 
   /** See `isClaudeCodeAuxiliaryRequest`. */
   isAuxiliaryRequest(c: Context, body?: unknown): boolean {
-    return isClaudeCodeAuxiliaryRequest(c.req.header(CLAUDE_CODE_REQUEST_CLASS_HEADER), body, c.req.header(CLAUDE_CODE_AGENT_ID_HEADER))
+    return isClaudeCodeAuxiliaryRequest(
+      c.req.header(CLAUDE_CODE_REQUEST_CLASS_HEADER),
+      body,
+      c.req.header(CLAUDE_CODE_AGENT_ID_HEADER),
+      isClaudeCodeClient(c),
+    )
   },
 
   /**
