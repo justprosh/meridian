@@ -41,7 +41,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PASSTHROUGH_EARLY_STOP` | — | `1` | Set to `0` to disable [digest-turn elimination](#how-tool-calling-works-in-passthrough) and restore the old end-of-turn behavior |
 | `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. **Setting this opts out of [digest-turn elimination](#how-tool-calling-works-in-passthrough)** — an explicit value always wins over the cap, so a turn budget set to work around an older issue keeps paying for the discarded digest turn. Unset it unless you still need it. |
 | `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, a capped turn with complete client-declared tool calls is returned as `tool_use` when every call has an ID-matched CLI `No such tool available` result; the rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow the experimental uncaptured abort-window recovery without an explicit dispatch rejection (no live positive gate yet). Set to `0` to disable both recoveries. Non-streaming responses are unaffected. The confirmed-rejection recovery applies at any turn budget, including the deferred-tools budget; the abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. |
-| `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
+| `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction, unless the deadline itself ran late because the event loop was blocked. An answered turn whose terminal publication meets any of these errors is still delivered; its next turn replays history. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
 | `MERIDIAN_SESSION_PROFILE_COPY_PRUNE` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE` | `0` | Opt in to removing stale cross-profile session mappings during GC. Off preserves native resume history. Returning to a pruned profile uses flattened, context-trimmed replay, which cannot restore SDK thinking. |
 | `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_GRACE_MS` | `86400000` (24 hours) | With several profiles, the same conversation gets its own stored session under each profile it has run on. When profile-copy pruning is enabled, on every session GC sweep a copy is removed once a newer copy of that conversation exists under another profile and the older copy has not been used for this many milliseconds. The newest copy, copies of a conversation with a request in flight, and mappings a priority route depends on are always kept. A conversation that returns to a profile while its copy exists resumes that profile's own session; after removal it is replayed into a fresh session on that account, as flattened history trimmed to the model's context window. The default covers an account's 5-hour usage window resetting and a day of switching back and forth. `0` keeps only the newest copy. Removal is paced to leave at least half of `MERIDIAN_SESSION_GC_MAX_PENDING` free for new requests, so a large store is trimmed over several sweeps. |
 | `MERIDIAN_SILENT_TURN_RECOVERY` | `CLAUDE_PROXY_SILENT_TURN_RECOVERY` | `1` | Set to `0` to stop spending a recovery turn on a [silent turn](#silent-turns). Detection and telemetry stay on either way |
@@ -154,7 +154,7 @@ second instance pointed at an empty directory starts genuinely empty:
 
 | File | Holds |
 |---|---|
-| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates` |
+| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates`, page `layout` |
 | `profiles.json` | Configured profiles ([Multi-Profile Support](profiles.md)) |
 | `profiles/<id>/` | Per-profile `CLAUDE_CONFIG_DIR` (credentials, SDK state) |
 | `adapter-instances.json` | [Adapter instances](agents.md#adapter-instances) |
@@ -293,10 +293,18 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /profiles` | Profile management page |
 | `GET /profiles/list` | List profiles with auth status (JSON) |
 | `POST /profiles/active` | Switch the active profile |
+| `POST /profiles/login/start` | Begin an OAuth login for a profile — returns the authorize URL (see [Re-authenticating from the web UI](profiles.md#from-the-web-ui-re-authenticate-a-profile-without-a-terminal)) |
+| `GET /profiles/login/status` | Poll a started login: `waiting`, `completed` or `failed` |
+| `POST /profiles/login/complete` | Finish that login with the code the user pasted back |
+| `GET /callback` | Anthropic's OAuth redirect target. **Not** behind `MERIDIAN_API_KEY` — the redirect carries no key; acts only on a single-use `state` minted by `/profiles/login/start` |
+| `POST /profiles/add/start` | Begin creating a new profile — validates the name and returns the authorize URL (see [Adding from the web UI](profiles.md#from-the-web-ui-add-a-profile)) |
+| `POST /profiles/add/complete` | Finish that creation — writes the profile only once Anthropic returns credentials |
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
 | `GET /v1/usage/quota/all` | Usage windows for every profile (JSON) |
-| `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage and update-check UI |
+| `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
 | `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy |
+| `GET/PUT /settings/api/header` | Read or set `showHostname` (JSON `{"showHostname": true}`): name the machine beside the header's status; takes effect on the running proxy |
+| `GET/PUT /settings/api/layout` | Read or set the web pages' `layout`: `contained` (default, a centered column) or `wide` (spans the window, more cards per row). JSON `{"layout": "wide"}`, `null` to unset; applies on the next page load |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
 
 Illustrative health response excerpt (versions and status vary by installation):
@@ -313,6 +321,34 @@ Illustrative health response excerpt (versions and status vary by installation):
 ```
 
 `plugin.opencode` is `"configured"` when `meridian setup` has been run, `"not-configured"` otherwise.
+
+With `"showHostname": true` in `settings.json` (or the switch under **Site
+Header** at `/settings`), `/health` also carries `"hostname"`, the machine's
+name as the OS reports it, and the site header shows it beside the status, e.g.
+`Operational · nwkr-desktop`. It is off by default because `/health` answers
+without the API key.
+
+This applies to Claude and standalone Antigravity health, including unhealthy
+and draining responses; their status codes and other fields stay intact.
+`/livez` and `/readyz` do not disclose the hostname. The header shows the first
+DNS label (or a whole IP address), with the complete name in its tooltip.
+
+`GET /settings/api/header` returns `{ "showHostname": false, "hostname":
+"<OS name>" }` when off. `PUT` accepts a boolean, `null` to remove the saved
+field, or an omitted field to preserve it; invalid values or bodies return
+400. Both routes use the existing `MERIDIAN_API_KEY` gate when configured.
+Health and header settings bypass caches, and disabling takes effect on
+responses assembled after the setting changes, including probes already
+waiting for auth. The UI permits one hostname save at a time and ignores
+older health polls when a newer refresh has started.
+
+Browser writes must originate from this server. HTTPS origins are also
+accepted across an internal HTTP TLS-termination hop with the same preserved
+public Host/port; explicit default 443 is equivalent to omitted HTTPS 443.
+Foreign, opaque, malformed or different-port origins return 403. Forwarding
+headers are not trusted. A reverse proxy that rewrites Host must preserve the
+public Host for this route. CLI writes without an `Origin` header continue to
+work through the API-key gate.
 
 ## Error reporting
 

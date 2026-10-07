@@ -19,6 +19,8 @@ import { describe, expect, it, mock, afterEach } from "bun:test"
 // crash somewhere unrelated.
 import * as realModels from "../proxy/models"
 
+let resolveExecutable = () => Promise.resolve("claude")
+
 const authCalls: Array<{ profileId?: string; envOverrides?: Record<string, string> }> = []
 
 mock.module("../proxy/models", () => ({
@@ -31,7 +33,7 @@ mock.module("../proxy/models", () => ({
       subscriptionType: profileId === "pro" ? "pro" : "max",
     }
   },
-  resolveClaudeExecutableAsync: async () => "claude",
+  resolveClaudeExecutableAsync: () => resolveExecutable(),
 }))
 
 const { createProxyServer } = await import("../proxy/server")
@@ -64,8 +66,47 @@ const STAMPS = [
 afterEach(() => {
   for (const key of STAMPS) delete process.env[key]
   authCalls.length = 0
+  resolveExecutable = () => Promise.resolve("claude")
   stopUpdateCheck()
   setSetting("checkForUpdates", undefined)
+})
+
+describe("cold executable readiness", () => {
+  it("leaves liveness responsive while asynchronous executable resolution is pending", async () => {
+    realModels.resetCachedClaudePath()
+    let release: (value: string) => void = () => { throw new Error("Resolution gate not installed") }
+    const pending = new Promise<string>(resolve => { release = resolve })
+    let entered = false
+    resolveExecutable = () => { entered = true; return pending }
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1",
+      profiles: [{ id: "ready-fixture", type: "api", apiKey: "owned-dummy-key" }], defaultProfile: "ready-fixture" })
+    let settled = false
+    const ready = Promise.resolve(app.fetch(new Request("http://localhost/readyz"))).then(response => {
+      settled = true
+      return response
+    })
+    try {
+      const live = await app.fetch(new Request("http://localhost/livez"))
+      expect(live.status).toBe(200)
+      expect(await live.text()).toBe("ok\n")
+      expect(entered).toBe(true)
+      expect(settled).toBe(false)
+    } finally {
+      release("owned-claude")
+      await ready
+    }
+    expect((await ready).status).toBe(200)
+  })
+
+  it("retains the unready response when cold executable resolution fails", async () => {
+    realModels.resetCachedClaudePath()
+    resolveExecutable = () => Promise.reject(new Error("No usable local executable"))
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1",
+      profiles: [{ id: "ready-fixture", type: "api", apiKey: "owned-dummy-key" }], defaultProfile: "ready-fixture" })
+    const response = await app.fetch(new Request("http://localhost/readyz?verbose"))
+    expect(response.status).toBe(503)
+    expect(await response.text()).toContain("[-]claude-executable failed")
+  })
 })
 
 describe("/v1/models profile auth context", () => {
@@ -189,7 +230,7 @@ describe("/health build provenance", () => {
     mock.module("../proxy/models", () => ({
       ...realModels,
       getClaudeAuthStatusAsync: async () => ({ loggedIn: false }),
-      resolveClaudeExecutableAsync: async () => "claude",
+      resolveClaudeExecutableAsync: () => resolveExecutable(),
     }))
     const { createProxyServer: create } = await import("../proxy/server")
     const { app } = create({ port: 0, host: "127.0.0.1", version: "1.62.7" })

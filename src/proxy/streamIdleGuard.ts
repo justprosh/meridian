@@ -62,11 +62,46 @@ function isSdkStreamPing(value: unknown): boolean {
     && "type" in value.event && value.event.type === "ping"
 }
 
+/**
+ * How far past its deadline the idle timer may fire before the guard treats
+ * the lateness as a blocked event loop rather than ordinary timer jitter.
+ *
+ * A late timer suggests delayed callbacks, for example from a synchronous
+ * fsync or a long CPU burst on the main thread. While the loop is
+ * blocked the upstream keeps sending, and its bytes wait in the socket or
+ * pipe. When the loop resumes, expired timers run before the I/O poll that
+ * would deliver those bytes, so without this check a live stream is rejected
+ * as silent. The two-second threshold excludes ordinary short timer jitter;
+ * it is not proof of a particular cause. Crossing it adds only a bounded I/O
+ * opportunity, without extending the idle window or accepting transport pings.
+ */
+export const IDLE_DEADLINE_LATE_MS = 2_000
+
+/** Reported when the idle timer fired more than IDLE_DEADLINE_LATE_MS late. */
+export interface LateIdleDeadline {
+  /** How long after its deadline the timer actually ran. */
+  lateMs: number
+  /** Time since the last upstream message, measured when the timer ran. */
+  sinceLastMs: number
+  /** True if model progress or completion turned up after yielding to I/O. */
+  resumed: boolean
+}
+
+const IDLE = Symbol("idle")
+
+// Give socket/pipe processing an opportunity on supported Node/Bun runtimes.
+// A single immediate can resume before I/O under Bun; the independent-process
+// socket probe exercises the two-immediate ordering on both runtimes.
+function yieldToIo(): Promise<void> {
+  return new Promise((resolve) => setImmediate(() => setImmediate(resolve)))
+}
+
 export async function* guardUpstreamIdle<T>(
   source: AsyncIterable<T>,
   idleMs: number,
   onStall?: (sinceLastMs: number) => void,
   clock: IdleGuardClock = realClock,
+  onLateDeadline?: (late: LateIdleDeadline) => void,
 ): AsyncGenerator<T> {
   if (idleMs <= 0) {
     yield* source
@@ -82,24 +117,41 @@ export async function* guardUpstreamIdle<T>(
       nextP.catch(() => {})
 
       let timer: IdleTimerHandle | undefined
-      const idle = new Promise<never>((_, reject) => {
+      let deadlineAt = 0
+      const idle = new Promise<typeof IDLE>((resolve) => {
         const remaining = Math.max(0, idleMs - (clock.now() - lastAt))
-        timer = clock.setTimeout(() => {
-          const sinceLastMs = clock.now() - lastAt
+        deadlineAt = clock.now() + remaining
+        timer = clock.setTimeout(() => resolve(IDLE), remaining)
+      })
+
+      let res: IteratorResult<T> | typeof IDLE
+      try {
+        res = await Promise.race([nextP, idle])
+      } finally {
+        if (timer !== undefined) clock.clearTimeout(timer)
+      }
+      if (res === IDLE) {
+        const sinceLastMs = clock.now() - lastAt
+        const lateMs = clock.now() - deadlineAt
+        if (lateMs > IDLE_DEADLINE_LATE_MS) {
+          // The loop was blocked, so upstream data may be waiting behind this
+          // timer. Poll I/O once, then check the stream again.
+          await yieldToIo()
+          res = await Promise.race([nextP, Promise.resolve(IDLE)])
+          try {
+            onLateDeadline?.({ lateMs, sinceLastMs, resumed: res !== IDLE && (res.done || !isSdkStreamPing(res.value)) })
+          } catch {
+            // Observer errors must not change the guard's verdict.
+          }
+        }
+        if (res === IDLE) {
           try {
             onStall?.(sinceLastMs)
           } catch {
             // Observer errors must not prevent rejecting the guarded iterator.
           }
-          reject(new UpstreamIdleError(idleMs, sinceLastMs))
-        }, remaining)
-      })
-
-      let res: IteratorResult<T>
-      try {
-        res = await Promise.race([nextP, idle])
-      } finally {
-        if (timer !== undefined) clock.clearTimeout(timer)
+          throw new UpstreamIdleError(idleMs, sinceLastMs)
+        }
       }
       if (res.done) return
       if (isSdkStreamPing(res.value)) continue

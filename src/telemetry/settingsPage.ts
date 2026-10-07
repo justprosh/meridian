@@ -18,7 +18,7 @@ export const settingsPageHtml = `<!DOCTYPE html>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
          color: var(--text); padding: 0; line-height: 1.5; }
   ${profileBarCss}
-  .content { max-width: 900px; margin: 0 auto; padding: 24px; }
+  .container { max-width: 900px; margin: 0 auto; padding: 24px; }
   h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
   .nav { display: flex; gap: 16px; margin-bottom: 24px; font-size: 13px; }
@@ -55,6 +55,11 @@ export const settingsPageHtml = `<!DOCTYPE html>
 
   .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 600px) { .feature-grid { grid-template-columns: 1fr; } }
+  /* Wide layout: two columns across the whole window put a toggle a thousand
+     pixels from its label, so rows keep their contained width and add columns.
+     The pricing table sizes to its columns for the same reason. */
+  html[data-layout="wide"] .feature-grid { grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); }
+  html[data-layout="wide"] .pricing-table { width: auto; }
 
   .feature-row {
     display: flex; align-items: center; justify-content: space-between;
@@ -102,18 +107,24 @@ export const settingsPageHtml = `<!DOCTYPE html>
   }
   .reset-btn:hover { border-color: var(--red); color: var(--red); }
 
-  /* Model pricing. Four fixed-width rate inputs cannot shrink to a phone
-     viewport, so the table scrolls inside its card instead of the page. */
+  /* Model pricing. Four rate inputs cannot shrink to a phone viewport, so
+     the table scrolls inside its card instead of the page, and a model id
+     stays on one line rather than breaking into a column of fragments.
+     A rate is a few digits ($/Mtok such as 123.45), so its input is sized
+     to that; the spinner, useless at a 0.01 step, would cover the digits. */
   .pricing-scroll { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
   .pricing-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .pricing-table th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500;
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
   .pricing-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
   .pricing-table tr:last-child td { border-bottom: none; }
-  .pricing-model { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  .pricing-model { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: nowrap; }
   .pricing-input { background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 8px; font-size: 12px; width: 84px; text-align: right;
     font-variant-numeric: tabular-nums; }
+  .pricing-table .pricing-input { width: calc(7ch + 18px); -moz-appearance: textfield; appearance: textfield; }
+  .pricing-table .pricing-input::-webkit-inner-spin-button,
+  .pricing-table .pricing-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   .pricing-input:focus { border-color: var(--accent); outline: none; }
   .pricing-badge { font-size: 10px; padding: 2px 8px; border-radius: 10px;
     text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
@@ -129,7 +140,7 @@ export const settingsPageHtml = `<!DOCTYPE html>
 </head>
 <body>
 ${profileBarHtml}
-<div class="content">
+<div class="container">
   <h1>Routing</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     How unpinned requests choose an account. <strong style="color:var(--text)">Active</strong> uses the manually
@@ -212,6 +223,29 @@ ${profileBarHtml}
   </p>
   <div class="adapter-card" id="updates-card">
     <div id="updates-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Site Header</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    With several Meridian instances open in tabs, they all look the same. Switch this on and the header names
+    the machine this one runs on, beside its status. Off unless you turn it on, because the hostname is then
+    also reported by <code>/health</code>, which answers without the API key.
+  </p>
+  <div class="adapter-card" id="header-card">
+    <div id="header-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Layout</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    How much of the window these pages use. <strong style="color:var(--text)">Contained</strong> keeps every page in
+    a centered column, the way Meridian has always looked. <strong style="color:var(--text)">Wide</strong> uses the
+    whole window, for a big monitor and many accounts: the home page fits more account cards on each row at about the
+    same size, and Profiles lays its larger cards out side by side, two to four to a row depending on the screen.
+    Phones get one column either way. The choice is saved on this Meridian, so every browser that opens it sees the same
+    layout. Other pages pick it up on their next load; this one switches as soon as you choose.
+  </p>
+  <div class="adapter-card" id="layout-card">
+    <div id="layout-body">Loading…</div>
   </div>
 </div>
 
@@ -714,11 +748,78 @@ async function putUpdates(checkForUpdates) {
   await loadUpdates();
 }
 
+async function loadHeaderSettings() {
+  const cfg = await (await fetch('/settings/api/header')).json();
+  document.getElementById('header-body').innerHTML = telemetryRow('Show hostname',
+    '<input type="checkbox" id="hdr-hostname" aria-label="Show hostname"' + (cfg.showHostname ? ' checked' : '') + '>',
+    cfg.showHostname ? 'shown' : 'hidden',
+    ' <span style="font-size:12px;color:var(--muted)">This machine: <code>' + telemetryEsc(cfg.hostname || 'unknown') + '</code></span>');
+  document.getElementById('hdr-hostname').addEventListener('change', (e) => putHeaderSettings(e.target.checked));
+}
+
+async function putHeaderSettings(showHostname) {
+  const checkbox = document.getElementById('hdr-hostname');
+  checkbox.disabled = true;
+  try {
+    const res = await fetch('/settings/api/header', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ showHostname }),
+    });
+    if (!res.ok) {
+      checkbox.checked = !showHostname;
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Failed to save header settings');
+    } else {
+      showSaved();
+      if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+    }
+  } catch {
+    checkbox.checked = !showHostname;
+    alert('Failed to save header settings');
+  } finally {
+    try { await loadHeaderSettings(); }
+    catch { alert('Failed to reload header settings'); }
+    checkbox.disabled = false;
+  }
+}
+
+async function loadLayout() {
+  const cfg = await (await fetch('/settings/api/layout')).json();
+  const el = document.getElementById('layout-body');
+  el.innerHTML = '<div style="display:flex;align-items:center;gap:12px">'
+    + '<label for="layout-mode" style="color:var(--muted);font-size:13px;width:90px">Layout</label>'
+    + '<select id="layout-mode" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
+    + (cfg.layouts || ['contained', 'wide']).map(l => '<option value="'+l+'"'+(cfg.layout===l?' selected':'')+'>'+l+'</option>').join('')
+    + '</select></div>';
+  document.getElementById('layout-mode').addEventListener('change', (e) => putLayout(e.target.value));
+}
+
+async function putLayout(layout) {
+  const res = await fetch('/settings/api/layout', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layout }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save the layout');
+  } else {
+    const saved = await res.json();
+    if (saved.layout === 'contained') document.documentElement.removeAttribute('data-layout');
+    else document.documentElement.setAttribute('data-layout', saved.layout);
+    showSaved();
+  }
+  await loadLayout();
+}
+
 loadConfig();
 loadPricing();
 loadRouting();
 loadTelemetry();
 loadUpdates();
+loadHeaderSettings();
+loadLayout();
 ${profileBarJs}
 </script>
 </body>

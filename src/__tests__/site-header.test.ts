@@ -18,6 +18,7 @@ import { profileBarCss, profileBarHtml, profileBarJs } from "../telemetry/profil
 import { ICON_PATH } from "../telemetry/icon"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
+import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 
 const allPages: Array<[string, string]> = [
   ["providers", providerPageHtml],
@@ -44,6 +45,13 @@ describe("shared site header", () => {
   test("header shows live status pill fed by /health", () => {
     expect(profileBarHtml).toContain("mhStatus")
     expect(profileBarJs).toContain("/health")
+  })
+
+  test("status pill can name the machine, hidden until /health reports one", () => {
+    expect(profileBarHtml).toContain('<span class="mh-host" id="mhHost" hidden></span>')
+    expect(profileBarJs).toContain("hostLabelView")
+    expect(profileBarJs).toContain("renderHost(h.hostname)")
+    expect(settingsPageHtml).toContain("/settings/api/header")
   })
 
   test("header shows active profile chip, not a dropdown", () => {
@@ -84,6 +92,10 @@ describe("shared site header", () => {
     expect(linkRule).toContain("var(--accent, #58a6ff)")
     expect(linkRule).not.toContain("--accent2")
 
+    // The separator is a pseudo-element of the link it precedes, so a hover
+    // underline reaches it unless it is an atomic inline.
+    expect(rule(".mh-prov-part + .mh-prov-part::before")).toContain("display: inline-block")
+
     const driftWarning = rule(".mh-drift.warning")
     expect(driftWarning).toContain("var(--yellow, #d29922)")
     expect(rule(".mh-drift")).not.toContain("--yellow")
@@ -115,6 +127,16 @@ describe("shared site header", () => {
       const head = html.slice(0, html.indexOf("</head>"))
       expect(head, `${name} page should link the favicon`).toContain(`<link rel="icon" type="image/svg+xml" href="${ICON_PATH}">`)
     }
+  })
+
+  test("the OAuth callback page is the deliberate exception", () => {
+    // /callback is reachable WITHOUT the API key — Anthropic's redirect carries
+    // none — while the header polls /health and /profiles/list, which are gated.
+    // Embedding it would render broken "offline" chrome on the one page a user
+    // sees mid-login. This pins that exception so it is not "fixed" by hand.
+    const html = renderLoginCallbackPage({ ok: true, profileId: "personal" })
+    expect(html).not.toContain("meridian-header")
+    expect(html).toContain("href=\"/profiles\"")
   })
 })
 
@@ -250,6 +272,7 @@ describe("design-system conformance (DESIGN.md)", () => {
     "src/telemetry/dashboard.ts",
     "src/telemetry/settingsPage.ts",
     "src/telemetry/profilePage.ts",
+    "src/telemetry/loginCallbackPage.ts",
     "src/proxy/plugins/pluginPage.ts",
   ]
 
@@ -274,6 +297,142 @@ describe("settings page layout", () => {
   test("pricing table scrolls inside its card so a phone viewport never scrolls sideways", () => {
     expect(settingsPageHtml).toMatch(/\.pricing-scroll \{[^}]*overflow-x: auto/)
     expect(settingsPageHtml).toMatch(/<div class="pricing-scroll">\s*<table class="pricing-table">/)
+  })
+
+  test("a model id stays on one line and a rate input is sized to a rate", () => {
+    const model = settingsPageHtml.match(/\.pricing-model \{[^}]*\}/)?.[0] ?? ""
+    expect(model).toContain("white-space: nowrap")
+    expect(model).not.toContain("word-break")
+    // 7 characters of content (123.45, 0.0375) plus the input's padding and
+    // border, which border-box sizing would otherwise take out of the text.
+    expect(settingsPageHtml).toMatch(/\.pricing-table \.pricing-input \{[^}]*width: calc\(7ch \+ 18px\)/)
+  })
+  test("offers the page layout setting", () => {
+    expect(settingsPageHtml).toContain('id="layout-body"')
+    expect(settingsPageHtml).toContain("fetch('/settings/api/layout'")
+  })
+})
+
+describe("profiles page — the sign-in control is a real link", () => {
+  // Someone signed into several Claude accounts needs the browser's own
+  // context menu — "Open Link in Incognito Window", "Copy Link Address" — to
+  // choose which session answers the sign-in. Chrome and Firefox offer that
+  // for an anchor with an href and for nothing else, so these assertions are
+  // the feature, not decoration.
+  test("renders an anchor with an href, not a button", () => {
+    expect(profilePageHtml).toContain('<a class="login-btn login-link"')
+    expect(profilePageHtml).toContain("loginHrefFor(p.id)")
+    expect(profilePageHtml).toContain('rel="noopener noreferrer"')
+    expect(profilePageHtml).not.toContain('<button class="login-btn" onclick="startLogin')
+  })
+
+  test("nothing in the login flow opens a window from script", () => {
+    // A scripted window.open is exactly what denies the context menu, and it
+    // also ignores ctrl-click and middle-click. Scoped to the login section so
+    // this says something precise about THIS flow rather than policing every
+    // other feature on the page.
+    const start = profilePageHtml.indexOf("// --- Browser login ---")
+    expect(start).toBeGreaterThan(-1)
+    const next = profilePageHtml.indexOf("// --- ", start + 24)
+    const loginSection = next === -1 ? profilePageHtml.slice(start) : profilePageHtml.slice(start, next)
+    expect(loginSection).not.toContain("window.open(")
+  })
+
+  test("the fallback to pasting a code is also a real link", () => {
+    expect(profilePageHtml).toContain('onclick="switchToPaste();return true;"')
+    expect(profilePageHtml).not.toContain('href="#" onclick="switchToPaste()')
+  })
+
+  test("hrefs survive a re-render and are refreshed before they expire", () => {
+    expect(profilePageHtml).toContain("applyLoginHrefs()")
+    expect(profilePageHtml).toContain("ensureLoginLinks(profiles)")
+  })
+
+  test("no PKCE material is ever put in a link", () => {
+    expect(profilePageHtml).not.toContain("codeVerifier")
+    expect(profilePageHtml).not.toContain("code_verifier")
+  })
+})
+
+describe("home page spacing on a phone", () => {
+  test("the page edge is a third and a card's padding half of the desktop values", () => {
+    expect(landingHtml).toContain(".container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }")
+    expect(landingHtml).toMatch(/\.profile-card \{[^}]*padding: 18px 20px;/)
+    expect(landingHtml).toMatch(/@media \(max-width: 720px\) \{\s*\.container \{ padding-left: 8px; padding-right: 8px; \}\s*\.profile-card \{ padding: 9px 10px; \}\s*\}/)
+  })
+})
+
+describe("header build info collapses to the room it has", () => {
+  test("the calm drift chip goes first, warnings never", () => {
+    expect(profileBarCss).toContain('.meridian-header[data-prov-calm="hidden"] .mh-drift.calm { display: none; }')
+    expect(profileBarCss).not.toMatch(/data-prov-calm[^{]*\.mh-drift\.(warning|neutral)/)
+    expect(profileBarCss).not.toMatch(/data-prov-[a-z]+="[a-z]+"\][^{]*\.mh-update/)
+  })
+
+  test("each compact form shows only its own pieces", () => {
+    const shown = (form: string) => profileBarCss.match(new RegExp(`\\[data-prov-form="${form}"\\] (\\.[a-z-]+)[,\\s]`, "g")) ?? []
+    expect(shown("commit").join(" ")).toContain(".mh-prov-short-commit")
+    expect(shown("run").join(" ")).toContain(".mh-prov-short-run")
+    expect(shown("version").join(" ")).not.toMatch(/short-(commit|run)/)
+  })
+
+  test("the fit follows the header's width and content, largest form first", () => {
+    expect(profileBarJs).toContain("[['shown', 'full'], ['hidden', 'full']].concat(provForms.map(")
+    expect(profileBarJs).toContain("new ResizeObserver(")
+    expect(profileBarJs).toContain("new MutationObserver(queueFit)")
+    expect(profileBarJs).toContain("attributeFilter: ['class', 'hidden']")
+    // The short forms are appended beside the full parts, so the full pill's
+    // tooltip and links are untouched and switching never rebuilds a link.
+    expect(profileBarJs).toContain("provForms = appendShortForms(view.parts);")
+  })
+})
+
+describe("wide page layout", () => {
+  const ruleIn = (css: string, selector: string) => {
+    const start = css.indexOf(`${selector} {`)
+    expect(start, `${selector} rule`).toBeGreaterThanOrEqual(0)
+    return css.slice(start, css.indexOf("}", start))
+  }
+
+  test("every page wraps its content in the shared .container, so the wide rule reaches it", () => {
+    for (const [name, html] of allPages) {
+      expect(html, `${name} page content wrapper`).toMatch(/<(div|main) class="container">/)
+    }
+  })
+
+  test("wide drops the centered column and keeps an edge margin, header included", () => {
+    expect(profileBarCss).toContain('html[data-layout="wide"] { --page-gutter: clamp(16px, 3vw, 48px); }')
+    const container = ruleIn(profileBarCss, 'html[data-layout="wide"] .container')
+    expect(container).toContain("max-width: none")
+    expect(container).toContain("padding-left: var(--page-gutter)")
+    expect(container).toContain("padding-right: var(--page-gutter)")
+    expect(ruleIn(profileBarCss, 'html[data-layout="wide"] .meridian-header')).toContain("padding-left: var(--page-gutter)")
+  })
+
+  test("contained pages keep their column", () => {
+    expect(landingHtml).toContain(".container { max-width: 960px;")
+    expect(profilePageHtml).toContain(".container { max-width: 800px;")
+    expect(settingsPageHtml).toContain(".container { max-width: 900px;")
+    expect(pluginPageHtml).toContain(".container { max-width: 960px;")
+    expect(providerPageHtml).toContain(".container{max-width:1040px;")
+  })
+
+  test("home cards keep their size and gain columns; profile cards grow, phones get one column", () => {
+    // min(…, 100%) is what lets a single column shrink to a phone instead of
+    // scrolling the page sideways.
+    expect(ruleIn(landingHtml, 'html[data-layout="wide"] .profile-grid'))
+      .toContain("grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr))")
+    expect(ruleIn(profilePageHtml, 'html[data-layout="wide"] #content'))
+      .toContain("grid-template-columns: repeat(auto-fill, minmax(min(560px, 100%), 1fr))")
+    expect(ruleIn(profilePageHtml, 'html[data-layout="wide"] #content > :not(.profile-card)')).toContain("grid-column: 1 / -1")
+  })
+
+  test("settings toggles, pricing rows and provider cards keep their values near their labels", () => {
+    expect(ruleIn(settingsPageHtml, 'html[data-layout="wide"] .feature-grid'))
+      .toContain("grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr))")
+    expect(ruleIn(settingsPageHtml, 'html[data-layout="wide"] .pricing-table')).toContain("width: auto")
+    expect(providerPageHtml)
+      .toContain('html[data-layout="wide"] .provider-grid{grid-template-columns:repeat(auto-fill,minmax(min(480px,100%),1fr))}')
   })
 })
 

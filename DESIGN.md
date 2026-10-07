@@ -95,7 +95,10 @@ green `rgba(63,185,80,α)`, yellow `rgba(210,153,34,α)`, red
 
 Usage bars and percentage readouts color by value: `< 60%` green,
 `≥ 60%` yellow, `≥ 85%` red. Health dot: healthy green (with soft glow),
-degraded yellow, offline red.
+degraded yellow, offline red. With the opt-in `showHostname` setting the pill
+names the machine after its status (`Operational · nwkr-desktop`), first DNS
+label only with the full name on hover; at phone width the name stays beside
+the dot, ellipsized, without the separator.
 
 ## 3. The backsplash
 
@@ -126,6 +129,17 @@ Every HTML page is assembled the same way:
 4. Page content in a `.container` (max-width 960px; the telemetry
    dashboard uses full-width padding instead)
 5. `profileBarJs` appended to the page script
+
+**Wide layout.** The `layout` setting (Settings → Layout) serves every page
+with `data-layout="wide"` on `<html>`. The shared rule in `profileBarCss`
+then lifts the `.container` max-width and pads it and the header with
+`--page-gutter` (`clamp(16px, 3vw, 48px)`). A page that lays out cards or
+label/value rows adds its own `html[data-layout="wide"]` rule so a value
+never ends up a screen away from its label: the home page keeps its card size
+and adds columns, `/profiles` shows larger cards side by side, and Settings
+and Providers keep rows and cards about as wide as when contained. The content
+wrapper must be `.container` for any of this to reach it. A contained page
+carries no attribute, so it renders as before.
 
 **The header owns the brand.** It shows the mark + wordmark (links home),
 the site nav (Home · Telemetry · Profiles · Settings · Plugins), the
@@ -205,6 +219,7 @@ account card on the home page (or the Profiles page). The header chip only
 ## 8. New-page checklist
 
 - [ ] Prepends `themeCss`, embeds `profileBarCss/Html/Js`
+- [ ] Content wrapper is `.container`; the route serves the page through `withSavedLayout`
 - [ ] No `body` background, no hardcoded hex colors, tokens only
 - [ ] `<h1>` = page name + muted subtitle; header handles brand/status
 - [ ] Nav link added to `profileBarHtml` (and its active-state id)

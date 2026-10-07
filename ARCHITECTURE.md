@@ -196,6 +196,9 @@ src/
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
 │   ├── sseFailureSniff.ts     ← SSE framing/classification and bounded priority stream transport (leaf)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
+│   ├── authStatusProcess.ts   ← Bounded auth/resolver children and explicit process/pipe joins
+│   ├── claudeResolverOwnership.ts ← Independent leases for shared async resolver custody
+│   ├── authStatusOwnership.ts ← Per-instance ownership of shared auth-status refreshes
 │   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
 │   ├── localBuildInfo.ts      ← Local build comparisons and public forge links (PURE)
 │   ├── buildRuntime.ts        ← Immutable runtime identity and independent disk status
@@ -223,6 +226,10 @@ src/
 │   ├── sessionStore.ts        ← Shared file store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
+│   ├── profileConfigStore.ts  ← cross-process profile writer lock and atomic snapshots (leaf, I/O)
+│   ├── profileLogin.ts        ← Browser re-authentication state, redirect/paste completion and status
+│   ├── profileAdd.ts          ← Browser profile creation and isolated credential persistence
+│   ├── profileOAuthBody.ts    ← Runtime schemas for browser OAuth request bodies (pure)
 │   ├── statusProbe.ts         ← Asks a busy port whether it is Meridian, and collects what / shows
 │   ├── agentDefs.ts           ← Subagent definition extraction from tool descriptions
 │   ├── agentMatch.ts          ← Fuzzy agent name matching
@@ -247,6 +254,7 @@ src/
 │   ├── pricingStore.ts        ← User pricing overrides (persisted JSON)
 │   ├── profileBar.ts          ← Shared profile switcher bar (injected into HTML pages)
 │   ├── profilePage.ts         ← Profile management page HTML
+│   ├── pageLayout.ts          ← Contained/wide layout setting, stamped on each page as it is served
 │   ├── cliDashboard.ts        ← The landing page rendered for a terminal (pure)
 │   └── types.ts               ← Telemetry types
 
@@ -293,7 +301,13 @@ server.ts (HTTP layer)
 
 3. **`errors.ts`, `retryAfter.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts` and `retryAfter.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
 
-4. **`server.ts` is the only module that imports from Hono** or touches HTTP concerns.
+4. **`server.ts` owns Hono route registration and orchestration.** Hono
+   middleware stays at the proxy boundary. Standard `Request`/`Response`
+   dispatch lives in the provider backend where needed. Shared
+   `src/headerSettings.ts` handles only hostname settings validation, Origin
+   policy and persisted consent, using standard web types and `settings.ts`;
+   it must not import a server, provider, Hono or session module. Backend auth
+   remains at each caller's existing boundary.
 
 5. **No circular dependencies.** If you need to share types, put them in `types.ts` or the relevant leaf module.
 
@@ -302,6 +316,10 @@ server.ts (HTTP layer)
 7. **`query.ts` builds SDK options through the adapter interface**, never importing tool constants directly.
 
 8. **`sessionTree.ts` holds only live-request bookkeeping.** No HTTP, no I/O, no logging: the caller supplies each entry's abort handle and owns the eviction and telemetry discipline that follows an abort. It must not import from `server.ts`, `session/`, or `adapter.ts`.
+
+`operationalLog.ts` owns the existing process-wide operational stderr silence
+policy. Server orchestration and lifecycle queue logging use it without importing
+each other; diagnostic entries remain available to silent embedding hosts.
 
 ## Agent Adapter Pattern
 
@@ -559,8 +577,16 @@ An SDK writer lease is released once its writer has been joined. If the lifecycl
 FIFO with at most 256 waiting callers. Local waiting does not consume the
 two-second external-lock acquisition budget; only the head creates a durable
 candidate. A holder stalled for 60 seconds rejects queued/new callers without
-unlocking or abandoning its transaction. Capacity and stalled-holder errors are
+unlocking or abandoning its transaction. A stall deadline that runs more than a
+second late was delayed by a blocked event loop, which delayed the holder too, so
+it grants one additional window. The second deadline rejects waiters even if it
+is late; the holder still owns the lock until its actual completion. Capacity and
+stalled-holder errors are
 distinct, defined in the dependency-leaf `session/lifecycleErrors.ts`.
+A turn whose model already answered does not fail on any of these lock errors
+at terminal publication: they are raised before the transaction runs, so the
+turn invalidates its unchanged pre-turn mapping and the next turn replays. A
+durable priority attempt still requires its atomic publication.
 Request admission signals remove queued work and cancel external acquisition,
 but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
@@ -623,3 +649,19 @@ Both render the same manager snapshot and use the same lifecycle/profile actions
 category preferences, burst thresholds and persisted cooldown timestamps prevent
 per-request alerts. Recovery exhaustion is critical; individual child exits remain
 in the in-app history.
+
+## Auth-status refresh lifetime
+
+Auth-status caches remain shared by profile/default context. Each proxy instance
+owns only the refreshes its routes or keepalive requested; closing one owner
+does not cancel a sibling's shared check. The last owner cancels and joins its
+check through the existing shutdown path. An independent direct caller retains
+its own ownership until the bounded process finishes. Caller patience is five
+seconds, while the process deadline is ninety seconds.
+
+`authStatusProcess.ts` records callback, exit, close and both captured pipe
+closures independently. Cancellation uses the exact owned child handle, with
+bounded TERM/KILL escalation. Missing settlement rejects cleanup and retains
+the single-flight slot; neither a settled result promise nor `exitCode` alone
+proves the child joined. Cache expiry never detaches an in-flight check. The
+existing `ProxyInstance.close()` and `closeBackend()` signatures are unchanged.
