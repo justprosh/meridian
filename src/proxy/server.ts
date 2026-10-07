@@ -1805,7 +1805,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let priorityRollbackRetirement: Promise<void> | undefined
       const evictSession = async (...args: Parameters<typeof evictCachedSession>): Promise<boolean> => {
         // An auxiliary request never owned the working mapping, so its
-        // failure has nothing to invalidate.
+        // failure has nothing to invalidate (#1288). `true` reports exactly
+        // that: the mapping is still in place, so this is not an eviction a
+        // caller may follow with refreshGenerationAfterEviction.
         if (requestMeta.auxiliaryRequest) return true
         try {
           if (priorityTerminalCommitted && options.priorityPublication) return true
