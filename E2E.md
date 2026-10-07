@@ -5912,8 +5912,11 @@ the turn is waiting on it.
 The CLI names its request class in `x-claude-code-request-class`, but sends it
 only with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, to a first-party base URL, or
 under a remote flag. The adapter therefore uses the header when present and
-otherwise the classifier's shape: session key, no tools, not streamed, and a
-`</block>` or `</severity>` stop sequence.
+otherwise the shape: session key, no tools, not streamed. A request carrying
+the CLI's own `x-claude-code-session-id` needs nothing more, which also covers
+the session-state classifier (one `Current state: …` message, no stop
+sequence); any other request also needs a `</block>` or `</severity>` stop
+sequence.
 
 ```bash
 bun scripts/e2e-claude-code-auto-mode.mjs

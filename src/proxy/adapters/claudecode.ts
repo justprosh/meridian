@@ -163,21 +163,37 @@ const CLASSIFIER_STOP_SEQUENCES = new Set(["</block>", "</severity>"])
 /**
  * Is this a Claude Code side call under the conversation's session id?
  *
- * NOTE: agent-specific (claude-code). The auto-mode permission classifier
- * sends the conversation's own `metadata.user_id` session id with a two-message
- * transcript of its own. Read as a turn, it classifies `unrelated-history` and
- * overwrites the conversation's mapping, so the next real turn cannot resume.
+ * NOTE: agent-specific (claude-code). The CLI sends several side calls with the
+ * conversation's own `metadata.user_id` session id and a short transcript of
+ * their own: the auto-mode permission classifier, and the classifier that sums
+ * up the session's state ("Current state: … / Assistant message tail …"). Read
+ * as a turn, each classifies `unrelated-history` and overwrites the
+ * conversation's mapping, so the next real turn cannot resume.
  *
  * The CLI names its request class in `x-claude-code-request-class`, but sends
  * it only with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, to a first-party base URL,
  * or under a remote flag — through Meridian it is normally absent. When present
- * it decides outright. Otherwise the classifier's shape does: a session key,
- * no tools, not streamed, and a stop sequence closing its verdict tag. The
- * streamed session-start request, compaction and main turns all fall outside
- * it. An identified subagent's streaming progress caption has its own narrow
- * shape in claudecodeProgress; it must also stay out of the working mapping.
+ * it decides outright. Otherwise the shape does: a session key, no tools, and
+ * not streamed. Both classifiers go through the CLI's unstreamed side-query
+ * helper without tools, while the conversation loop streams its turns and
+ * keeps their tools when it retries one unstreamed. The streamed session-start
+ * request, compaction and main turns all fall outside the shape.
+ *
+ * Other clients can reach this adapter with the same tool-less unstreamed
+ * shape for real turns, so the shape alone counts only for a request from the
+ * CLI itself (`fromCli`, see isClaudeCodeClient). Otherwise it also needs a
+ * stop sequence closing the auto-mode classifier's verdict tag; if a future CLI
+ * changes those, detection falls back to treating the request as a turn rather
+ * than isolating a real one. An identified
+ * subagent's streaming progress caption has its own narrow shape in
+ * claudecodeProgress; it must also stay out of the working mapping.
  */
-export function isClaudeCodeAuxiliaryRequest(requestClass: string | undefined, body: unknown, agentId?: string): boolean {
+export function isClaudeCodeAuxiliaryRequest(
+  requestClass: string | undefined,
+  body: unknown,
+  agentId?: string,
+  fromCli = false,
+): boolean {
   if (requestClass !== undefined) return requestClass === "auxiliary"
   if (!body || typeof body !== "object") return false
   if (extractClaudeCodeSessionId(body) === undefined) return false
@@ -185,11 +201,9 @@ export function isClaudeCodeAuxiliaryRequest(requestClass: string | undefined, b
   const request = body as { tools?: unknown; stream?: unknown; stop_sequences?: unknown }
   if (Array.isArray(request.tools) && request.tools.length > 0) return false
   if (request.stream === true) return false
-  if (!Array.isArray(request.stop_sequences)) return false
-  if (!request.stop_sequences.some(stop => typeof stop === "string" && CLASSIFIER_STOP_SEQUENCES.has(stop))) {
-    return false
-  }
-  return true
+  if (fromCli) return true
+  return Array.isArray(request.stop_sequences)
+    && request.stop_sequences.some(stop => typeof stop === "string" && CLASSIFIER_STOP_SEQUENCES.has(stop))
 }
 
 /**
@@ -264,7 +278,12 @@ export const claudeCodeAdapter: AgentAdapter = {
 
   /** See `isClaudeCodeAuxiliaryRequest`. */
   isAuxiliaryRequest(c: Context, body?: unknown): boolean {
-    return isClaudeCodeAuxiliaryRequest(c.req.header(CLAUDE_CODE_REQUEST_CLASS_HEADER), body, c.req.header(CLAUDE_CODE_AGENT_ID_HEADER))
+    return isClaudeCodeAuxiliaryRequest(
+      c.req.header(CLAUDE_CODE_REQUEST_CLASS_HEADER),
+      body,
+      c.req.header(CLAUDE_CODE_AGENT_ID_HEADER),
+      isClaudeCodeClient(c),
+    )
   },
 
   /**
