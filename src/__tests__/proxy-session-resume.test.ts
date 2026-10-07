@@ -243,12 +243,16 @@ describe("Session resume: session ID tracking", () => {
       }),
     }
     const headers = { "user-agent": "claude-cli/2.1.207" }
+    // Conversation turns carry the client's tools; a tool-less unstreamed
+    // request is one of the CLI's side calls.
+    const tools = [{ name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } }]
 
     await (await post(app, {
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
       stream: false,
       metadata,
+      tools,
       messages: [{ role: "user", content: "Run the tests" }],
     }, headers)).json()
 
@@ -258,6 +262,7 @@ describe("Session resume: session ID tracking", () => {
       max_tokens: 1024,
       stream: false,
       metadata,
+      tools,
       messages: [
         { role: "user", content: "Run the tests" },
         {

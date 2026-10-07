@@ -370,11 +370,18 @@ describe("isClaudeCodeAuxiliaryRequest", () => {
     })).toBe(false)
   })
 
-  it("requires one of the classifier's stop sequences", () => {
+  // The session-state classifier sends one user message and no stop sequence.
+  it("recognises any tool-less unstreamed side call, with or without stop sequences", () => {
+    const stateCard = {
+      model: "claude-opus-4-8",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Current state: working (for 3m)\nTool calls so far: Bash\u00d72\nUser's most recent ask: \"go\"\n\nAssistant message tail (last 20 chars):\nRunning the tests." }],
+      metadata: classifier.metadata,
+    }
+    expect(isClaudeCodeAuxiliaryRequest(undefined, stateCard)).toBe(true)
+    expect(isClaudeCodeAuxiliaryRequest(undefined, { ...stateCard, stream: false })).toBe(true)
     const { stop_sequences: _omitted, ...withoutStops } = classifier
-    expect(isClaudeCodeAuxiliaryRequest(undefined, withoutStops)).toBe(false)
-    expect(isClaudeCodeAuxiliaryRequest(undefined, { ...classifier, stop_sequences: ["\n\nHuman:"] }))
-      .toBe(false)
+    expect(isClaudeCodeAuxiliaryRequest(undefined, withoutStops)).toBe(true)
   })
 
   it("requires a Claude Code session key", () => {
@@ -385,8 +392,7 @@ describe("isClaudeCodeAuxiliaryRequest", () => {
   it("rejects malformed shapes without throwing", () => {
     expect(isClaudeCodeAuxiliaryRequest(undefined, undefined)).toBe(false)
     expect(isClaudeCodeAuxiliaryRequest(undefined, "not an object")).toBe(false)
-    expect(isClaudeCodeAuxiliaryRequest(undefined, { ...classifier, stop_sequences: "</block>" })).toBe(false)
-    expect(isClaudeCodeAuxiliaryRequest(undefined, { ...classifier, stop_sequences: [42, null] })).toBe(false)
+    expect(isClaudeCodeAuxiliaryRequest(undefined, { ...classifier, metadata: { user_id: 42 } })).toBe(false)
     expect(isClaudeCodeAuxiliaryRequest(undefined, { ...classifier, tools: null })).toBe(true)
   })
 })
