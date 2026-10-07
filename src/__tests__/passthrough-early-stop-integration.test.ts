@@ -1316,7 +1316,7 @@ describe("Integration: passthrough early stop", () => {
   // system[text]); the generic helpers reject role=system and forced a fresh
   // replay. Oh My Pi (adapter pi) produces the same tail when it upgrades a
   // developer-origin note to a mid-conversation system turn, and OpenCode 2
-  // when a project instruction file changes. The opt-in must resume and
+  // for an instruction update. The opt-in must resume and
   // deliver the reminder as user text; Crush stands for every other adapter.
   const reminderCases = [false, true].flatMap(stream =>
     ["claude-code", "pi", "opencode", "crush"].flatMap(adapter =>
@@ -1574,8 +1574,9 @@ describe("Integration: passthrough early stop", () => {
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBeUndefined()
   })
 
-  // OpenCode 2 sends a changed AGENTS.md as a native system update after the
-  // tool results, also when the user queued a message during the tool call.
+  // OpenCode 2 sends an instruction update (here a changed AGENTS.md) as a
+  // native system update after the tool results, also when the user queued a
+  // message during the tool call.
   it("non-stream: OpenCode instruction update after tool results and queued user text resumes the checkpoint", async () => {
     const update = "The instructions changed:\nInstructions from: /repo/AGENTS.md\n# Rules\nRun the gate before pushing."
     const toolTurn = assistantMessage([
@@ -1583,13 +1584,15 @@ describe("Integration: passthrough early stop", () => {
       { type: "tool_use", id: "oc-update-tu1", name: "write", input: { file_path: "AGENTS.md" } },
     ])
     mockMessages = [toolTurn, userDenyMessage("oc-update-tu1")]
-    expect((await post(app, {
+    const first = await post(app, {
       model: "claude-sonnet-4-5",
       max_tokens: 400,
       stream: false,
       tools: [READ_TOOL],
       messages: [{ role: "user", content: "rewrite AGENTS.md" }],
-    }, "es-oc-update")).status).toBe(200)
+    }, "es-oc-update")
+    expect(first.status).toBe(200)
+    await first.text()
 
     mockMessages = [assistantMessage([{ type: "text", text: "rules updated" }])]
     const requestId = `oc-update-turn2-${TEST_RUN_ID}`
