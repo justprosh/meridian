@@ -92,7 +92,13 @@ export function bootstrapResidues(path: string): Residue[] {
     }
     residues.push({ path: prefix + stem, kind: "bootstrap-alias", verdict: verdict === "dead" ? "dead-incarnation" : verdict === "alive" ? "live" : "unknown" })
   }
-  if (publicStat?.nlink === 2 && !linked) throw new Error("bootstrap hardlink has no matching owner provenance")
+  if (publicStat?.nlink === 2 && !linked) {
+    // A concurrent bootstrap links its alias and then removes it; a scan that
+    // straddles the removal sees the second link without the alias.
+    if (lstatSync(path, { throwIfNoEntry: false })?.nlink !== 2)
+      throw new BookkeepingBusyError("bootstrap publication changed during inspection; retry")
+    throw new Error("bootstrap hardlink has no matching owner provenance")
+  }
   if (publicStat && (!publicStat.isFile() || ![1, 2].includes(publicStat.nlink)
     || (process.getuid && publicStat.uid !== process.getuid()) || (publicStat.mode & 0o777) !== 0o600))
     throw new Error("not an owned regular bootstrap publication")
@@ -102,7 +108,13 @@ export function bootstrapResidues(path: string): Residue[] {
 export function assertDeadBootstrapAliases(path: string): void {
   const residues = bootstrapResidues(path)
   if (residues.some(row => row.verdict !== "dead-incarnation")) throw new BookkeepingBusyError("live or ambiguous bootstrap ownership; stop/recheck original owner, never infer death")
-  if (!residues.length) throw new Error("bootstrap alias has no owned provenance")
+  if (!residues.length) {
+    // Callers come here after seeing a second link; a bootstrap that finished
+    // since then has already removed its alias.
+    if (lstatSync(path, { throwIfNoEntry: false })?.nlink === 1)
+      throw new BookkeepingBusyError("bootstrap publication finished during inspection; retry")
+    throw new Error("bootstrap alias has no owned provenance")
+  }
 }
 
 /** No opens of SQLite inodes: closing even an alias would drop this process's POSIX locks. */

@@ -9,7 +9,8 @@ import { resumeRetirements } from "../proxy/session/bookkeeping/privateRetiremen
 import { runBookkeepingCli } from "../proxy/session/bookkeeping/cli"
 import { inspectBookkeeping } from "../proxy/session/bookkeeping/inspect"
 import { observeMaintenancePhases } from "../proxy/session/bookkeeping/maintenanceJournal"
-import { bootstrapResidues, createBootstrapPath } from "../proxy/session/bookkeeping/bootstrapOwner"
+import { assertDeadBootstrapAliases, bootstrapResidues, createBootstrapPath } from "../proxy/session/bookkeeping/bootstrapOwner"
+import { BookkeepingBusyError } from "../proxy/session/bookkeeping/storagePaths"
 import { initializeSessionBookkeeping } from "../proxy/session/bookkeeping/connection"
 import { recoverBootstrapAliases } from "../proxy/session/bookkeeping/bootstrapRecovery"
 
@@ -91,6 +92,15 @@ it("foreign inode and missing-owner bootstrap aliases fail closed without touchi
   linkSync(path, alias)
   expect(() => bootstrapResidues(path)).toThrow("no matching owner")
   expect(existsSync(alias)).toBe(true)
+})
+
+// The guard inspects aliases after seeing a second link. A concurrent bootstrap
+// that removed its alias in between is busy, so startup retries it.
+it("a bootstrap that finished after the second link was seen is busy, not ambiguous", () => {
+  const path = join(directory, "session-bookkeeping.sqlite")
+  writeFileSync(path, "published", { mode: 0o600 })
+  expect(() => assertDeadBootstrapAliases(path)).toThrow(BookkeepingBusyError)
+  expect(readFileSync(path, "utf8")).toBe("published")
 })
 
 it("first-guard alias cleanup keeps actual cross-process EXCLUSIVE exclusion throughout retirement", async () => {
