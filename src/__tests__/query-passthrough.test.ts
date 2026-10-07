@@ -202,17 +202,19 @@ describe("scratchpad suppression (#627, #1049)", () => {
 })
 
 describe("promptCachingDisabled", () => {
-  it("honors the global and the per-family switch for the resolved model", () => {
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "1" }, "sonnet")).toBe(true)
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "true" }, "claude-opus-4-6")).toBe(true)
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING_OPUS: "1" }, "opus[1m]")).toBe(true)
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING_OPUS: "1" }, "claude-sonnet-4-6")).toBe(false)
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING_HAIKU: "yes" }, "claude-haiku-4-5-20251001")).toBe(true)
+  it("parses values the way the CLI's boolean env parser does", () => {
+    for (const value of ["1", "true", "TRUE", "yes", "on", " true ", "1\n"]) {
+      expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: value })).toBe(true)
+    }
+    for (const value of [undefined, "", "0", "false", "no", "off", "enabled"]) {
+      expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: value })).toBe(false)
+    }
   })
 
-  it("treats unset, empty and false values as caching on", () => {
-    expect(promptCachingDisabled({}, "sonnet")).toBe(false)
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "" }, "sonnet")).toBe(false)
-    expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: "0", DISABLE_PROMPT_CACHING_SONNET: "false" }, "sonnet")).toBe(false)
+  it("treats any per-family switch as disabling, whatever the model is named", () => {
+    for (const family of ["HAIKU", "SONNET", "OPUS", "FABLE", "MYTHOS"]) {
+      expect(promptCachingDisabled({ [`DISABLE_PROMPT_CACHING_${family}`]: " on " })).toBe(true)
+      expect(promptCachingDisabled({ [`DISABLE_PROMPT_CACHING_${family}`]: "0" })).toBe(false)
+    }
   })
 })

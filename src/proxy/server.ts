@@ -3439,7 +3439,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // blocks, with one breakpoint at the client's reusable prefix, lets
           // the next one read that prefix from cache instead of rewriting it.
           // One SDK input: several would be answered as several turns.
-          if (!isResume && independentCause === "auxiliary-request" && !promptCachingDisabled({ ...profileEnv, ...envOverrides }, model)) {
+          if (!isResume && independentCause === "auxiliary-request" && !promptCachingDisabled({ ...profileEnv, ...envOverrides })) {
             const blocks = layoutReplayBlocks(replayMessages.map((m: { role: string; content: any }) => {
               if (m.role !== "assistant") return { role: m.role, parts: flattenUserContentParts(m.content, sanitizeOpts, toolIndex) }
               const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
