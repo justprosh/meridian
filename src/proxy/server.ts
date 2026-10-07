@@ -2936,12 +2936,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const durableCheckpointIds = durableMappingAtTurn.status === "found"
           ? durableMappingAtTurn.session.passthroughToolCallIds
           : undefined
-        // NOTE: agent-specific (claude-code, pi) — trailing system reminder: claude-cli's
-        // mid-conversation-system feature, and Oh My Pi upgrading developer-origin notes to a
-        // mid-conversation `system` turn after tool results. Fresh replay already delivers the
-        // reminder as user text, so resuming only avoids rewriting the whole history cache.
-        // See allowTrailingSystemReminder.
-        const trailingSystemReminderOptions = adapterBase === "claude-code" || adapterBase === "pi"
+        // NOTE: agent-specific (claude-code, pi, opencode) — trailing system reminder: claude-cli's
+        // mid-conversation-system feature, Oh My Pi upgrading developer-origin notes to a
+        // mid-conversation `system` turn after tool results, and OpenCode 2 sending a changed
+        // project instruction file (AGENTS.md) as a native `system` update after tool results.
+        // Fresh replay already delivers the reminder as user text, so resuming only avoids
+        // rewriting the whole history cache. See allowTrailingSystemReminder.
+        const trailingSystemReminderOptions = adapterBase === "claude-code" || adapterBase === "pi" || adapterBase === "opencode"
           ? { allowTrailingSystemReminder: true }
           : undefined
         // An auxiliary request carries the working session key but must not
