@@ -778,6 +778,26 @@ describe("SDK and Session concurrency coordination", () => {
     expect(capturedParams[1]?.options?.env?.FORCE_PROMPT_CACHING_5M).toBe("1")
   })
 
+  // Settings files may disable caching through their own `env`, which only
+  // the CLI resolves, so any loaded setting source skips the breakpoint.
+  it("adds no replay breakpoint when setting files are loaded", async () => {
+    const original = process.env.MERIDIAN_LOAD_CONTEXT
+    process.env.MERIDIAN_LOAD_CONTEXT = "1"
+    try {
+      const app = createProxyServer({ port: 0, host: "127.0.0.1", silent: true }).app
+      const sessionId = `progress-settings-${crypto.randomUUID()}`
+      const captionP = app.fetch(claudeCodeCaptionRequest([
+        ...PROGRESS_WORK, { role: "assistant", content: "ok" }, { role: "user", content: PROGRESS_FIRST_PROMPT },
+      ], sessionId, "progress-agent"))
+      ;(await waitForControl(0)).release()
+      await (await captionP).text()
+      expect(typeof capturedParams[0]?.prompt).toBe("string")
+    } finally {
+      if (original === undefined) delete process.env.MERIDIAN_LOAD_CONTEXT
+      else process.env.MERIDIAN_LOAD_CONTEXT = original
+    }
+  })
+
   // The per-family switches are covered by promptCachingDisabled's own tests:
   // the resolved model depends on the account the test run resolves.
   it("adds no replay breakpoint when DISABLE_PROMPT_CACHING turns caching off", async () => {
