@@ -3549,6 +3549,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
       // Build the prompt — either structured or text.
       // Structured prompts are stored as arrays so they can be replayed on retry.
+      // SDK setting sources — controls CLAUDE.md and user settings loading.
+      const settingSources: import("@anthropic-ai/claude-agent-sdk").SettingSource[] =
+        envBool("LOAD_CONTEXT") || sdkFeatures.claudeMd === "full"
+          ? ["user", "project"]
+          : sdkFeatures.claudeMd === "project"
+            ? ["project"]
+            : pipelineCtx.settingSources ?? []
+
       let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
       let textPrompt: string | undefined
 
@@ -3653,7 +3661,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // blocks, with one breakpoint at the client's reusable prefix, lets
           // the next one read that prefix from cache instead of rewriting it.
           // One SDK input: several would be answered as several turns.
-          if (!isResume && independentCause === "auxiliary-request" && !promptCachingDisabled({ ...profileEnv, ...envOverrides })) {
+          if (!isResume && independentCause === "auxiliary-request" && !promptCachingDisabled({ ...profileEnv, ...envOverrides })
+            // Loaded settings files can set the same switch through their
+            // `env`, which only the CLI resolves; skip the breakpoint then.
+            && settingSources.length === 0) {
             const blocks = layoutReplayBlocks(replayMessages.map((m: { role: string; content: any }) => {
               if (m.role !== "assistant") return { role: m.role, parts: flattenUserContentParts(m.content, sanitizeOpts, toolIndex) }
               const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
@@ -3704,14 +3715,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
         return textPrompt!
       }
-
-      // SDK setting sources — controls CLAUDE.md and user settings loading.
-      const settingSources: import("@anthropic-ai/claude-agent-sdk").SettingSource[] =
-        envBool("LOAD_CONTEXT") || sdkFeatures.claudeMd === "full"
-          ? ["user", "project"]
-          : sdkFeatures.claudeMd === "project"
-            ? ["project"]
-            : pipelineCtx.settingSources ?? []
 
       // Passthrough tool_use capture. `capturedToolUses` holds the DISTINCT
       // tool calls to forward to the client; `capturedSignatures` dedupes them
