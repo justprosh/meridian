@@ -692,6 +692,26 @@ describe("SDK and Session concurrency coordination", () => {
     expect(capturedParams[1]?.options?.env?.FORCE_PROMPT_CACHING_5M).toBe("1")
   })
 
+  // The per-family switches are covered by promptCachingDisabled's own tests:
+  // the resolved model depends on the account the test run resolves.
+  it("adds no replay breakpoint when DISABLE_PROMPT_CACHING turns caching off", async () => {
+    const original = process.env.DISABLE_PROMPT_CACHING
+    process.env.DISABLE_PROMPT_CACHING = "1"
+    try {
+      const app = createProxyServer({ port: 0, host: "127.0.0.1", silent: true }).app
+      const sessionId = `progress-nocache-${crypto.randomUUID()}`
+      const captionP = app.fetch(claudeCodeCaptionRequest([
+        ...PROGRESS_WORK, { role: "assistant", content: "ok" }, { role: "user", content: PROGRESS_FIRST_PROMPT },
+      ], sessionId, "progress-agent"))
+      ;(await waitForControl(0)).release()
+      await (await captionP).text()
+      expect(typeof capturedParams[0]?.prompt).toBe("string")
+    } finally {
+      if (original === undefined) delete process.env.DISABLE_PROMPT_CACHING
+      else process.env.DISABLE_PROMPT_CACHING = original
+    }
+  })
+
   it("does not queue a progress summary behind its subagent's running turn", async () => {
     process.env.MERIDIAN_MAX_CONCURRENT = "2"
     resetProcessSdkSemaphoreForTests()
