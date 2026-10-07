@@ -696,7 +696,7 @@ describe("SDK and Session concurrency coordination", () => {
   // the resolved model depends on the account the test run resolves.
   it("adds no replay breakpoint when DISABLE_PROMPT_CACHING turns caching off", async () => {
     const original = process.env.DISABLE_PROMPT_CACHING
-    process.env.DISABLE_PROMPT_CACHING = "1"
+    process.env.DISABLE_PROMPT_CACHING = " true "
     try {
       const app = createProxyServer({ port: 0, host: "127.0.0.1", silent: true }).app
       const sessionId = `progress-nocache-${crypto.randomUUID()}`
