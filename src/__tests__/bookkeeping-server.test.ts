@@ -17,10 +17,14 @@ import { setSessionStoreDir, readSessionStoreSnapshot } from "../proxy/sessionSt
 
 let queries = 0
 let fault: "before" | "after" | "busy" | undefined
+// Another writer holds the database from this SDK query on, until released.
+let lockFromQuery: number | undefined
+let locked = false
 installSdkMock(() => ({
   query: (params: { options?: { sessionId?: string; resume?: string; includePartialMessages?: boolean } }) =>
     (async function* () {
       queries++
+      if (queries === lockFromQuery) locked = true
       if (params.options?.includePartialMessages) {
         for (const event of [messageStart(), textBlockStart(), textDelta(0, "ok"), blockStop(0), messageDelta(), messageStop()]) {
           yield withMockSdkSessionId(event, params.options)
@@ -54,7 +58,12 @@ beforeEach(async () => {
   setSessionStoreDir(directory)
   queries = 0
   fault = undefined
+  lockFromQuery = undefined
+  locked = false
   observer = initializeSessionBookkeeping(directory, { executeTransaction(db, sql) {
+    if (locked && sql === "BEGIN IMMEDIATE") {
+      throw Object.assign(new Error("injected concurrent writer"), { code: "SQLITE_BUSY" })
+    }
     if (sql === "COMMIT" && db.inTransaction && fault
       && Number((db.prepare("SELECT count(*) AS n FROM mappings").get() as { n: number }).n) > 0) {
       const requested = fault
@@ -84,11 +93,14 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-async function request(stream: boolean, key = `sql-client:${root}`) {
+const opening = [{ role: "user", content: "hello" }]
+const followUp = [...opening, { role: "assistant", content: "ok" }, { role: "user", content: "again" }]
+
+async function request(stream: boolean, key = `sql-client:${root}`, messages: unknown[] = opening) {
   if (!proxy) throw new Error("proxy missing")
   return proxy.app.fetch(new Request("http://localhost/v1/messages", {
     method: "POST", headers: { "content-type": "application/json", "x-opencode-session": key },
-    body: JSON.stringify({ model: "haiku", stream, messages: [{ role: "user", content: "hello" }] }),
+    body: JSON.stringify({ model: "haiku", stream, messages }),
   }))
 }
 
@@ -136,3 +148,38 @@ it.each(["before", "after", "busy"] as const)("streaming publication COMMIT %s r
     expect(observer.reader.get("SELECT state FROM resources")?.state).toBe("live")
   }
 })
+
+// Upstream defers a terminal lock error by invalidating the mapping instead.
+// In SQLite mode that invalidation waits on the same refused writer lock, and
+// a failed invalidation of a resumed mapping keeps the session turn fence, so
+// the conversation would hang on every retry. The refusal must stay retryable.
+it.each([false, true])("a resumed turn refused by a held writer lock leaves the conversation retryable (stream=%s)", async (stream) => {
+  const budget = { MERIDIAN_SESSION_GC_LOCK_WAIT_MS: "300", MERIDIAN_SESSION_LOCK_TIMEOUT_MS: "300" }
+  const previous = Object.fromEntries(Object.keys(budget).map(key => [key, process.env[key]]))
+  Object.assign(process.env, budget)
+  try {
+    const first = await request(stream)
+    expect(first.status, await first.text()).toBe(200)
+
+    lockFromQuery = queries + 1
+    const refused = await request(stream, undefined, followUp)
+    const refusedText = await refused.text()
+    expect(refusedText).toContain("overloaded_error")
+    expect(locked).toBe(true)
+    locked = false
+
+    const retry = await Promise.race([
+      request(stream, undefined, followUp).then(async response => ({ status: response.status, text: await response.text() })),
+      new Promise<undefined>(resolve => setTimeout(resolve, 5000)),
+    ])
+    expect(retry, "retry is still waiting on the session turn fence").toBeDefined()
+    expect(retry!.status, retry!.text).toBe(200)
+    expect(retry!.text).toContain("ok")
+    expect(retry!.text).not.toContain('"type":"error"')
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}, 20000)
