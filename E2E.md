@@ -8124,3 +8124,22 @@ The old-writer compatibility suite also accepts an optional pre-SQLite package:
 `BOOKKEEPING_COMPAT_TARBALL=/path/to/package.tgz bun test src/__tests__/bookkeeping-old-artifacts.test.ts`.
 It supplements the published baseline with the same writer/gate assertions;
 an unavailable optional artifact is reported explicitly, not counted as a pass.
+
+
+## Digest turn on a lifted passthrough budget (#1367)
+
+`bun scripts/e2e-deferred-digest-turn.mjs [--stream]` drives the real SDK and
+CLI through `startProxyServer` with an `api` profile pointed at a local fixture,
+so no subscription or model is involved. The request carries one `defer_loading`
+tool, which lifts the one-turn cap to 4. The fixture answers the first model
+request with a client `tool_use` and any later one with text; each kind of
+request reports its own digit of input usage.
+
+It asserts that the client receives exactly the forwarded `tool_use` with
+`stop_reason: "tool_use"`, that the CLI sends no model request after the
+forwarded batch, that neither the response nor `/telemetry/requests` counts a
+digest turn, and that the follow-up resumes the same SDK session at the tool
+checkpoint with the client's real `tool_result` and without the denial. Run it
+before any release touching `maxTurns`, the PreToolUse deny hook, or the
+early-stop checkpoint. It does not exercise ToolSearch discovery itself, and it
+proves the CLI's turn accounting, not a live model's behaviour.
