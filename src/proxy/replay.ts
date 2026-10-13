@@ -16,13 +16,22 @@ export function coalesceTrailingSystemReminders(messages: readonly ReplayMessage
   while (boundary >= 0 && messages[boundary]?.role === "system") boundary--
   if (boundary < 0 || boundary === messages.length - 1 || messages[boundary]?.role !== "user") return [...messages]
   const current = messages[boundary]!
-  const currentAndReminders = messages.slice(boundary)
+  // Metadata-only system messages (e.g. an effort `output_config` with no
+  // text) add nothing to the turn and would otherwise become empty text blocks.
+  const currentAndReminders = [current, ...messages.slice(boundary + 1).filter(message => !isBlankContent(message.content))]
   if (!currentAndReminders.every(message => typeof message.content === "string" || Array.isArray(message.content))) return [...messages]
   const content = currentAndReminders.every(message => typeof message.content === "string")
     ? currentAndReminders.map(message => message.content).join("\n\n")
     : currentAndReminders.flatMap(message => Array.isArray(message.content)
       ? message.content : [{ type: "text", text: message.content }])
   return [...messages.slice(0, boundary), { ...current, content }]
+}
+
+function isBlankContent(content: unknown): boolean {
+  if (content === undefined || content === null) return true
+  if (typeof content === "string") return content.trim() === ""
+  return Array.isArray(content) && content.every(block =>
+    record(block) && block.type === "text" && (typeof block.text !== "string" || block.text.trim() === ""))
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -136,6 +145,67 @@ export function frameStructuredReplay<T extends { message: { content: unknown } 
   // the complete replay atomically so the model cannot answer an earlier
   // fragment before the final client tool result has arrived.
   return coalesceStructuredUserMessages(framed)
+}
+
+/** One rendered piece of replay text, and whether the client put a cache
+ * breakpoint on the block it came from. */
+export interface ReplayPart {
+  text: string
+  clientMarked: boolean
+}
+
+export interface ReplayTextBlock {
+  type: "text"
+  text: string
+  cache_control?: { type: "ephemeral" }
+}
+
+/**
+ * Lay out a fresh replay as text blocks whose concatenation is exactly the
+ * string `frameReplayTurns` would produce for the same turns, with one cache
+ * breakpoint where the prefix is expected to recur.
+ *
+ * A single replay string cannot be cached across requests that share history
+ * but differ at the tail: the API writes cache entries only at breakpoints and
+ * looks them up at block boundaries. Separators lead each block, so a block
+ * never changes when later turns are appended.
+ *
+ * The breakpoint follows the client's own markers. History (everything up to
+ * the last assistant turn) never changes once sent, so its last client marker,
+ * or failing that its last block, is reusable. After the last assistant turn,
+ * Claude Code's permission classifier marks the item under review as well as
+ * the end of the transcript before it, and leaves the final instruction
+ * unmarked; the item changes on every call. So in that live section, when the
+ * client did not mark the final block, its last marker is taken as volatile
+ * and the marker before it is used. This holds whether the classifier sends
+ * its transcript as one message or as one message per entry. Without such a
+ * marker the history choice applies; without history no breakpoint is added
+ * and the caller keeps the plain replay. The final block always keeps the
+ * breakpoint the SDK adds itself.
+ */
+export function layoutReplayBlocks(turns: Array<{ role: string; parts: ReplayPart[] }>): ReplayTextBlock[] {
+  const nonEmpty = turns
+    .map(turn => ({ role: turn.role, parts: turn.parts.filter(part => part.text) }))
+    .filter(turn => turn.parts.length > 0)
+  const lastTurn = nonEmpty.length - 1
+  const framed = nonEmpty.length >= 2 && nonEmpty[lastTurn]!.role === "user"
+  const lastAssistant = nonEmpty.findLastIndex(turn => turn.role === "assistant")
+  const blocks: Array<ReplayTextBlock & { turn: number; clientMarked: boolean }> = []
+  nonEmpty.forEach((turn, index) => turn.parts.forEach((part, partIndex) => {
+    let lead = partIndex > 0 ? "\n" : index > 0 ? "\n\n" : ""
+    if (framed && partIndex === 0 && index === 0) lead = REPLAY_CONTEXT_OPEN
+    if (framed && partIndex === 0 && index === lastTurn) lead = REPLAY_CONTEXT_CLOSE
+    blocks.push({ type: "text", text: lead + part.text, turn: index, clientMarked: part.clientMarked })
+  }))
+  const lastBlock = blocks.length - 1
+  const liveMarked = blocks.flatMap((block, index) =>
+    block.turn > lastAssistant && block.clientMarked && index < lastBlock ? [index] : [])
+  const live = blocks[lastBlock]?.clientMarked ? liveMarked.at(-1) : liveMarked.at(-2)
+  const history = blocks.findLastIndex(block => block.turn <= lastAssistant && block.clientMarked)
+  const historyEnd = blocks.findLastIndex(block => block.turn <= lastAssistant)
+  const marker = live ?? (history >= 0 ? history : historyEnd)
+  return blocks.map(({ turn: _turn, clientMarked: _marked, ...block }, index) =>
+    index === marker && index < lastBlock ? { ...block, cache_control: { type: "ephemeral" as const } } : block)
 }
 
 /** Keep completed calls as context, including their exact identity and input.
