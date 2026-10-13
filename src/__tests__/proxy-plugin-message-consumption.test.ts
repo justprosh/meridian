@@ -9,7 +9,7 @@ import { assistantMessage, messageStart, textBlockStart, textDelta, blockStop, m
 import * as models from "../proxy/models"
 
 type Message = { role: string; content: string | Array<Record<string, unknown>> }
-type Input = { prompt: string | AsyncIterable<{ message: { content: unknown } }>; options?: { sessionId?: string; resume?: string; resumeSessionAt?: string; model?: string; mcpServers?: Record<string, unknown> } }
+type Input = { prompt: string | AsyncIterable<{ message: { content: unknown } }>; options?: { sessionId?: string; resume?: string; resumeSessionAt?: string; model?: string; env?: Record<string, string | undefined>; mcpServers?: Record<string, unknown> } }
 let calls: Array<{ payload: unknown[]; options: Input["options"] }> = []
 let overrides: Array<{ mockRestore(): void }> = []
 let failures: string[] = []
@@ -97,7 +97,7 @@ async function post(app: Awaited<ReturnType<typeof appWithPlugin>>, messages: Me
     body: JSON.stringify({ model: "sonnet", stream, system, messages, ...(tools ? { tools } : {}) }),
   }))
   if (!allowFailure) expect(response.status).toBe(200)
-  const output = await response.text()
+  const output = await response.clone().text()
   if (stream && !allowFailure) expect(output).toContain("event: message_stop")
   expect(JSON.stringify(messages)).toBe(before)
   return response
@@ -274,16 +274,38 @@ describe("documented plugin message transforms at SDK ingress", () => {
       expect(capturedText(0)).toContain("replacement question EXECUTION_TRANSFORM_APPLIED")
     })
 
-    it(`overflow retries retain the transformed replay source (stream=${stream})`, async () => {
+    for (const [tier, pin, chunkSize] of [["legacy-200k", "claude-sonnet-4-6", 60_000], ["native-1m", "claude-sonnet-5-5", 240_000]] as const) {
+      it(`overflow retries retain the transformed replay source (stream=${stream}, tier=${tier})`, async () => {
+        overrides.push(spyOn(models, "resolveSdkModelDefaults").mockReturnValue({ ...models.resolveSdkModelDefaults({}), ANTHROPIC_DEFAULT_SONNET_MODEL: pin }))
+        const app = await appWithPlugin()
+        failures = ["Claude Code returned an error result: Prompt is too long"]
+        // Each fixture exceeds its tier's replay budget; halving that budget
+        // can therefore drop more history instead of retrying an unchanged prompt.
+        const history: Message[] = [{ role: "user", content: "REMOVE_FROM_EXECUTION first poll" }, { role: "user", content: "objective" }, ...Array.from({ length: 8 }, (_, index) => [{ role: "user", content: `context ${index}` }, { role: "assistant", content: "я".repeat(chunkSize) }]).flat(), { role: "user", content: "live question" }]
+        await post(app, history, "modify", stream, `fixture-overflow-${tier}`)
+        expect(calls).toHaveLength(2)
+        expect(capturedText(0)).toContain("context 7")
+        expect(capturedText(1).length).toBeLessThan(capturedText(0).length)
+        for (let index = 0; index < calls.length; index++) {
+          expect(calls[index]?.options?.env?.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(pin)
+          expect(capturedText(index)).not.toContain("REMOVE_FROM_EXECUTION")
+          expect(capturedText(index)).toContain("live question EXECUTION_TRANSFORM_APPLIED")
+        }
+      })
+    }
+
+    it(`native-1m overflow does not retry unchanged transformed history (stream=${stream})`, async () => {
+      overrides.push(spyOn(models, "resolveSdkModelDefaults").mockReturnValue({ ...models.resolveSdkModelDefaults({}), ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5-5" }))
       const app = await appWithPlugin()
       failures = ["Claude Code returned an error result: Prompt is too long"]
       const history: Message[] = [{ role: "user", content: "REMOVE_FROM_EXECUTION first poll" }, { role: "user", content: "objective" }, ...Array.from({ length: 8 }, (_, index) => [{ role: "user", content: `context ${index}` }, { role: "assistant", content: "я".repeat(60_000) }]).flat(), { role: "user", content: "live question" }]
-      await post(app, history, "modify", stream, "fixture-overflow")
-      expect(calls).toHaveLength(2)
-      for (let index = 0; index < calls.length; index++) {
-        expect(capturedText(index)).not.toContain("REMOVE_FROM_EXECUTION")
-        expect(capturedText(index)).toContain("live question EXECUTION_TRANSFORM_APPLIED")
-      }
+      const response = await post(app, history, "modify", stream, "fixture-overflow-unchanged", true)
+      if (!stream) expect(response.status).toBe(400)
+      else expect(await response.text()).toContain("Prompt exceeds the model's context window")
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.options?.env?.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5-5")
+      expect(capturedText(0)).not.toContain("REMOVE_FROM_EXECUTION")
+      expect(capturedText(0)).toContain("live question EXECUTION_TRANSFORM_APPLIED")
     })
 
     it(`model fallback retains the transformed replay source (stream=${stream})`, async () => {

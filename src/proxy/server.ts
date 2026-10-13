@@ -2435,6 +2435,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
         // Overlay profile-specific env vars (e.g. CLAUDE_CONFIG_DIR for multi-account)
         const profileEnv = { ...sdkModelDefaults, ...cleanEnv, ...profile.env }
+        // The Sonnet the SDK will actually serve (query.ts spreads the explicit
+        // pin last). Plain `sonnet` on Sonnet 5+ has a native 1M window, so the
+        // replay budget must not assume 200k from the alias alone (#1212).
+        const resolvedSonnetModel = envOverrides?.ANTHROPIC_DEFAULT_SONNET_MODEL ?? profileEnv.ANTHROPIC_DEFAULT_SONNET_MODEL
         const resolvedHaikuModel = () => model === "haiku"
           ? envOverrides?.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? profileEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL
           : undefined
@@ -3343,7 +3347,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const freshReplay = !isResume && !resumeSessionId
       // Client usage describes its resumed context, not the fresh transcript;
       // derive replay capacity from the actual SDK model's window instead.
-      const modelReplayBudget = () => replayBudgetFor(model, resolvedHaikuModel())
+      const modelReplayBudget = () => replayBudgetFor(model, model === "sonnet" ? resolvedSonnetModel : resolvedHaikuModel())
       let currentReplayBudget = modelReplayBudget()
       let replayTrimRetries = 0
       let replayOmittedMessages = 0

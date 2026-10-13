@@ -1,4 +1,4 @@
-import { CANONICAL_HAIKU_MODEL, hasExtendedContext, type ClaudeModel } from "./models"
+import { CANONICAL_HAIKU_MODEL, hasExtendedContext, sonnetHasNative1mContext, type ClaudeModel } from "./models"
 
 /** Approximate replay estimate: overestimates Cyrillic-like scripts, but can
  * underestimate CJK, base64, and multi-page documents. Reactive overflow
@@ -23,13 +23,15 @@ export function estimateTokens(content: unknown): number {
 }
 
 /** resolvedModel is the effective SDK tier pin, including profile/shell and
- * per-request overrides. Haiku 5.5's 1M window is native, not a [1m] beta. */
+ * per-request overrides. Haiku 5.5's 1M window is native, not a [1m] beta, and
+ * plain `sonnet` on Sonnet 5+ already runs with a 1M window (#1212). */
 export function contextWindowFor(
   model: string,
   resolvedModel = model === "haiku" ? CANONICAL_HAIKU_MODEL : model,
 ): number {
   if (resolvedModel === "claude-haiku-5-5") return 1_000_000
-  return hasExtendedContext(model as ClaudeModel) ? 1_000_000 : 200_000
+  if (hasExtendedContext(model as ClaudeModel)) return 1_000_000
+  return model === "sonnet" && sonnetHasNative1mContext(resolvedModel) ? 1_000_000 : 200_000
 }
 
 // Leave space for system instructions, tool schemas, and the generated answer.
