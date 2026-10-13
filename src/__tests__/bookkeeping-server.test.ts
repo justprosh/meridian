@@ -105,7 +105,7 @@ it.each([false, true])("publishes a production SQL request without JSON (stream=
   expect(existsSync(join(directory, "session-gc.json"))).toBe(false)
 })
 
-it.each(["before", "after", "busy"] as const)("fails closed on publication COMMIT %s", async (failure) => {
+it.each(["before", "after"] as const)("fails closed on publication COMMIT %s", async (failure) => {
   fault = failure
   const response = await request(false)
   const text = await response.text()
@@ -122,7 +122,20 @@ it.each(["before", "after", "busy"] as const)("fails closed on publication COMMI
   expect(existsSync(join(directory, "sessions.json"))).toBe(false)
 })
 
-it.each(["before", "after", "busy"] as const)("streaming publication COMMIT %s remains typed and preserves uncertain authority", async (failure) => {
+// A busy COMMIT rolls back before anything is durable: the answered turn is
+// delivered and its mapping invalidated, so the next turn replays.
+it.each([false, true])("delivers the answer and drops the mapping on publication COMMIT busy (stream=%s)", async (stream) => {
+  fault = "busy"
+  const response = await request(stream)
+  const text = await response.text()
+  expect(response.status, text).toBe(200)
+  expect(text).toContain("ok")
+  expect(text).not.toContain('"type":"error"')
+  expect(fault).toBeUndefined()
+  await proxy?.sweepSessionGc?.()
+  expect(Object.keys(readSessionStoreSnapshot())).toHaveLength(0)
+})
+it.each(["before", "after"] as const)("streaming publication COMMIT %s remains typed and preserves uncertain authority", async (failure) => {
   fault = failure
   const response = await request(true)
   const text = await response.text()
