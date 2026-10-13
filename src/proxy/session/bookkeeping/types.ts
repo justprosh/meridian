@@ -49,6 +49,8 @@ export interface StoredSession {
   messageCount: number
   /** Hash of messages[0..messageCount-1] for conversation lineage verification. */
   lineageHash?: string
+  /** Raw client proof when lineageHash cannot certify the SDK execution prefix. */
+  clientLineageHash?: string
   /** Per-message content hashes for precise diff-based compaction detection. */
   messageHashes?: string[]
   /** Per-message hashes of individual content blocks for append-only tool results. */

@@ -976,7 +976,7 @@ export function storeSharedSession(
   const backend = activeStoreBackend()
   if (backend) return backend.storeSharedSession(getSessionStoreDir(), key, claudeSessionId, messageCount,
     lineageHash, messageHashes, sdkMessageUuids, contextUsage, messageBlockHashes, passthroughToolCallAssistantUuid,
-    passthroughToolCallIds, currentTranscript, sourceTranscript, expectedGeneration)
+    passthroughToolCallIds, currentTranscript, sourceTranscript, expectedGeneration, clientLineageHash)
   if (currentTranscript !== undefined) {
     validateTranscriptLocator(currentTranscript, claudeSessionId)
   }

@@ -38,6 +38,8 @@ function validateEntry(entry: StoredSession): void {
   for (const key of ["createdAt", "lastUsedAt", "messageCount"] as const) {
     if (!Number.isSafeInteger(entry[key]) || entry[key] < 0) throw new TypeError(`invalid mapping ${key}`)
   }
+  if (entry.clientLineageHash !== undefined && typeof entry.clientLineageHash !== "string")
+    throw new TypeError("invalid clientLineageHash")
   for (const field of ["messageHashes", "passthroughToolCallIds"] as const) {
     if (
       entry[field] !== undefined &&
@@ -108,6 +110,7 @@ export function writeMappingRow(
   const history = legacy
     ? entry
     : {
+        clientLineageHash: entry.clientLineageHash,
         messageHashes: entry.messageHashes,
         messageBlockHashes: entry.messageBlockHashes,
         sdkMessageUuids: entry.sdkMessageUuids,
@@ -171,7 +174,8 @@ export function readMapping(reader: BookkeepingReader, key: string): StoredSessi
   const payload = JSON.parse(String(history.history_json)) as Record<string, unknown>
   if (
     Object.keys(payload).some(
-      (key) => !["messageHashes", "messageBlockHashes", "sdkMessageUuids", "passthroughResumeUuid"].includes(key),
+      (key) => !["clientLineageHash", "messageHashes", "messageBlockHashes", "sdkMessageUuids",
+        "passthroughResumeUuid"].includes(key),
     )
   )
     throw new Error("unexpected mapping history field")

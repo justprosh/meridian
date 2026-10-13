@@ -56,7 +56,8 @@ function pruneRoutes(tx: BookkeepingTransaction, route: string): boolean {
 
 export function storeSharedSessionAndPriorityAssignment(directory: string,
   options: SharedSessionAndPriorityAssignmentOptions): SharedSessionAndPriorityAssignmentResult | false {
-  checkParameters([options.key, options.claudeSessionId, options.lineageHash, options.expectedMappingGeneration,
+  checkParameters([options.key, options.claudeSessionId, options.lineageHash, options.clientLineageHash ?? null,
+    options.expectedMappingGeneration,
     options.rollbackMappingKey ?? null, options.attemptOwnerToken ?? null, options.priority.routeKey,
     options.priority.profileId, options.priority.lastHumanTurnDigest, options.priority.expectedAssignmentGeneration])
   validate(options)
@@ -82,7 +83,8 @@ export function storeSharedSessionAndPriorityAssignment(directory: string,
     const stored: CanonicalStoredSession = {
       claudeSessionId: options.claudeSessionId, revision: (existing?.revision ?? 0) + 1,
       generationId: randomUUID(), createdAt: existing?.createdAt || Date.now(), lastUsedAt: Date.now(),
-      messageCount: options.messageCount, lineageHash: options.lineageHash, messageHashes: options.messageHashes,
+      messageCount: options.messageCount, lineageHash: options.lineageHash,
+      clientLineageHash: options.clientLineageHash, messageHashes: options.messageHashes,
       messageBlockHashes: options.messageBlockHashes, sdkMessageUuids: options.sdkMessageUuids,
       passthroughToolCallAssistantUuid: options.passthroughToolCallAssistantUuid ?? undefined,
       passthroughToolCallIds: options.passthroughToolCallIds ?? undefined, contextUsage: options.contextUsage,

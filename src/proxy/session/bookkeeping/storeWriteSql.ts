@@ -12,8 +12,8 @@ import type { CanonicalStoredSession } from "./types"
 export function storeSharedSession(directory: string, ...args: StoreSessionArguments): string | false {
   const [key, claudeSessionId, messageCount, lineageHash, messageHashes, sdkMessageUuids, contextUsage,
     messageBlockHashes, passthroughToolCallAssistantUuid, passthroughToolCallIds, current, source,
-    expectedGeneration] = args
-  checkParameters([key, claudeSessionId, lineageHash ?? null,
+    expectedGeneration, clientLineageHash] = args
+  checkParameters([key, claudeSessionId, lineageHash ?? null, clientLineageHash ?? null,
     passthroughToolCallAssistantUuid ?? null, expectedGeneration ?? null])
   const currentTranscript = prepareStoreLocator(directory, current, claudeSessionId)
   const sourceTranscript = prepareStoreLocator(directory, source, undefined, "sourceTranscript")
@@ -35,6 +35,8 @@ export function storeSharedSession(directory: string, ...args: StoreSessionArgum
       createdAt: existing?.createdAt || Date.now(), lastUsedAt: Date.now(),
       messageCount: messageCount ?? existing?.messageCount ?? 0,
       lineageHash: lineageHash ?? existing?.lineageHash,
+      clientLineageHash: clientLineageHash === undefined
+        ? existing?.clientLineageHash : clientLineageHash ?? undefined,
       messageHashes: messageHashes ?? existing?.messageHashes,
       messageBlockHashes: messageBlockHashes ?? existing?.messageBlockHashes,
       sdkMessageUuids: sdkMessageUuids ?? existing?.sdkMessageUuids,
