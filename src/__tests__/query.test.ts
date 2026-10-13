@@ -320,6 +320,60 @@ describe("buildQueryOptions", () => {
     expect(result.options.maxTurns).toBe(200)
   })
 
+  describe("forwarded-batch stop on a lifted budget", () => {
+    const isForwardedToolUse = (id: string) => id === "toolu_client"
+    const postToolBatch = (result: ReturnType<typeof buildQueryOptions>) =>
+      (result.options as any).hooks?.PostToolBatch as Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }> | undefined
+
+    it("ends a deferred-tools query after the batch forwarded to the client", async () => {
+      const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true, isForwardedToolUse }))
+      expect(result.options.maxTurns).toBe(4)
+      const hooks = postToolBatch(result)
+      expect(hooks).toHaveLength(1)
+      const hook = hooks![0]!.hooks[0]!
+      expect(await hook({ tool_calls: [{ tool_name: "mcp__oc__read", tool_use_id: "toolu_client" }] }))
+        .toMatchObject({ continue: false })
+      expect(await hook({ tool_calls: [{ tool_name: "ToolSearch", tool_use_id: "toolu_search" }] })).toEqual({})
+    })
+
+    it("keeps the caller's own hooks alongside the stop", () => {
+      const own = { matcher: "", hooks: [async () => ({})] }
+      const sdkHooks = { PreToolUse: [own], PostToolBatch: [own] }
+      const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true, isForwardedToolUse, sdkHooks }))
+      expect((result.options as any).hooks.PreToolUse).toEqual([own])
+      expect(postToolBatch(result)).toHaveLength(2)
+      expect(postToolBatch(result)![0]).toBe(own)
+    })
+
+    it("leaves the one-turn cap alone — its error_max_turns result is the expected terminal shape", () => {
+      const sdkHooks = { PreToolUse: [] }
+      const result = buildQueryOptions(makeContext({ passthrough: true, isForwardedToolUse, sdkHooks }))
+      expect(result.options.maxTurns).toBe(1)
+      expect((result.options as any).hooks).toBe(sdkHooks)
+    })
+
+    it("stays off under the early-stop kill switch", () => {
+      const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true, earlyStop: false, isForwardedToolUse }))
+      expect(postToolBatch(result)).toBeUndefined()
+    })
+
+    it("stays off outside passthrough", () => {
+      const result = buildQueryOptions(makeContext({ isForwardedToolUse }))
+      expect(postToolBatch(result)).toBeUndefined()
+    })
+
+    it("stays off with structured output — its answer is a StructuredOutput call after the denial", () => {
+      const result = buildQueryOptions(makeContext({
+        passthrough: true,
+        hasDeferredTools: true,
+        isForwardedToolUse,
+        outputFormat: { type: "json_schema", schema: { type: "object" } } as any,
+      }))
+      expect(result.options.maxTurns).toBe(4)
+      expect(postToolBatch(result)).toBeUndefined()
+    })
+  })
+
   it("includes system prompt as preset in normal mode", () => {
     const result = buildQueryOptions(makeContext({ systemContext: "Be helpful" }))
     const sp = (result.options as any).systemPrompt

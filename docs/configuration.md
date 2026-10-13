@@ -39,7 +39,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_PRIORITY_FAILBACK` | — | `new-conversation` | Priority failback policy: `new-conversation` (current behavior) or `next-user-turn`. Environment value overrides `priorityFailback` in the settings JSON. Applies only to priority routing and OpenCode turn metadata; other adapters retain `new-conversation` behavior. |
 | `MERIDIAN_FOLLOW_ACTIVE` | `CLAUDE_PROXY_FOLLOW_ACTIVE` | unset | Base URL of another Meridian instance to take the active profile from, e.g. `http://127.0.0.1:3456`. For a development instance running beside a primary one — see [Following another instance's active profile](#following-another-instances-active-profile). |
 | `MERIDIAN_PASSTHROUGH_EARLY_STOP` | — | `1` | Set to `0` to disable [digest-turn elimination](#how-tool-calling-works-in-passthrough) and restore the old end-of-turn behavior |
-| `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. **Setting this opts out of [digest-turn elimination](#how-tool-calling-works-in-passthrough)** — an explicit value always wins over the cap, so a turn budget set to work around an older issue keeps paying for the discarded digest turn. Unset it unless you still need it. |
+| `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. An explicit value always wins over the one-turn cap; a budget above one turn still stops after a batch forwarded to the client (see [digest-turn elimination](#how-tool-calling-works-in-passthrough)), so the pin only adds headroom before the tool boundary. Unset it unless you still need it. |
 | `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, a capped turn with complete client-declared tool calls is returned as `tool_use` when every call has an ID-matched CLI `No such tool available` result; the rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow the experimental uncaptured abort-window recovery without an explicit dispatch rejection (no live positive gate yet). Set to `0` to disable both recoveries. Non-streaming responses are unaffected. The confirmed-rejection recovery applies at any turn budget, including the deferred-tools budget; the abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. |
 | `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction, unless the deadline itself ran late because the event loop was blocked. An answered turn whose terminal publication meets any of these errors is still delivered; its next turn replays history. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
 | `MERIDIAN_SESSION_PROFILE_COPY_PRUNE` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE` | `0` | Opt in to removing stale cross-profile session mappings during GC. Off preserves native resume history. Returning to a pruned profile uses flattened, context-trimmed replay, which cannot restore SDK thinking. |
@@ -1104,14 +1104,17 @@ Measured against the live SDK (sonnet, one tool call), capped vs. uncapped: **66
 
 The cap is lifted for the cases that genuinely need the SDK to keep going — deferred tools (ToolSearch discovery is a real round-trip), a configured advisor, and structured output — and an explicit `MERIDIAN_PASSTHROUGH_MAX_TURNS` always wins. Kill switch: `MERIDIAN_PASSTHROUGH_EARLY_STOP=0` restores the uncapped multi-turn behavior.
 
+A lifted budget still stops at the tool boundary. Deferred tools and an advisor need turns *before* the client tool call, not after it, so whenever the budget is above one turn Meridian adds a `PostToolBatch` hook: once a batch holding a call forwarded to the client has resolved, the hook returns `continue: false` and the CLI ends the turn without another model request. The turn ends on a normal `success` result, so the transcript is committed at the tool boundary exactly as under the cap. The stop counts only calls Meridian captured for the client. A batch made only of other calls continues: SDK-internal ones (ToolSearch), a bare tool name the CLI refused, a repeat the hook dropped — so the CLI-refusal recovery (`MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY`) still runs to `error_max_turns`. Not covered: the one-turn cap, where `error_max_turns` is the expected terminal shape; structured output, whose answer is a StructuredOutput call that can only come after the denial; and the kill switch, which removes the stop along with the cap.
+
 > **Upgrade note.** If you previously set `MERIDIAN_PASSTHROUGH_MAX_TURNS` — most
-> likely to give deep orchestration chains more headroom (#494) — you will not
-> get this saving: an explicit budget wins over the cap by design, so every tool
-> call still pays for a digest turn. Try unsetting it. The reason the override
+> likely to give deep orchestration chains more headroom (#494) — an explicit
+> budget still wins over the cap by design. A budget above one turn no longer
+> pays for a digest turn: it gets the `PostToolBatch` stop described above, so
+> the pin only adds headroom before the tool boundary. The reason the override
 > was needed is largely gone: it existed because wide parallel tool calls could
-> exhaust the budget, and under the cap the SDK stops at the tool boundary
-> instead of competing for turns with its own internal loop. If unsetting it
-> causes trouble, that is worth an issue rather than a permanent pin.
+> exhaust the budget, and the SDK now stops at the tool boundary instead of
+> competing for turns with its own internal loop. If unsetting it causes
+> trouble, that is worth an issue rather than a permanent pin.
 >
 > Two other behaviours change with the cap, both deliberate. A passthrough tool
 > turn now ends on the SDK's `max_turns` result rather than a clean `success` —

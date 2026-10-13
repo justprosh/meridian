@@ -27,6 +27,8 @@ let capturedQueryParamsAll: any[] = []
 let mockTerminalError: Error | undefined
 let mockBeforeTerminalError: (() => void) | undefined
 let mockLogObserver: ((event: string) => void) | undefined
+/** What each PostToolBatch hook returned for a `test_post_tool_batch` step. */
+let postToolBatchResults: Array<{ ids: string[]; result: unknown }> = []
 /**
  * Per-attempt SDK scripts, consumed one per `query()` call. Retry paths need
  * the second attempt to behave differently from the first; without this every
@@ -55,6 +57,17 @@ installSdkMock(() => ({
       const explicitlyHookedIds = new Set<string>()
       for (const msg of script ? script.messages : mockMessages) {
         yieldedCount++
+        if (msg?.type === "test_post_tool_batch") {
+          const toolCalls = msg.tool_use_ids.map((id: string) => ({ tool_name: "read", tool_input: {}, tool_use_id: id }))
+          for (const matcher of params?.options?.hooks?.PostToolBatch ?? []) {
+            for (const hook of matcher.hooks) {
+              const result = await hook({ hook_event_name: "PostToolBatch", tool_calls: toolCalls }, undefined,
+                { signal: new AbortController().signal })
+              postToolBatchResults.push({ ids: msg.tool_use_ids, result })
+            }
+          }
+          continue
+        }
         if (msg?.type === "test_pre_tool_hook") {
           explicitlyHookedIds.add(msg.tool_use_id)
           if (preHook) {
@@ -263,6 +276,7 @@ describe("Integration: passthrough early stop", () => {
     mockTerminalError = undefined
     mockBeforeTerminalError = undefined
     mockLogObserver = undefined
+    postToolBatchResults = []
     mockAttemptScripts = []
     forkSessionSequence = 0
     mockBaseSessionId = `test-session-${crypto.randomUUID()}`
@@ -1199,6 +1213,39 @@ describe("Integration: passthrough early stop", () => {
     expect(body.content[0].text).toBe("just an answer")
     expect(yieldedCount).toBe(1) // fully consumed (only 1 message)
     expect(capturedQueryParams.options.abortController?.signal?.aborted ?? false).toBe(false)
+  })
+
+  it("non-stream: a lifted budget stops after the batch holding a call captured for the client, not a dropped repeat (#1367)", async () => {
+    mockMessages = [
+      messageStart("msg_ns_forwarded_batch"),
+      toolUseBlockStart(0, "read", "fb-1"),
+      inputJsonDelta(0, '{"file_path":"a"}'),
+      blockStop(0),
+      messageDelta("tool_use"),
+      { type: "test_pre_tool_hook", tool_name: "read", tool_use_id: "fb-1", tool_input: { file_path: "a" } },
+      // The same call under a fresh id is an exact repeat: denied, not forwarded.
+      { type: "test_pre_tool_hook", tool_name: "read", tool_use_id: "fb-repeat", tool_input: { file_path: "a" } },
+      { type: "test_post_tool_batch", tool_use_ids: ["fb-repeat"] },
+      { type: "test_post_tool_batch", tool_use_ids: ["fb-1"] },
+      assistantMessage([{ type: "tool_use", id: "fb-1", name: "read", input: { file_path: "a" } }]),
+      userDenyMessage("fb-1"),
+    ]
+
+    const res = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL, { name: "aux", description: "Deferred fixture tool", input_schema: { type: "object", properties: {} }, defer_loading: true }],
+      messages: [{ role: "user", content: "read a" }],
+    }, "es-forwarded-batch")
+    expect(res.status).toBe(200)
+    expect(capturedQueryParams.options.maxTurns).toBe(4)
+    expect(postToolBatchResults).toEqual([
+      { ids: ["fb-repeat"], result: {} },
+      { ids: ["fb-1"], result: { continue: false, stopReason: expect.any(String) } },
+    ])
+    const body = await res.json() as { content: Array<{ type: string; id?: string }> }
+    expect(body.content.filter((block) => block.type === "tool_use").map((block) => block.id)).toEqual(["fb-1"])
   })
 
   it("kill switch restores the legacy full drain", async () => {
