@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
+import { legacyStoreOnly, setupStoreBackend, sqliteStoreTest, teardownStoreBackend } from "./fixtures/bookkeeping-store-backend"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -23,8 +24,10 @@ describe("durable raw proof and execution reuse proof", () => {
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), "meridian-execution-proof-"))
     setSessionStoreDir(directory)
+    setupStoreBackend(directory)
   })
   afterEach(() => {
+    teardownStoreBackend()
     setSessionStoreDir(null)
     rmSync(directory, { recursive: true, force: true })
   })
@@ -43,15 +46,19 @@ describe("durable raw proof and execution reuse proof", () => {
     setSessionStoreDir(null)
     setSessionStoreDir(directory)
     expect(lookupSession("ordinary", continuation).type).toBe("continuation")
-    const serialized = JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8"))
-    expect(serialized.ordinary.clientLineageHash).toBe(computeLineageHash(messages))
-    expect(serialized.ordinary.lineageHash).toBe("")
+    if (!sqliteStoreTest) {
+      const serialized = JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8"))
+      expect(serialized.ordinary.clientLineageHash).toBe(computeLineageHash(messages))
+      expect(serialized.ordinary.lineageHash).toBe("")
+    }
 
     expect(storeSession("ordinary", continuation, "sdk-full-replay")).not.toBe(false)
     const restored = lookupSharedSession("ordinary")
     expect(restored?.lineageHash).toBe(computeLineageHash(continuation))
     expect(restored?.clientLineageHash).toBeUndefined()
-    expect(JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8")).ordinary.clientLineageHash).toBeUndefined()
+    if (!sqliteStoreTest) {
+      expect(JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8")).ordinary.clientLineageHash).toBeUndefined()
+    }
   })
 
   it("priority atomic publication, reload and rollback retain distinct proofs", () => {
@@ -89,7 +96,7 @@ describe("durable raw proof and execution reuse proof", () => {
     expect(stored?.passthroughToolCallIds).toBeUndefined()
   })
 
-  it("fails closed on malformed persisted raw proof rather than granting SDK resume", () => {
+  legacyStoreOnly("fails closed on malformed persisted raw proof rather than granting SDK resume", () => {
     storeSession("malformed", messages, "sdk-malformed", undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, false)
     const file = join(directory, "sessions.json")
