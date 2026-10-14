@@ -4005,10 +4005,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       let passthroughMcp: ReturnType<typeof createPassthroughMcpServer> | undefined
       if (passthrough && requestTools.length > 0) {
         const toolSetKey = computeToolSetKey(requestTools)
-        // An SDK MCP server instance serves one query at a time; a second
-        // query connecting it fails and runs without the client's tools. An
-        // auxiliary request runs beside the working turn, so it gets its own
-        // server and leaves the session's cache to the working turns.
+        // An auxiliary request runs beside the working turn and may carry a
+        // different tool set, so it neither reads nor replaces the session's
+        // cached tool definitions and never sets its defer pin; both stay
+        // with the working turns.
         const mcpCacheKey = independentCause === "auxiliary-request" ? undefined : profileSessionId
         const cachedMcp = mcpCacheKey ? sessionMcpCache.get(mcpCacheKey) : undefined
         const coreNamesForDefer = pipelineCtx.coreToolNames ? [...pipelineCtx.coreToolNames] : undefined
