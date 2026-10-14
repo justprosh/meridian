@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { computeToolSetKey } from "../proxy/passthroughTools"
+import { computeToolSetKey, describeToolSetDelta } from "../proxy/passthroughTools"
 
 describe("computeToolSetKey", () => {
   it("is stable across input ordering", () => {
@@ -62,5 +62,38 @@ describe("computeToolSetKey", () => {
     const a = computeToolSetKey([{ name: "read" }])
     const b = computeToolSetKey([{ name: "read", input_schema: null as any }])
     expect(a).toBe(b)
+  })
+})
+
+describe("describeToolSetDelta", () => {
+  it("names the tools a client added mid-conversation", () => {
+    const line = describeToolSetDelta(["bash", "read"], ["bash", "grep", "read", "write"])
+    expect(line).toBe("count=2->4 added=[grep,write]")
+  })
+
+  it("names the tools a client dropped", () => {
+    const line = describeToolSetDelta(["bash", "grep", "read"], ["bash", "read"])
+    expect(line).toBe("count=3->2 removed=[grep]")
+  })
+
+  it("reports both directions when a set is swapped wholesale", () => {
+    // The shape a subagent used to produce under its parent's session key.
+    const line = describeToolSetDelta(["a", "b"], ["c", "d"])
+    expect(line).toContain("added=[c,d]")
+    expect(line).toContain("removed=[a,b]")
+  })
+
+  it("calls an identical name list a schema-only change", () => {
+    // The key already differed or this would not be logged at all, so silence
+    // here would read as "nothing changed" — the one reading that is wrong.
+    expect(describeToolSetDelta(["read"], ["read"])).toBe("count=1->1 schema-only")
+  })
+
+  it("counts the tail instead of printing an unbounded list", () => {
+    const after = Array.from({ length: 20 }, (_, i) => `tool_${String(i).padStart(2, "0")}`)
+    const line = describeToolSetDelta([], after)
+    expect(line).toContain("count=0->20")
+    expect(line).toContain("tool_11,+8]")
+    expect(line).not.toContain("tool_12")
   })
 })
