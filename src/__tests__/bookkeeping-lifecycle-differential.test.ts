@@ -21,6 +21,12 @@ it("compares lifecycle results, errors and observed ledger after every JSON/SQLi
   const capture = spyOn(incarnation, "captureProcessIncarnation").mockReturnValue(owner)
   const probe = spyOn(incarnation, "processIncarnationIsDead").mockImplementation(() => dead)
   let handle: ReturnType<typeof initializeSessionBookkeeping> | undefined
+  const pendingDeletes: Array<{ promise: Promise<void>; release: () => void }> = []
+  const joinPendingDeletes = async () => {
+    const pending = pendingDeletes.splice(0)
+    for (const deletion of pending) deletion.release()
+    await Promise.all(pending.map(deletion => deletion.promise))
+  }
   const execute = async (sqlite: boolean) => {
     step = 0; now = 1000; dead = false
     const results: unknown[] = []
@@ -85,15 +91,19 @@ it("compares lifecycle results, errors and observed ledger after every JSON/SQLi
       const target = await run(`${kind} prepare`, () => lifecycle.prepareFork(locator(kind), options))
       await run(`${kind} abandon`, () => lifecycle.abandonFork(target, options))
       const result = await run(`${kind} GC`, () => lifecycle.runGc(store.readSessionTranscriptPins(), {
-        ...options, deletionTimeoutMs: 10, runTimeoutMs: 1000, deleter: async () => {
-          if (kind === "notFound") throw new Error("Session notFound not found")
-          if (kind === "failure") throw new Error("deletion failed")
-          await new Promise(() => {})
+        ...options, deletionTimeoutMs: 10, runTimeoutMs: 1000, deleter: () => {
+          if (kind === "notFound") return Promise.reject(new Error("Session notFound not found"))
+          if (kind === "failure") return Promise.reject(new Error("deletion failed"))
+          let release!: () => void
+          const promise = new Promise<void>(resolve => { release = resolve })
+          pendingDeletes.push({ promise, release })
+          return promise
         },
       }))
       expect(result).toEqual(kind === "notFound" ? { deleted: 0, notFound: 1, failed: 0, deferred: 0 }
         : kind === "failure" ? { deleted: 0, notFound: 0, failed: 1, deferred: 1 }
-          : { deleted: 0, notFound: 0, failed: 0, deferred: 3 })
+          // The failed resource and hung resource each count once.
+          : { deleted: 0, notFound: 0, failed: 0, deferred: 2 })
     }
     await run("hung fence reconcile", () => lifecycle.reconcile(store.readSessionTranscriptPins(), options))
     await run("hung fence repeated GC", () => lifecycle.runGc(store.readSessionTranscriptPins(), {
@@ -117,16 +127,19 @@ it("compares lifecycle results, errors and observed ledger after every JSON/SQLi
   try {
     store.setSessionStoreDir(directory)
     const json = await execute(false)
+    await joinPendingDeletes()
     rmSync(directory, { recursive: true, force: true }); mkdirSync(directory, { mode: 0o700 })
     handle = initializeSessionBookkeeping(directory)
     store.setSessionStoreBackendForTest(sqliteSessionStoreBackend)
     lifecycle.setSessionLifecycleBackendForTest(sqliteLifecycleBackend)
     const sql = await execute(true)
+    await joinPendingDeletes()
     expect(sql.length).toBe(json.length)
     for (let index = 0; index < json.length; index++) expect(sql[index]).toEqual(json[index])
   } finally {
+    await joinPendingDeletes()
     lifecycle.setSessionLifecycleBackendForTest(null); store.setSessionStoreBackendForTest(null)
-    handle?.close(); store.setSessionStoreDir(null)
+    await handle?.close(); store.setSessionStoreDir(null)
     probe.mockRestore(); capture.mockRestore(); clock.mockRestore(); uuid.mockRestore()
     rmSync(directory, { recursive: true, force: true })
   }
