@@ -38,6 +38,7 @@ import {
   releaseActiveTranscriptLease,
   releaseJoinedTranscriptLease,
   runGc,
+  withLegacyLifecycleMaintenanceLock,
   type SessionLifecycleOptions,
   type TranscriptLocator,
 } from "../proxy/sessionLifecycle"
@@ -818,6 +819,38 @@ describe("session transcript lifecycle", () => {
     expect(readdirSync(storeDir)).toEqual(["session-gc.json"])
   })
 
+  legacyLifecycleOnly("injects JSON lock and recovery files", "acquires a recovered maintenance lock after durable recovery exceeds its wait budget", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "slow-recovery", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
+    const stale = (Date.now() - 1_000) / 1_000
+    utimesSync(lock, stale, stale)
+    const sync = durableFileSystem.syncDirectoryDurably
+    let recoveries = 0
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      if (path.startsWith(`${lock}.recover-`) && path.includes(".candidate-")) {
+        // A real recovery fsync may outlast maintenance's 100 ms contention
+        // budget. Once it retires the dead owner, try the exclusive link before
+        // timing out; no additional waiting budget is needed.
+        await new Promise(resolve => setTimeout(resolve, 150))
+        recoveries++
+      }
+      await sync(path)
+    })
+    let entered = false
+    try {
+      await withLegacyLifecycleMaintenanceLock(storeDir, async () => {
+        const owner = JSON.parse(readFileSync(lock, "utf8").split("\n")[0]!)
+        expect(owner.pid).toBe(process.pid)
+        entered = true
+      })
+      expect(entered).toBe(true)
+      expect(recoveries).toBe(1)
+      expect(readdirSync(storeDir)).toEqual([])
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
   legacyLifecycleOnly("injects JSON lock and recovery files", "repeatedly adopts dead lifecycle recovery claims and cleans resolved tombstones", async () => {
     const lock = join(storeDir, "session-gc.json.lock")
     const contents = `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "stale-claim-generation", incarnation: deadProcessIncarnation(999_999_999) })}
@@ -843,6 +876,58 @@ describe("session transcript lifecycle", () => {
 
     expect(readSidecar(storeDir).resources).toBeDefined()
     expect(readdirSync(storeDir).some((name) => name.includes(".recover-"))).toBe(false)
+  })
+
+  legacyLifecycleOnly("injects JSON lock and recovery files", "does not acquire over a successor published during stale recovery at the deadline", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "old-generation", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
+    const stale = (Date.now() - 1_000) / 1_000
+    utimesSync(lock, stale, stale)
+    const incarnation = captureProcessIncarnation()
+    if (!incarnation) throw new Error("test process incarnation unavailable")
+    const successor = `${JSON.stringify({ pid: process.pid, hostname: hostname(), token: "live-successor", incarnation })}\n`
+    const sync = durableFileSystem.syncDirectoryDurably
+    let published = false
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      await sync(path)
+      if (path === storeDir && !published) {
+        writeFileSync(lock, successor, { mode: 0o600 })
+        published = true
+      }
+    })
+    try {
+      await expect(prepareFork(locator("blocked-by-successor"), {
+        ...options, lockWaitMs: 0, lockStaleMs: 1,
+      })).rejects.toBeInstanceOf(SessionLifecycleLockError)
+      expect(published).toBe(true)
+      expect(readFileSync(lock, "utf8")).toBe(successor)
+      expect(readdirSync(storeDir)).toEqual(["session-gc.json.lock"])
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
+  legacyLifecycleOnly("injects JSON lock and recovery files", "honors cancelled admission before acquiring a just-recovered lock", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "cancel-during-recovery", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
+    const stale = (Date.now() - 1_000) / 1_000
+    utimesSync(lock, stale, stale)
+    const controller = new AbortController()
+    const cancelled = new Error("cancelled during stale recovery")
+    const sync = durableFileSystem.syncDirectoryDurably
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      await sync(path)
+      if (path.startsWith(`${lock}.recover-`)) controller.abort(cancelled)
+    })
+    try {
+      await expect(prepareFork(locator("cancelled-recovery"), {
+        ...options, admissionSignal: controller.signal, lockStaleMs: 1,
+      })).rejects.toBe(cancelled)
+      expect(controller.signal.aborted).toBe(true)
+      expect(readdirSync(storeDir)).toEqual([])
+    } finally {
+      syncSpy.mockRestore()
+    }
   })
 
   legacyLifecycleOnly("injects JSON lock and recovery files", "fails closed for live and remote lifecycle recovery owners", async () => {

@@ -1435,6 +1435,11 @@ async function withSidecarLock<T>(
           if (acquired) break
           await recoverStaleLock(paths.lock, staleMs)
           options.admissionSignal?.throwIfAborted()
+          // Recovery itself may consume the contention budget while durably
+          // retiring a dead owner. Try the now-free lock before deciding to
+          // wait again; the exclusive link still protects any successor.
+          acquired = await candidate.publish()
+          if (acquired) break
           if (performance.now() >= deadline) {
             throw new SessionLifecycleLockError(`timed out waiting for ${paths.lock}`)
           }
