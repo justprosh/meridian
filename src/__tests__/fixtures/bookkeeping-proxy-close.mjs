@@ -6,8 +6,9 @@ const [source, root, mode] = process.argv.slice(2)
 const sql = !mode.startsWith('json-')
 const delayed = mode.endsWith('-slow')
 const embedded = mode.startsWith('embedded-')
+const idle = mode.endsWith('-idle')
 const withChatGpt = mode.includes('chatgpt')
-if (!root || (statSync(root).mode & 0o777) !== 0o700) throw new Error('expected owned private disposable root')
+if (!root || (process.platform !== 'win32' && (statSync(root).mode & 0o777) !== 0o700)) throw new Error('expected owned private disposable root')
 const sessions = join(root, 'sessions')
 for (const name of ['sessions', 'config', 'claude', 'plugins', 'xdg', 'work']) mkdirSync(join(root, name), { mode: 0o700 })
 for (const key of Object.keys(process.env)) {
@@ -27,7 +28,7 @@ Object.assign(process.env, {
 const events = []
 const beginning = performance.now()
 const note = (name, fields = {}) => events.push({ name, elapsedMs: Number((performance.now() - beginning).toFixed(3)), ...fields })
-const counters = { sdkQueries: 0, syntheticAuthChecks: 0, syntheticExecutableResolutions: 0, syntheticCredentialReads: 0, outboundFetchRefusals: 0, realCredentialReads: 0, spawnedSdkChildren: 0 }
+const counters = { sdkQueries: 0, gcRuns: 0, syntheticAuthChecks: 0, syntheticExecutableResolutions: 0, syntheticCredentialReads: 0, outboundFetchRefusals: 0, realCredentialReads: 0, spawnedSdkChildren: 0 }
 const realFetch = globalThis.fetch
 Reflect.set(globalThis, 'fetch', async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
@@ -43,7 +44,7 @@ function deferred() {
   const promise = new Promise(done => { resolve = done })
   return { promise, resolve }
 }
-async function bounded(promise, name, ms = 6000) {
+async function bounded(promise, name, ms = process.platform === 'win32' ? 30000 : 6000) {
   let timer
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${name} timed out`)), ms) })]) }
   finally { clearTimeout(timer) }
@@ -108,7 +109,13 @@ setSdkMock(() => ({
 const lifecyclePath = join(source, 'src/proxy/sessionLifecycle.ts')
 const lifecycle = await import(lifecyclePath)
 const realReleaseJoinedTranscriptLease = lifecycle.releaseJoinedTranscriptLease
+const realRunGc = lifecycle.runGc
+if (typeof realRunGc !== 'function') throw new Error('expected the real lifecycle GC entrypoint')
 mock.module(lifecyclePath, () => ({ ...lifecycle,
+  async runGc(...args) {
+    counters.gcRuns++
+    return realRunGc(...args)
+  },
   async releaseJoinedTranscriptLease(...args) {
     if (delayed && !heldFinalizer) {
       heldFinalizer = true
@@ -172,7 +179,7 @@ function ownershipSnapshot(label) {
 
 let instance, backend, outerOwner, closePromise, readResult
 let outcome = 'pending', closeError
-const watchdog = setTimeout(() => { console.error('shutdown fixture watchdog expired'); process.exit(70) }, 12000)
+const watchdog = setTimeout(() => { console.error('shutdown fixture watchdog expired'); process.exit(70) }, process.platform === 'win32' ? 60000 : 12000)
 try {
   const config = { port: 0, host: '127.0.0.1', silent: true, backend: 'claude',
     profiles: [{ id:'owned-api-fixture', type:'api', apiKey:'owned-not-a-provider-key', baseUrl:'http://127.0.0.1:1' }],
@@ -184,17 +191,19 @@ try {
   if (embedded) {
     outerOwner = await initializeProxyBookkeeping()
     backend = createProxyServer(config)
-    request = backend.app.fetch(new Request('http://127.0.0.1/v1/messages', init))
+    if (!idle) request = backend.app.fetch(new Request('http://127.0.0.1/v1/messages', init))
   } else {
     instance = await startProxyServer(config)
     const address = instance.server.address()
     if (!address || typeof address === 'string') throw new Error('expected live TCP listener')
     request = fetch(`http://127.0.0.1:${address.port}/v1/messages`, init)
   }
-  await bounded(queryStarted.promise, 'SDK request started')
-  const response = await bounded(request, 'streaming response')
-  if (response.status !== 200) throw new Error(`request refused: ${response.status}`)
-  readResult = response.text().then(body => ({ bodyBytes: body.length }), error => ({ error: error.name }))
+  if (!idle) {
+    await bounded(queryStarted.promise, 'SDK request started')
+    const response = await bounded(request, 'streaming response')
+    if (response.status !== 200) throw new Error(`request refused: ${response.status}`)
+    readResult = response.text().then(body => ({ bodyBytes: body.length }), error => ({ error: error.name }))
+  }
   if (embedded) { backend.beginDrain(); backend.forceAbortInFlight() }
   const close = () => embedded ? backend.closeBackend() : instance.close()
   closePromise = close()
@@ -207,8 +216,10 @@ try {
   const beforeReleaseChatGptLeaseAvailable = await chatGptLeaseAvailable()
   const outcomeBeforeRelease = outcome
   releaseCleanup.resolve()
-  await bounded(cleanupFinished.promise, 'actual SQL transcript lease released')
-  await bounded(readResult, 'response consumer settled')
+  if (!idle) {
+    await bounded(cleanupFinished.promise, 'actual SQL transcript lease released')
+    await bounded(readResult, 'response consumer settled')
+  }
   if (embedded) await bounded(settled, 'embedded backend joined')
   const deadline = Date.now()+2000
   while (Date.now()<deadline && (embedded ? activeStoreBackend() && connectionFor(sessions).refs > 1 : activeStoreBackend())) await Bun.sleep(5)
@@ -216,7 +227,7 @@ try {
   if (outerOwner) await outerOwner.close()
   const afterOuterOwner = ownershipSnapshot('all owned cleanup joined')
   const afterCloseChatGptLeaseAvailable = await chatGptLeaseAvailable()
-  const report = { mode, sql, delayed, embedded, identicalPromise, outcomeBeforeRelease, outcome, closeError,
+  const report = { mode, sql, delayed, embedded, idle, identicalPromise, outcomeBeforeRelease, outcome, closeError,
     beforeRelease, afterBackend, afterOuterOwner, listenerClosed: !instance || !instance.server.listening,
     withChatGpt, beforeReleaseChatGptLeaseAvailable, afterCloseChatGptLeaseAvailable,
     counters, events, platform: process.platform, arch: process.arch, bun: process.versions.bun }

@@ -11584,7 +11584,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // Failed child cleanup is not permission to release its native owner.
         const failures = results.filter(result => result.status === "rejected")
         if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Backend cleanup failed; ownership retained")
-        await sweepSessionGc()
+        // Embedders and failed startup join work already owned here. They do
+        // not start fresh transcript deletions merely by closing the backend.
+        if (sessionGcRunning) await sessionGcRunning
         if (bookkeepingHandle) await closeProxyBookkeepingWhenSettled(bookkeepingHandle)
       })()
       return backendClosePromise
@@ -11961,7 +11963,11 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         // joins request finalizers and admitted durable work before releasing SQL;
         // ChatGPT ownership must remain attached to that actual cleanup as well.
         const joined = (async () => {
-          try { await closeBackend?.() }
+          try {
+            await waitForShutdownIdle(() => (getInFlightCount?.() ?? 0) > 0)
+            if (sweepSessionGc) await sweepSessionGc()
+            await closeBackend?.()
+          }
           finally {
             await chatGptRenewalStopped
             await chatGpt?.settle()

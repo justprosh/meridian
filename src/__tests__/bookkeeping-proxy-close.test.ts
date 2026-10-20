@@ -7,7 +7,7 @@ import { writeBenchArtifact } from "./fixtures/bookkeeping-support"
 
 // Each child owns its environment, real listener/native database and original
 // request finalizer. Only SDK/auth/executable boundaries are synthetic.
-for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "sqlite-normal", "sqlite-chatgpt-slow"]) {
+for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "embedded-idle", "sqlite-normal", "sqlite-chatgpt-slow"]) {
   it(`joins original request cleanup before releasing backend ownership: ${mode}`, () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-proxy-close-")))
     try {
@@ -16,7 +16,7 @@ for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "sqlite-normal"
         env: { PATH: process.env.PATH, HOME: root, USERPROFILE: root,
           SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
           TMPDIR: root, TMP: root, TEMP: root },
-        encoding: "utf8", timeout: 15_000,
+        encoding: "utf8", timeout: process.platform === "win32" ? 65_000 : 15_000,
       })
       expect(child.error).toBeUndefined()
       expect(child.signal).toBeNull()
@@ -27,7 +27,7 @@ for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "sqlite-normal"
       writeBenchArtifact(`proxy-close-${mode}.json`, report)
       expect(report.identicalPromise).toBe(true)
       expect(report.listenerClosed).toBe(true)
-      expect(report.counters).toMatchObject({ sdkQueries: 1, realCredentialReads: 0, spawnedSdkChildren: 0,
+      expect(report.counters).toMatchObject({ sdkQueries: report.idle ? 0 : 1, realCredentialReads: 0, spawnedSdkChildren: 0,
         outboundFetchRefusals: 0 })
       if (report.withChatGpt) {
         expect(report.beforeReleaseChatGptLeaseAvailable).toBe(false)
@@ -43,8 +43,11 @@ for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "sqlite-normal"
         }
       } else {
         expect(report.outcome).toBe("fulfilled")
+        if (!report.embedded) expect(report.counters.gcRuns).toBeGreaterThanOrEqual(1)
       }
       if (report.embedded) {
+        // Joining an embedder's work must not start fresh transcript deletions.
+        if (report.idle) expect(report.counters.gcRuns).toBe(0)
         expect(report.outcome).toBe("fulfilled")
         expect(report.afterBackend.connection.refs).toBe(1)
         expect(report.afterBackend.guardReleased).toBe(false)
@@ -53,10 +56,10 @@ for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "sqlite-normal"
       expect(report.afterOuterOwner.guardReleased).toBe(true)
       expect(report.afterOuterOwner.sqliteBackendInstalled).toBe(false)
       expect(report.afterOuterOwner.runtimeIdentityRetained).toBe(false)
-      expect(report.events.some((event: { name: string }) => event.name === "actualSqlTranscriptLeaseReleased")).toBe(true)
+      if (!report.idle) expect(report.events.some((event: { name: string }) => event.name === "actualSqlTranscriptLeaseReleased")).toBe(true)
     } finally {
       // spawnSync joins the original actor and both pipes before disposal.
       rmSync(root, { recursive: true, force: true })
     }
-  }, 20_000)
+  }, process.platform === "win32" ? 70_000 : 20_000)
 }
