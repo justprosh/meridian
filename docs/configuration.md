@@ -1641,7 +1641,9 @@ experimental SQLite notice on stderr; structured command results remain on stdou
 
 SQLite uses `session-bookkeeping.sqlite`, WAL, `synchronous=FULL`, foreign keys,
 `busy_timeout=0` and disabled automatic checkpoints. Use a local filesystem
-with working SQLite locks: Linux ext2/3/4, xfs, btrfs or tmpfs; macOS APFS/HFS.
+with working SQLite locks: Linux ext2/3/4, xfs, btrfs or tmpfs; macOS APFS.
+HFS/HFS+ and native Windows are outside the verified filesystem set and refuse
+normal SQLite initialization; the default JSON backend remains available.
 An unverified filesystem requires the explicit
 `BOOKKEEPING_ALLOW_UNVERIFIED_FS=1` escape hatch, not an assumed safety claim.
 The directory must belong to the service uid with mode 0700; database, journal,

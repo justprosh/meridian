@@ -18,12 +18,14 @@ export function errorCode(error: unknown): string | undefined {
 
 export function assertSupportedFilesystem(type: number, platform = process.platform): void {
   const APFS = 26,
-    HFS = 17,
     EXT = 0xef53,
     XFS = 0x58465342,
     BTRFS = 0x9123683e,
     TMPFS = 0x01021994
-  const allowed = platform === "darwin" ? [APFS, HFS] : platform === "linux" ? [EXT, XFS, BTRFS, TMPFS] : []
+  // Only APFS has current macOS package/crash evidence. An owned HFS+ image
+  // reports 25 on the qualification host, not the previously assumed 17;
+  // neither HFS number establishes verified topology support.
+  const allowed = platform === "darwin" ? [APFS] : platform === "linux" ? [EXT, XFS, BTRFS, TMPFS] : []
   if (!allowed.includes(type >>> 0) && process.env.BOOKKEEPING_ALLOW_UNVERIFIED_FS !== "1") {
     throw new Error(
       `unsupported bookkeeping filesystem ${platform}/${type}; ` +

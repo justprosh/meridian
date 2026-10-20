@@ -345,6 +345,11 @@ it("filesystem allowlist rejects unverified transports and directory modes are n
     for (const type of [0xef53, 0x58465342, 0x9123683e, 0x01021994]) {
       expect(() => assertSupportedFilesystem(type, "linux")).not.toThrow()
     }
+    expect(() => assertSupportedFilesystem(26, "darwin")).not.toThrow()
+    for (const type of [17, 25, 0x6969]) {
+      expect(() => assertSupportedFilesystem(type, "darwin")).toThrow("unsupported")
+    }
+    expect(() => assertSupportedFilesystem(26, "win32")).toThrow("unsupported")
     process.env.BOOKKEEPING_ALLOW_UNVERIFIED_FS = "1"
     expect(() => assertSupportedFilesystem(0x65735546, "linux")).not.toThrow()
   } finally {
