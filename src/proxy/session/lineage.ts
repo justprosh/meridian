@@ -44,6 +44,11 @@ export interface SessionState {
    *  When the full prefix matches, the conversation is a strict continuation
    *  and we skip the per-message diff entirely. */
   lineageHash: string
+  /** Raw client ancestry when the SDK transcript does not contain that prefix.
+   * Empty lineageHash deliberately withholds SDK reuse proof from old readers. */
+  clientLineageHash?: string
+  /** Adapter-owned proof of the stable context used to create this SDK session. */
+  resumeContextHash?: string
   /** Per-message content hashes from the last stored request.
    *  Used for precise diff-based mutation classification when the aggregate
    *  lineageHash mismatches. */
@@ -90,10 +95,12 @@ export function withClientAssistantUuid(
 /**
  * Reconcile rollback UUIDs with the session the SDK actually returned.
  *
- * A fork remaps every copied transcript UUID, so UUIDs inherited from the
- * resumed session are invalid in the returned session. The one UUID observed
- * for this request's new client-visible assistant remains valid and occupies
- * its future client message slot.
+ * The CLI's `--resume <source> --fork-session --session-id <target>` path
+ * preserves the copied transcript entries' `uuid` fields in the new fork,
+ * so inherited assistant UUIDs aligned to `0 .. clientMessageCount - 1` remain
+ * valid rollback checkpoints across managed forks (#1371). Any stale trailing
+ * slots at or beyond `clientMessageCount` are trimmed and replaced with this
+ * turn's observed client-visible assistant UUID.
  */
 export function reconcileReturnedSessionUuids(
   existing: Array<string | null>,
@@ -103,8 +110,54 @@ export function reconcileReturnedSessionUuids(
   returnedSessionId: string | undefined,
 ): Array<string | null> {
   if (!resumeSessionId || !returnedSessionId || returnedSessionId === resumeSessionId) return existing
-  const next = new Array<string | null>(clientMessageCount + 1).fill(null)
+  const next = existing.slice(0, clientMessageCount)
+  while (next.length < clientMessageCount) next.push(null)
   next[clientMessageCount] = currentAssistantUuid
+  return next
+}
+
+/**
+ * Build the initial SDK rollback UUID map for a resumed or rolled-back turn,
+ * aligned to the incoming client message indices (#1371).
+ *
+ * - `diverged`: no SDK session is resumed, so start empty.
+ * - `undo`: retain only the preserved prefix `0 .. prefixOverlap - 1`.
+ * - `continuation`: retain stored UUIDs (truncated to `incoming.length` when
+ *   resuming from an in-place block boundary).
+ * - `compaction`: retain any unchanged leading prefix, null out the replaced
+ *   compaction span, shift the preserved suffix UUIDs into their new incoming
+ *   indices, and carry the final stored assistant UUID if the resume boundary
+ *   sits on that assistant slot.
+ */
+export function inheritSdkUuids(
+  cached: SessionState,
+  lineage: LineageResult,
+  incoming: Array<{ role: string; content: unknown }>,
+): Array<string | null> {
+  const stored = cached.sdkMessageUuids ?? []
+  if (lineage.type === "diverged") return []
+  if (lineage.type === "undo") return stored.slice(0, lineage.prefixOverlap)
+  if (lineage.type === "continuation") {
+    return lineage.resumeContentFrom !== undefined
+      ? stored.slice(0, incoming.length)
+      : [...stored]
+  }
+  const next = new Array<string | null>(incoming.length).fill(null)
+  const storedHashes = cached.messageHashes ?? []
+  const suffixStartStored = Math.max(0, storedHashes.length - lineage.suffixOverlap)
+  const suffixStartIncoming = lineage.resumeFrom - lineage.suffixOverlap
+  const prefix = Math.min(
+    measurePrefixOverlap(storedHashes, computeMessageHashes(incoming)),
+    suffixStartIncoming,
+    suffixStartStored,
+  )
+  for (let i = 0; i < prefix; i++) next[i] = stored[i] ?? null
+  for (let j = 0; j < lineage.suffixOverlap; j++) {
+    next[suffixStartIncoming + j] = stored[suffixStartStored + j] ?? null
+  }
+  if (incoming[lineage.resumeFrom]?.role === "assistant") {
+    next[lineage.resumeFrom] = stored[cached.messageCount] ?? null
+  }
   return next
 }
 
@@ -395,7 +448,7 @@ export function formatLineageMismatch(mismatch: LineageMismatch): string | undef
  * Why a request skipped session lookup entirely.
  *
  * `independent-request` is assigned in server.ts before `classifyLineage` runs,
- * so it is the one divergence that emits no diagnostic at all — and four
+ * so it is the one divergence that emits no diagnostic at all — and several
  * unrelated causes collapse into that single silent outcome. #820 was a log
  * full of `lineage=new` with zero explanatory lines; the reporter could only
  * identify the bypass by reading server.ts.
@@ -405,6 +458,7 @@ export function formatLineageMismatch(mismatch: LineageMismatch): string | undef
  * unaffected.
  */
 export type IndependentRequestCause =
+  | "auxiliary-request"
   | "fork-source"
   | "subagent"
   | "headerless-tool-result"
@@ -430,7 +484,12 @@ export function independentRequestCause(input: {
   /** Whether a session key or a conversation fingerprint could be derived.
    *  Image-only and otherwise text-free headerless requests have neither. */
   hasDurableKey: boolean
+  /** The adapter declared a side call that shares the conversation's key by
+   *  protocol without being a turn of it. The key-override rule above cannot
+   *  apply: here the shared key is the collision, not proof against one. */
+  isAuxiliary: boolean
 }): IndependentRequestCause | undefined {
+  if (input.isAuxiliary) return "auxiliary-request"
   if (!input.hasSessionKey && input.forkSource) return "fork-source"
   if (!input.hasSessionKey && input.isSubagent) return "subagent"
   if (input.clientDrivenLoop) return "headerless-tool-result"
@@ -601,14 +660,17 @@ export function verifyLineage(
   options: { compactionSurvival?: boolean } = {},
 ): LineageResult {
   // A legacy entry cannot prove which client history its SDK session contains.
-  if (!cached.lineageHash || cached.messageCount === 0) {
+  // Partial/legacy writers may preserve an unknown optional raw-only field.
+  // A nonempty SDK-prefix hash takes precedence over that stale field.
+  const clientLineageHash = cached.lineageHash || cached.clientLineageHash
+  if (!clientLineageHash || cached.messageCount === 0) {
     return { type: "diverged", reason: "unverifiable" }
   }
 
   // --- Fast path: aggregate lineage hash ---
   const prefix = messages.slice(0, cached.messageCount)
   const prefixHash = computeLineageHash(prefix)
-  if (prefixHash === cached.lineageHash) {
+  if (prefixHash === clientLineageHash) {
     // Same or fewer messages with matching hash = replay/retry, not continuation.
     // Without this guard, identical requests resume the old SDK session and
     // re-send the last user message, causing ghost context accumulation.

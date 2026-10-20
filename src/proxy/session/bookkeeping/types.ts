@@ -49,6 +49,10 @@ export interface StoredSession {
   messageCount: number
   /** Hash of messages[0..messageCount-1] for conversation lineage verification. */
   lineageHash?: string
+  /** Raw client proof when the SDK execution prefix differs. */
+  clientLineageHash?: string
+  /** Adapter-owned stable context digest, never prompt text. */
+  resumeContextHash?: string
   /** Per-message content hashes for precise diff-based compaction detection. */
   messageHashes?: string[]
   /** Per-message hashes of individual content blocks for append-only tool results. */

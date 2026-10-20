@@ -971,11 +971,13 @@ export function storeSharedSession(
   currentTranscript?: TranscriptLocator,
   sourceTranscript?: TranscriptLocator,
   expectedGeneration?: StoredSessionGeneration | null,
+  clientLineageHash?: string | null,
+  resumeContextHash?: string | null,
 ): StoredSessionGeneration | false {
   const backend = activeStoreBackend()
   if (backend) return backend.storeSharedSession(getSessionStoreDir(), key, claudeSessionId, messageCount,
     lineageHash, messageHashes, sdkMessageUuids, contextUsage, messageBlockHashes, passthroughToolCallAssistantUuid,
-    passthroughToolCallIds, currentTranscript, sourceTranscript, expectedGeneration)
+    passthroughToolCallIds, currentTranscript, sourceTranscript, expectedGeneration, clientLineageHash, resumeContextHash)
   if (currentTranscript !== undefined) {
     validateTranscriptLocator(currentTranscript, claudeSessionId)
   }
@@ -1026,6 +1028,12 @@ export function storeSharedSession(
       lastUsedAt: Date.now(),
       messageCount: messageCount ?? existing?.messageCount ?? 0,
       lineageHash: lineageHash ?? existing?.lineageHash,
+      clientLineageHash: clientLineageHash === undefined
+        ? existing?.clientLineageHash
+        : clientLineageHash ?? undefined,
+      resumeContextHash: resumeContextHash === undefined
+        ? sessionIdChanged ? undefined : existing?.resumeContextHash
+        : resumeContextHash ?? undefined,
       messageHashes: messageHashes ?? existing?.messageHashes,
       messageBlockHashes: messageBlockHashes ?? existing?.messageBlockHashes,
       sdkMessageUuids: sdkMessageUuids ?? existing?.sdkMessageUuids,
@@ -1320,6 +1328,8 @@ export function storeSharedSessionAndPriorityAssignment(
       lastUsedAt: Date.now(),
       messageCount: options.messageCount,
       lineageHash: options.lineageHash,
+      clientLineageHash: options.clientLineageHash,
+      resumeContextHash: options.resumeContextHash,
       messageHashes: options.messageHashes,
       messageBlockHashes: options.messageBlockHashes,
       sdkMessageUuids: options.sdkMessageUuids,
@@ -1621,6 +1631,8 @@ export function attachSharedTranscriptLocator(
       }
     } else {
       attachedGeneration = getStoredSessionGeneration(existing, key)
+      // API success is independent of publication: this locked draft is unchanged.
+      return false
     }
     return true
   })

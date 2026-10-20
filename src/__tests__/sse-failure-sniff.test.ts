@@ -402,6 +402,36 @@ describe("stream transport (actual relay, not a duplicate scan loop)", () => {
     expect(text(output)).not.toContain('"retry_after":0')
   })
 
+  it("bounds non-SSE fallback bodies and joins cancellation before reporting an error", async () => {
+    const bytes = encoder.encode(JSON.stringify({ error: { type: "rate_limit_error", message: "x".repeat(256 * 1024) } }))
+    let offset = 0
+    let reads = 0
+    let joined = false
+    const inner = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        reads++
+        if (offset === bytes.length) { controller.close(); return }
+        controller.enqueue(bytes.slice(offset, offset + 32768))
+        offset = Math.min(offset + 32768, bytes.length)
+      },
+      async cancel() {
+        await new Promise(resolve => setTimeout(resolve, 5))
+        joined = true
+      },
+    }, { highWaterMark: 0 }), { status: 429, headers: { "content-type": "application/json" } })
+    const output: Uint8Array[] = []
+    const verdict = await relayStreamAttempt(inner, sink(output))
+    // Oversized undecided bodies cannot authorize account replay or be read
+    // without a bound. Release the original reader before returning the error.
+    if (verdict.kind === "suppressed") await verdict.discard()
+    expect(verdict.kind).toBe("relayed")
+    expect(reads).toBeLessThanOrEqual(3)
+    expect(joined).toBe(true)
+    expect(inner.body!.locked).toBe(false)
+    expect(text(output)).toContain('"type":"api_error"')
+    expect(text(output)).not.toContain('"type":"rate_limit_error"')
+  })
+
   it("retains JSON account failures' valid header hint through suppression", async () => {
     const verdict = await relayStreamAttempt(new Response(JSON.stringify({ error: { type: "rate_limit_error" } }), {
       status: 429, headers: { "retry-after": "30" },

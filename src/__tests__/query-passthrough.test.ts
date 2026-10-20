@@ -2,7 +2,7 @@
  * Tests for SDK parameter passthrough fields in buildQueryOptions.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
-import { buildQueryOptions, SCRATCHPAD_COUNTER_INSTRUCTION, type QueryContext } from "../proxy/query"
+import { buildQueryOptions, promptCachingDisabled, passthroughThinking, SCRATCHPAD_COUNTER_INSTRUCTION, type QueryContext } from "../proxy/query"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME, ALLOWED_MCP_TOOLS } from "../proxy/tools"
 
 function makeContext(overrides: Partial<QueryContext> = {}): QueryContext {
@@ -111,6 +111,21 @@ describe("buildQueryOptions — SDK parameter passthrough", () => {
     expect(buildQueryOptions(makeContext({ thinking: unknownType })).options.thinking as unknown).toEqual({ type: "future" })
   })
 
+  it("asks for summarized thinking when the blocks are forwarded and no display is named", () => {
+    expect(passthroughThinking({ type: "adaptive" }, true)).toEqual({ type: "adaptive", display: "summarized" })
+    expect(passthroughThinking({ type: "enabled", budgetTokens: 2048 }, true))
+      .toEqual({ type: "enabled", budgetTokens: 2048, display: "summarized" })
+  })
+
+  it("leaves thinking alone when the blocks are not forwarded, off, or already carry a display", () => {
+    expect(passthroughThinking({ type: "adaptive" }, false)).toEqual({ type: "adaptive" })
+    expect(passthroughThinking(undefined, true)).toBeUndefined()
+    expect(passthroughThinking({ type: "disabled" }, true)).toEqual({ type: "disabled" })
+    expect(passthroughThinking({ type: "adaptive", display: "omitted" }, true)).toEqual({ type: "adaptive", display: "omitted" })
+    // A value the bundled CLI rejects is still the client's choice: it is dropped later, not replaced.
+    expect(passthroughThinking({ type: "adaptive", display: "updates" }, true)).toEqual({ type: "adaptive", display: "updates" })
+  })
+
   it("leaves disabled thinking untouched", () => {
     const disabled = { type: "disabled", display: "updates" } as unknown as QueryContext["thinking"]
     expect(buildQueryOptions(makeContext({ thinking: disabled })).options.thinking as unknown).toEqual(disabled)
@@ -198,5 +213,23 @@ describe("scratchpad suppression (#627, #1049)", () => {
       ? result.options.systemPrompt
       : (result.options.systemPrompt as any)?.append
     expect(prompt ?? "").not.toContain(SCRATCHPAD_COUNTER_INSTRUCTION)
+  })
+})
+
+describe("promptCachingDisabled", () => {
+  it("parses values the way the CLI's boolean env parser does", () => {
+    for (const value of ["1", "true", "TRUE", "yes", "on", " true ", "1\n"]) {
+      expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: value })).toBe(true)
+    }
+    for (const value of [undefined, "", "0", "false", "no", "off", "enabled"]) {
+      expect(promptCachingDisabled({ DISABLE_PROMPT_CACHING: value })).toBe(false)
+    }
+  })
+
+  it("treats any per-family switch as disabling, whatever the model is named", () => {
+    for (const family of ["HAIKU", "SONNET", "OPUS", "FABLE", "MYTHOS"]) {
+      expect(promptCachingDisabled({ [`DISABLE_PROMPT_CACHING_${family}`]: " on " })).toBe(true)
+      expect(promptCachingDisabled({ [`DISABLE_PROMPT_CACHING_${family}`]: "0" })).toBe(false)
+    }
   })
 })

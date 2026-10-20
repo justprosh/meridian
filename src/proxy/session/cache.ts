@@ -214,6 +214,8 @@ function stateFromSharedSession(
     lastAccess: Date.now(),
     messageCount: shared.messageCount || 0,
     lineageHash: shared.lineageHash || "",
+    clientLineageHash: shared.clientLineageHash,
+    resumeContextHash: shared.resumeContextHash,
     messageHashes: shared.messageHashes,
     messageBlockHashes: shared.messageBlockHashes,
     sdkMessageUuids: shared.sdkMessageUuids,
@@ -504,21 +506,30 @@ export function storeSession(
   sourceTranscript?: { sessionId: string; configDir: string; projectDir?: string },
   expectedGeneration?: StoredSessionGeneration | null,
   priorityPublication?: PrioritySessionPublication,
+  sdkPrefixMatchesClient = true,
+  resumeContextHash?: string,
 ): StoredSessionGeneration | false {
   if (!claudeSessionId) return false
-  const lineageHash = computeLineageHash(messages)
+  const rawLineageHash = computeLineageHash(messages)
+  const lineageHash = sdkPrefixMatchesClient ? rawLineageHash : ""
+  const clientLineageHash = sdkPrefixMatchesClient ? undefined : rawLineageHash
   const messageHashes = computeMessageHashes(messages)
   const messageBlockHashes = computeMessageBlockHashes(messages)
+  // A transformed fresh run can certify only its newly observed assistant.
+  const publishedUuids = sdkPrefixMatchesClient ? sdkMessageUuids : sdkMessageUuids?.map((uuid, index) =>
+    index === messages.length ? uuid : null)
   const state: SessionState = {
     claudeSessionId,
     lastAccess: Date.now(),
     messageCount: messages?.length || 0,
     lineageHash,
+    ...(clientLineageHash ? { clientLineageHash } : {}),
+    resumeContextHash,
     messageHashes,
     messageBlockHashes,
-    sdkMessageUuids,
-    ...(passthroughToolCallAssistantUuid ? { passthroughToolCallAssistantUuid } : {}),
-    ...(passthroughToolCallIds ? { passthroughToolCallIds } : {}),
+    sdkMessageUuids: publishedUuids,
+    ...(sdkPrefixMatchesClient && passthroughToolCallAssistantUuid ? { passthroughToolCallAssistantUuid } : {}),
+    ...(sdkPrefixMatchesClient && passthroughToolCallIds ? { passthroughToolCallIds } : {}),
     ...(contextUsage ? { contextUsage } : {}),
     ...(currentTranscript ? { currentTranscript } : {}),
     ...(sourceTranscript ? { previousTranscript: sourceTranscript } : {}),
@@ -540,12 +551,14 @@ export function storeSession(
       claudeSessionId,
       messageCount: state.messageCount,
       lineageHash,
+      clientLineageHash,
+      resumeContextHash,
       messageHashes,
-      sdkMessageUuids,
+      sdkMessageUuids: publishedUuids,
       contextUsage,
       messageBlockHashes,
-      passthroughToolCallAssistantUuid: passthroughToolCallAssistantUuid ?? null,
-      passthroughToolCallIds: passthroughToolCallIds ?? null,
+      passthroughToolCallAssistantUuid: sdkPrefixMatchesClient ? passthroughToolCallAssistantUuid ?? null : null,
+      passthroughToolCallIds: sdkPrefixMatchesClient ? passthroughToolCallIds ?? null : null,
       currentTranscript,
       sourceTranscript,
       expectedMappingGeneration: expectedGeneration,
@@ -578,15 +591,17 @@ export function storeSession(
       state.messageCount,
       lineageHash,
       messageHashes,
-      sdkMessageUuids,
+      publishedUuids,
       contextUsage,
       messageBlockHashes,
       // undefined would preserve the stored checkpoint; a full store must rewrite it.
-      passthroughToolCallAssistantUuid ?? null,
-      passthroughToolCallIds ?? null,
+      sdkPrefixMatchesClient ? passthroughToolCallAssistantUuid ?? null : null,
+      sdkPrefixMatchesClient ? passthroughToolCallIds ?? null : null,
       currentTranscript,
       sourceTranscript,
       expectedGeneration,
+      clientLineageHash ?? null,
+      resumeContextHash ?? null,
     )
   }
   if (!storedGeneration) return false

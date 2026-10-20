@@ -30,6 +30,8 @@ export interface SharedSessionAndPriorityAssignmentOptions {
   claudeSessionId: string
   messageCount: number
   lineageHash: string
+  clientLineageHash?: string
+  resumeContextHash?: string
   messageHashes: string[]
   sdkMessageUuids?: Array<string | null>
   contextUsage?: TokenUsage
@@ -87,4 +89,5 @@ export type StoreSessionArguments = [
   messageBlockHashes?: string[][], passthroughToolCallAssistantUuid?: string | null,
   passthroughToolCallIds?: string[] | null, currentTranscript?: TranscriptLocator,
   sourceTranscript?: TranscriptLocator, expectedGeneration?: StoredSessionGeneration | null,
+  clientLineageHash?: string | null, resumeContextHash?: string | null,
 ]

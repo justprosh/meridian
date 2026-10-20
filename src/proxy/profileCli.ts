@@ -21,6 +21,7 @@ import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
 import { envBool } from "../env"
+import { findChatGptSeat, listChatGptSeats, printChatGptSeats, removeChatGptSeat, renameChatGptSeat, signInChatGptSeat, switchChatGptSeat, type SeatCliContext } from "./chatgpt/seatCli"
 
 import {
   applyProfileRename,
@@ -99,6 +100,8 @@ function getProfileDir(id: string): string {
 
 interface AuthLoginOptions {
   headless?: boolean
+  /** Add or sign in a ChatGPT seat by this name rather than a Claude profile. */
+  chatgpt?: boolean
 }
 
 interface ManualOAuthSession {
@@ -117,6 +120,8 @@ interface OAuthTokenResponse {
   refresh_token?: string
   expires_in?: number
   expires_at?: number
+  refresh_token_expires_in?: number
+  refresh_token_expires_at?: number
   scope?: string
 }
 
@@ -299,11 +304,20 @@ export function buildLoginCredentials(
   plan: OAuthPlanFields,
   now: number = Date.now(),
 ): CredentialsFile {
+  // Preserve the provider's refresh deadline just as the refresh path does.
+  // Missing/malformed metadata is unknown; do not guess its units or lifetime.
+  const refreshDeadline = tokenData.refresh_token_expires_at ??
+    (typeof tokenData.refresh_token_expires_in === "number" && tokenData.refresh_token_expires_in > 0
+      ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
+  const refreshTokenExpiresAt = typeof refreshDeadline === "number"
+    && Number.isFinite(refreshDeadline) && refreshDeadline > now && refreshDeadline <= 8.64e15
+    ? refreshDeadline : undefined
   return {
     claudeAiOauth: {
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresAt: tokenData.expires_at ?? now + (tokenData.expires_in ?? 8 * 60 * 60) * 1000,
+      ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
       scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
       ...plan,
     },
@@ -541,6 +555,7 @@ function createProfileSlotOrExit(id: string, options: { claudeConfigDir?: string
 }
 
 export async function profileAdd(id: string, options: AuthLoginOptions = {}): Promise<void> {
+  if (options.chatgpt || chatGptSeatNamed(id)) return chatGptSignInOrExit(id, options)
   if (!isValidProfileId(id)) {
     console.error("\x1b[31m✗ Invalid profile ID.\x1b[0m Use only letters, numbers, hyphens, underscores.")
     process.exit(1)
@@ -696,7 +711,9 @@ export function profileList(deps: ProfileListDeps = {
   authStatus: getAuthStatus,
 }): void {
   const profiles = deps.loadProfiles()
+  const seats = listChatGptSeats(seatContext())
   if (profiles.length === 0) {
+    if (seats.length > 0) { printChatGptSeats(seats); return }
     console.log("No profiles configured.")
     console.log("  Add one: meridian profile add <name>")
     return
@@ -723,7 +740,23 @@ export function profileList(deps: ProfileListDeps = {
     }
   }
   console.log()
+  printChatGptSeats(seats)
   printEnvHint(profiles)
+}
+
+function seatContext(): SeatCliContext {
+  return { reserved: new Set(["default", ...loadProfileConfig().flatMap(p => [p.id, ...(p.aliases ?? [])])]) }
+}
+
+/** Whether this name is a ChatGPT seat's and no Claude profile's: a Claude profile's name always wins, as on the server. */
+function chatGptSeatNamed(id: string): boolean {
+  if (loadProfileConfig().some(p => p.id === id || p.aliases?.includes(id))) return false
+  return findChatGptSeat(id, seatContext()) !== undefined
+}
+
+/** `add` and `login` are one operation for a ChatGPT seat: sign in an existing one again, or add one by a new name. */
+async function chatGptSignInOrExit(id: string, options: AuthLoginOptions): Promise<void> {
+  if (!await signInChatGptSeat(id, { headless: options.headless }, seatContext())) process.exit(1)
 }
 
 /**
@@ -747,7 +780,11 @@ export function dirsToRemoveOnProfileRemove(profile: ProfileConfig, profilesDir:
   return dirs
 }
 
-export function profileRemove(id: string): void {
+export async function profileRemove(id: string): Promise<void> {
+  if (chatGptSeatNamed(id)) {
+    if (!await removeChatGptSeat(id, seatContext())) process.exit(1)
+    return
+  }
   try { withProfileConfigLockSync(profilesConfigFile(), () => profileRemoveLocked(id)) }
   catch (error) {
     console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
@@ -781,6 +818,10 @@ function profileRemoveLocked(id: string): void {
 }
 
 export function profileRename(from: string, to: string): void {
+  if (chatGptSeatNamed(from)) {
+    if (!renameChatGptSeat(from, to, seatContext())) process.exit(1)
+    return
+  }
   if (envBool("CREDENTIALS_READONLY")) {
     console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
     console.error("  Rename the profile from the instance that owns them.")
@@ -802,6 +843,10 @@ export function profileRename(from: string, to: string): void {
 }
 
 export async function profileSwitch(id: string): Promise<void> {
+  if (chatGptSeatNamed(id)) {
+    if (!switchChatGptSeat(id, seatContext())) process.exit(1)
+    return
+  }
   const port = process.env.MERIDIAN_PORT ?? process.env.CLAUDE_PROXY_PORT ?? "3456"
   const host = process.env.MERIDIAN_HOST ?? process.env.CLAUDE_PROXY_HOST ?? "127.0.0.1"
 
@@ -812,8 +857,11 @@ export async function profileSwitch(id: string): Promise<void> {
       body: JSON.stringify({ profile: id }),
       signal: AbortSignal.timeout(5000),
     })
-    const body = await res.json() as { success?: boolean; error?: string }
-    if (body.success) {
+    const body = await res.json() as { success?: boolean; error?: string; provider?: string; activeProfile?: string }
+    if (body.success && body.provider === "chatgpt") {
+      // The instance keeps its own ChatGPT pointer; the local Claude one must never name a seat.
+      console.log(`\x1b[32m✓ Active ChatGPT seat: ${body.activeProfile ?? id}\x1b[0m`)
+    } else if (body.success) {
       // Also persist locally so it survives proxy restarts
       setSetting("activeProfile", id)
       console.log(`\x1b[32m✓ Switched to profile: ${id}\x1b[0m`)
@@ -851,6 +899,7 @@ export function planProfileLogin(id: string, profiles: ProfileConfig[]): Profile
 }
 
 export async function profileLogin(id: string, options: AuthLoginOptions = {}): Promise<void> {
+  if (options.chatgpt || chatGptSeatNamed(id)) return chatGptSignInOrExit(id, options)
   const plan = planProfileLogin(id, loadProfileConfig())
 
   if (plan.action === "reject-invalid-id") {
@@ -978,18 +1027,25 @@ function printEnvHint(_profiles: ProfileConfig[]): void {
 }
 
 export function profileHelp(): void {
-  console.log(`meridian profile — manage Claude account profiles
+  console.log(`meridian profile — manage Claude account profiles and ChatGPT seats
 
 Commands:
   meridian profile add <name> [--headless]          Add a profile via Claude OAuth login
   meridian profile add <name> --oauth-token [TOKEN] Add a profile from a \`claude setup-token\` value
                                                     (if TOKEN is omitted, you will be prompted; input is hidden)
+  meridian profile add <name> --chatgpt [--headless]
+                                                    Add a ChatGPT seat via ChatGPT sign-in (--headless: a
+                                                    one-time code to enter in any browser)
   meridian profile list                             List profiles and auth status
   meridian profile rename <old> <new>               Rename a profile; <old> keeps routing to it until reused
   meridian profile remove <name>                    Remove a profile
   meridian profile switch <name>                    Switch the active profile (requires running proxy)
   meridian profile login <name> [--headless]        Re-authenticate a profile, adding it first if it does not
                                                     exist yet (claude-max only)
+
+Every command acts on a ChatGPT seat by its name, as on a Claude profile. For a
+seat, \`add\` and \`login\` are the same: an existing seat is signed in again (it must
+come back as the same account and workspace), a new name adds a seat.
 
 Examples:
   meridian profile add personal                     # Add personal account (browser login)
@@ -999,6 +1055,8 @@ Examples:
   meridian profile add ci --oauth-token sk-ant-oat01-...
                                                     # Add headless CI profile (token from CLI argument)
   meridian profile login work --headless            # Re-authenticate via OAuth URL/code prompt
+  meridian profile add work-gpt --chatgpt           # Add a ChatGPT seat
+  meridian profile login work-gpt --headless        # Sign a ChatGPT seat in again by one-time code
   meridian profile switch work                      # Switch to work account
   meridian profile rename work employer             # Rename; "work" still routes to it
   meridian profile list                             # Show all profiles`)

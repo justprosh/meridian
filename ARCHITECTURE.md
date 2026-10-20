@@ -75,6 +75,20 @@ server orchestration. The build packages self-contained retry integrations under
 `dist/antigravity-clients`; npm, Nix and Docker installations carry those assets.
 Setup prepares edits before writing, preserves unrelated settings, rejects malformed
 or conflicting input, creates private backups and uses per-file atomic replacement.
+`chatgpt/migrate/` implements `meridian chatgpt-migrate`: credential discovery
+(`sources.ts`), /proc scanning (`processes.ts`), opencode config resolution and
+jsonc editing (`opencodeConfig.ts`), stripping under oc-codex-multi-auth's own
+locks (`strip.ts`, `files.ts`), duplicate detection and naming on import
+(`duplicates.ts`), finding the running instance's store and config directory
+(`instance.ts`), the `--reverse` hand-back to the plugin (`reverse.ts`, with
+the pure store merge in `handback.ts`) and the owned-store adapter
+(`ownedStore.ts`), which writes only through `chatgpt/credentials.ts` under the
+writer lease. The server never imports it.
+`instanceImport/` implements `meridian instance-import`: the pure plan that names
+every seat the way the destination will (`plan.ts`), the telemetry copy keyed on
+`request_id` and its column-by-column verification (`telemetry.ts`), and the run
+under both stores' writer leases that retires the source by renaming its files
+(`importer.ts`). The server never imports it.
 `telemetry/providerSetup.ts` shares pure command generation and setup presentation
 between the web provider page and desktop. Desktop clipboard requests contain
 choices rather than arbitrary text; the main process validates them against its
@@ -184,21 +198,31 @@ src/
 │   ├── server.ts              ← HTTP layer: routes, SSE streaming, concurrency, request orchestration
 │   ├── concurrency.ts         ← Abortable SDK query semaphore and concurrency config parsing
 │   ├── requestAbort.ts        ← HTTP request abort → SDK query abort bridge
+│   ├── runtimeCancelWarning.ts ← Startup warning under Bun, whose HTTP server misses a client gone before the first byte (leaf)
 │   ├── sessionTree.ts         ← Live parent→child request registry; subtree cancellation (PURE bookkeeping)
 │   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
 │   ├── inflight.ts            ← Per-upstream in-flight request counts for GET /inflight (PURE bookkeeping)
+│   ├── admissionHold.ts       ← Bounded per-instance generation reservations for the best-effort POST /drain hold
+│   ├── drainBody.ts           ← Tiny operator body byte/deadline limits and joined reader cancellation
+│   ├── generationAdmission.ts ← Exact combined-provider generation classification and response-reader ownership
+│   ├── upstreamReachability.ts ← Pure instance-local native-Claude transport observations for /readyz and /health
+│   ├── upstreamReachabilityConfig.ts ← Dynamic environment/settings acquisition injected by server orchestration
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
 │   │   └── forgecode.ts       ← ForgeCode adapter (fingerprint sessions, XML CWD, passthrough)
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
+│   ├── toolInputJson.ts       ← Tool input JSON repair for raw control characters in strings (PURE)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
 │   ├── sseFailureSniff.ts     ← SSE framing/classification and bounded priority stream transport (leaf)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
 │   ├── authStatusProcess.ts   ← Bounded auth/resolver children and explicit process/pipe joins
 │   ├── claudeResolverOwnership.ts ← Independent leases for shared async resolver custody
 │   ├── authStatusOwnership.ts ← Per-instance ownership of shared auth-status refreshes
+│   ├── claudeExecutablePreference.ts ← System/bundled/custom executable choice, read from settings.json (leaf)
+│   ├── claudeExecutableSettings.ts ← GET/PUT /settings/api/claude-executable: the choice, what each would run, versions
+│   ├── claudeProbeOwnership.ts ← Request/instance ownership of executable probes and resolver leases
 │   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
 │   ├── localBuildInfo.ts      ← Local build comparisons and public forge links (PURE)
 │   ├── buildRuntime.ts        ← Immutable runtime identity and independent disk status
@@ -252,6 +276,9 @@ src/
 │   ├── dashboard.ts           ← HTML dashboard
 │   ├── pricing.ts             ← Static API list prices + cost estimation (pure)
 │   ├── pricingStore.ts        ← User pricing overrides (persisted JSON)
+│   ├── openaiPricingData.ts   ← Generated OpenAI list prices (scripts/update-openai-pricing.ts)
+│   ├── openaiPricingUpdate.ts ← Builds/validates that table from models.dev + LiteLLM (pure)
+│   ├── openaiOfficialPricing.ts ← Hand-kept official OpenAI rates guarding the update
 │   ├── profileBar.ts          ← Shared profile switcher bar (injected into HTML pages)
 │   ├── profilePage.ts         ← Profile management page HTML
 │   ├── pageLayout.ts          ← Contained/wide layout setting, stamped on each page as it is served
@@ -273,7 +300,8 @@ server.ts (HTTP layer)
     ├── adapter.ts (interface)
     ├── adapters/opencode.ts ──► messages.ts, session/fingerprint.ts, tools.ts
     ├── query.ts ──► adapter.ts, mcpTools.ts, passthroughTools.ts
-    ├── errors.ts
+    ├── errors.ts ──► toolInputJson.ts
+    ├── toolInputJson.ts
     ├── retryAfter.ts
     ├── requestAbort.ts
     ├── sessionTree.ts
@@ -299,15 +327,28 @@ server.ts (HTTP layer)
 
 2. **`session/cache.ts` owns all mutable session state.** No other module should create or manage LRU caches for sessions.
 
-3. **`errors.ts`, `retryAfter.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts` and `retryAfter.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
+3. **`errors.ts`, `retryAfter.ts`, `toolInputJson.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts`, `retryAfter.ts` and `toolInputJson.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
 
 4. **`server.ts` owns Hono route registration and orchestration.** Hono
    middleware stays at the proxy boundary. Standard `Request`/`Response`
    dispatch lives in the provider backend where needed. Shared
-   `src/headerSettings.ts` handles only hostname settings validation, Origin
-   policy and persisted consent, using standard web types and `settings.ts`;
-   it must not import a server, provider, Hono or session module. Backend auth
-   remains at each caller's existing boundary.
+   `src/headerSettings.ts` handles only hostname settings validation and
+   persisted consent, using standard web types and `settings.ts`;
+   it must not import a server, provider, Hono or session module. The Origin
+   policy for settings that disclose something or choose what runs lives in
+   `src/sameOrigin.ts` (standard web types only), used by the header and
+   Claude Code executable settings. Backend auth remains at each caller's
+   existing boundary. Shared same-origin browser-write policy is
+   reused by the loopback reachability override; it confers no peer/key authority.
+   `upstreamReachability.ts` has no imports or settings/filesystem I/O; its
+   normalizer, tracker and native-message observer default to pure constants.
+   Each proxy creates its own tracker and injects the per-evaluation callback
+   from `upstreamReachabilityConfig.ts`, the only reachability module that
+   acquires current environment/settings values. Its pass-through observer stays outside the
+   idle guard, preserving direct SDK teardown, and reads only that query's native
+   messages. Bounded response/parent identities prevent old completion/replay
+   from supplying fresh transport evidence. Native event dialect acceptance is
+   separate from direct mocked/pure verification (#1281).
 
 5. **No circular dependencies.** If you need to share types, put them in `types.ts` or the relevant leaf module.
 
@@ -342,6 +383,8 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 |--------|-------------|
 | `getSessionId(c)` | Extract session ID from request headers |
 | `getAgentMode(c, body)` | Normalize an adapter-specific primary/subagent declaration |
+| `getRootSessionId(c, body)` | Optional conversation root for account routing (sticky and priority assignment): a subagent with a session key of its own stays on its parent's account (Claude Code's Agent tool) |
+| `isAuxiliaryRequest(c, body)` | Declare a side call that shares the conversation's session key: it skips session lookup, publication and the turn lease (Claude Code's auto-mode classifier, progress captions and tool-less side calls) |
 | `extractWorkingDirectory(body)` | Parse working directory from request body |
 | `normalizeContent(content)` | Normalize message content for hashing |
 | `getBlockedBuiltinTools()` | SDK tools replaced by agent's MCP equivalents |
@@ -424,9 +467,19 @@ therefore appends the agent name for non-primary agents (`ses_x#title`), leaving
 the primary agent's key byte-identical to the header. An adapter whose client
 multiplexes agents over one session id needs the same treatment.
 
+Claude Code is the second such client: its Agent-tool subagents send the
+conversation's own `metadata.user_id` session id, so `claudeCodeAdapter`
+keys a request carrying `x-claude-code-agent-id` as `<sid>:agent:<agentId>`
+and leaves the main conversation on the bare `<sid>`. `getRootSessionId`
+keeps those subagents on the conversation's account under sticky and
+priority routing. Known limitation: a backgrounded main session (and a
+fork-of-main subagent) gets a fresh agent id but carries the whole
+transcript, so its first request under the new key is one full-history
+replay; later turns resume normally.
+
 **A session header is identity, never authentication.** Polytoken's native
-`X-Polytoken-Session` header is the cleanest example: the trimmed header value
-IS the conversation identity — no agent-mode scoping, no lineage
+`X-Polytoken-Conversation` header supplies the trimmed conversation identity,
+with `X-Polytoken-Session` retained only as a legacy fallback — no agent-mode scoping, no lineage
 canonicalization, no attestation. A blank/missing native header means "no
 identity" rather than an invented fallback key: a headerless tool-result
 continuation runs independent (never resumed, nothing stored) via the
@@ -437,6 +490,19 @@ forces client-owned passthrough unconditionally: instance
 that base, because the protocol's tool loop lives entirely in the client.
 
 Both are LRU with coordinated eviction — evicting from one removes the corresponding entry in the other.
+
+The SDK mapping can also record an adapter-owned stable context digest.
+`adapters/opencodeAgentContext.ts` fingerprints an explicitly declared primary
+agent when client prompts are enabled. The native CLI restores its original
+system prompt on ordinary resume and on forks, so switching primary agents
+requires complete client-history replay into a fresh SDK session. A legacy
+mapping replays once when the plugin first supplies primary-agent identity.
+The cache and shared store publish the digest with the mapping; `server.ts`
+uses the existing execution-history replay boundary. Dynamic file-tree and
+diagnostic context within the same agent retains ordinary resume, as do
+clients without this explicit identity. Editing instructions without changing
+the primary agent remains subject to the native resume limitation. Prompt text
+is never added to the store.
 
 ### Lineage Verification
 
@@ -520,7 +586,8 @@ Three properties bound it:
   cancel children; a subagent routinely outlives the turn that spawned it. The
   shutdown path already aborts every request directly, and the lease watchdog is
   a proxy-side fence rather than a user intent, so neither cascades.
-- **Live requests only.** An entry exists between "admitted" and "settled". A
+- **Live requests only.** An entry exists between parsed live arrival and
+  settlement, including a bounded pre-admission generation hold (#1282). A
   session that was seen once but has nothing in flight is not a cancellation
   target, so the registry is bounded by concurrency, not by history.
 - **Self-gating.** Propagation can only reach a request that declared a parent,
@@ -529,6 +596,17 @@ Three properties bound it:
 `POST /v1/sessions/:key/cancel` cancels a subtree explicitly, and
 `GET /telemetry/summary` reports the live gauges and cumulative counts under
 `sessionTree`.
+
+The per-instance soft hold is separate from process shutdown. Private body,
+translation and held-request ownership keeps close and idle exit aware of
+pending work while `/inflight.total` reports only admitted client HTTP response
+lifetimes. OpenAI translations transfer one instance-owned reservation and
+abort link to Messages, where existing adapters derive one cancellation
+identity. Held adapter selection stays fixed so a config edit cannot change
+the identity used by the live tree/turn lease at execution. Estimates and
+control routes bypass the hold; combined-provider POST counting remains as
+before. No accepted connection, background job or client-tool process becomes
+restart-transferable through this hold.
 
 ## Testing Strategy
 
@@ -608,6 +686,8 @@ A conversation that has run under several profiles has one mapping per profile (
 
 `session/lineage.ts` hashes structured v2 records with separate history, message and block domains. Records preserve roles, block and message boundaries, tool call identity/arguments, and result identity/error status. JSON object keys are canonicalized; plain text and a single text block remain equivalent, and opaque thinking/cache hints remain excluded. Display-oriented `normalizeContent` is not a lineage proof.
 
+Plugin `onRequest` message changes affect SDK execution, while the original client history remains authoritative for lineage and turn ownership. `executionHistory.ts` compares complete message/block values, including fields excluded from lineage hashing; equivalent clones keep ordinary resumes. A changed execution history replays fully instead of using raw offsets, rollback UUIDs or tool checkpoints. Its stored `lineageHash` is empty to withhold SDK-prefix proof, and the internal `clientLineageHash` retains raw continuation proof. Old proxies cannot use that record for resume. A later unchanged full replay restores ordinary SDK-prefix proof; repeated changes incur full replay cost and cannot recover hidden SDK thinking absent from client history. Ordinary and atomic priority publication retain this distinction, including rollback.
+
 Existing v1 digests cannot establish a v2 prefix. Their next request on an upgraded proxy safely replays the full supplied history and publishes v2 hashes; subsequent requests on upgraded proxies resume normally. Alternating between old and new proxy versions can repeat this replay cost until all participating proxies are upgraded. This migration relies on complete fresh replay, including completed tool calls/results and media. Stored transcript files are never rewritten to migrate hashes.
 
 ## Appended content and transient hooks
@@ -671,3 +751,13 @@ bounded TERM/KILL escalation. Missing settlement rejects cleanup and retains
 the single-flight slot; neither a settled result promise nor `exitCode` alone
 proves the child joined. Cache expiry never detaches an in-flight check. The
 existing `ProxyInstance.close()` and `closeBackend()` signatures are unchanged.
+
+Executable settings and turn/readiness resolution also register independent
+leases with `claudeProbeOwnership.ts`. Disconnect/shutdown retires admission
+before canceling those leases, while a sibling caller retains its shared child.
+Version/lookup slots survive missing joins; changing preference cannot bypass an
+older resolver's unknown custody. Settings use a coherent preference/resolution
+snapshot and revalidate the saved mode/path after asynchronous path vetting,
+returning 409 instead of committing against a concurrent selection change.
+The settings boundary is limited to 32 pending requests per instance and 16
+shared live probe slots; the completed version cache holds at most 128 files.

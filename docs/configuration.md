@@ -29,24 +29,27 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_DIAGNOSTIC_LOG_SIZE` | `CLAUDE_PROXY_DIAGNOSTIC_LOG_SIZE` | `500` | Diagnostic log ring buffer size (the Logs tab and `GET /telemetry/logs`) |
 | `MERIDIAN_NO_FILE_CHANGES` | `CLAUDE_PROXY_NO_FILE_CHANGES` | unset | Disable "Files changed" summary in responses |
 | `MERIDIAN_STRIP_THINKING` | `CLAUDE_PROXY_STRIP_THINKING` | unset | Set to `1` to strip raw `<thinking>` tags from user-authored prompt text. Off by default — `<thinking>` is a common chain-of-thought convention in hand-written prompts (#720); enable only if your harness is observed leaking it verbatim. |
-| `MERIDIAN_SONNET_MODEL` | `CLAUDE_PROXY_SONNET_MODEL` | `sonnet` | Sonnet context tier: `sonnet` (200k, default) or `sonnet[1m]` (1M, requires Extra Usage†). Not to be confused with `MERIDIAN_DEFAULT_SONNET_MODEL` below, which pins a concrete model id, not a context tier. |
+| `MERIDIAN_SONNET_MODEL` | `CLAUDE_PROXY_SONNET_MODEL` | `sonnet` | Sonnet 4.x context tier: `sonnet` (200k, default) or `sonnet[1m]` (1M, requires Extra Usage†). No effect on Sonnet 5 and later (the default pin), which run with a native 1M window on every plan without Extra Usage. Not to be confused with `MERIDIAN_DEFAULT_SONNET_MODEL` below, which pins a concrete model id, not a context tier. |
 | `MERIDIAN_FABLE_MODEL` | `CLAUDE_PROXY_FABLE_MODEL` | `fable[1m]` | Fable context tier opt-out: set to `fable` to disable the 1M extended context window and stay on the 200k base variant (also governs Mythos, which rides the Fable tier). `fable[1m]` is a documented no-op. Not to be confused with `MERIDIAN_DEFAULT_FABLE_MODEL` below, which pins a concrete model id, not a context tier. |
 | `MERIDIAN_OPUS_MODEL` | `CLAUDE_PROXY_OPUS_MODEL` | `opus[1m]` | Opus context tier opt-out: set to `opus` to disable the 1M extended context window and stay on the 200k base variant. `opus[1m]` is a documented no-op. Not to be confused with `MERIDIAN_DEFAULT_OPUS_MODEL` below, which pins a concrete model id, not a context tier. |
-| `MERIDIAN_1M_CONTEXT_SUPPORT` | `CLAUDE_PROXY_1M_CONTEXT_SUPPORT` | unset | Set to `0`/`false`/`no` to disable 1M context entirely — every model resolves to its 200k base variant, so Meridian never requests the extended window (avoids Extra Usage on 1M). To opt out a single tier instead, use `MERIDIAN_FABLE_MODEL` or `MERIDIAN_OPUS_MODEL` above. |
+| `MERIDIAN_1M_CONTEXT_SUPPORT` | `CLAUDE_PROXY_1M_CONTEXT_SUPPORT` | unset | Set to `0`/`false`/`no` to stop Meridian selecting the optional `[1m]` tier — every model resolves to its base variant, so Meridian never requests the extended window (avoids Extra Usage on 1M). Sonnet 5+ and Haiku 5.5 have a native 1M window with no `[1m]` variant, so this switch does not shrink them. To opt out a single tier instead, use `MERIDIAN_FABLE_MODEL` or `MERIDIAN_OPUS_MODEL` above. |
 | `MERIDIAN_DEFAULT_AGENT` | — | `opencode` | Default adapter for unrecognized agents: `opencode`, `forgecode`, `pi`, `prime`, `crush`, `droid`, `cherry`, `claude-code`, `passthrough`, `polytoken`, `openai`, `jcode`, `letta`, `codex`. Aliases: `prime-agent`, `cherrystudio`, `claudecode`. Re-read per request from the process environment — restart the proxy to pick up deployment-level env changes. |
 | `MERIDIAN_ROUTING` | — | `active` | Session-to-profile routing: `active` (all traffic to the active profile), `sticky` ([sticky session routing](profiles.md#sticky-session-routing)), or `priority` ([priority failover](profiles.md#priority-failover-routing)) |
 | `MERIDIAN_PROFILE_ORDER` | — | *(config order)* | Priority-mode pool order, comma-separated, highest priority first (e.g. `work,personal`). Also editable at `/settings`. |
 | `MERIDIAN_PRIORITY_FAILBACK` | — | `new-conversation` | Priority failback policy: `new-conversation` (current behavior) or `next-user-turn`. Environment value overrides `priorityFailback` in the settings JSON. Applies only to priority routing and OpenCode turn metadata; other adapters retain `new-conversation` behavior. |
 | `MERIDIAN_FOLLOW_ACTIVE` | `CLAUDE_PROXY_FOLLOW_ACTIVE` | unset | Base URL of another Meridian instance to take the active profile from, e.g. `http://127.0.0.1:3456`. For a development instance running beside a primary one — see [Following another instance's active profile](#following-another-instances-active-profile). |
 | `MERIDIAN_PASSTHROUGH_EARLY_STOP` | — | `1` | Set to `0` to disable [digest-turn elimination](#how-tool-calling-works-in-passthrough) and restore the old end-of-turn behavior |
-| `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. **Setting this opts out of [digest-turn elimination](#how-tool-calling-works-in-passthrough)** — an explicit value always wins over the cap, so a turn budget set to work around an older issue keeps paying for the discarded digest turn. Unset it unless you still need it. |
-| `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, a capped turn with complete client-declared tool calls is returned as `tool_use` when every call has an ID-matched CLI `No such tool available` result; the rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow the experimental uncaptured abort-window recovery without an explicit dispatch rejection (no live positive gate yet). Set to `0` to disable both recoveries. Non-streaming responses are unaffected. The confirmed-rejection recovery applies at any turn budget, including the deferred-tools budget; the abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. |
+| `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. An explicit positive value wins over the one-turn cap. With early stop enabled, a budget above one still stops after a batch forwarded to the client (see [digest-turn elimination](#how-tool-calling-works-in-passthrough)), so the pin adds headroom before the tool boundary; structured-output requests retain the normal SDK completion loop. Unset it unless you still need it. |
+| `MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY` | — | *(unset — confirmed CLI rejection only)* | In streaming passthrough, complete tool calls can be returned as `tool_use` when every call has a CLI dispatch rejection matching its ID and tool name: `No such tool available`, or `InputValidationError: … could not be parsed as JSON`. Input must still form a complete JSON object after the supported control-character/invalid-escape repair; schema validation failures do not count. Explicit rejection can also qualify an undeclared tool name for the client's own invalid-tool response. The rejected SDK session is evicted so the next client result replays against a fresh one. Set to `1` to **also** allow experimental uncaptured abort-window recovery without explicit rejection (no live positive gate yet); every call must then name a declared tool. Set to `0` to disable both recoveries. Non-streaming responses are unaffected. Confirmed-rejection recovery applies at any turn budget, including deferred tools; abort-window recovery requires `maxTurns=1`. Both require a complete open envelope and no cancellation. When neither applies, the `sdk_termination` error log names the blocking condition as `uncaptured_veto=…`. |
 | `MERIDIAN_SESSION_GC_LOCK_WAIT_MS` | `CLAUDE_PROXY_SESSION_GC_LOCK_WAIT_MS` | `2000` | External lifecycle-lock acquisition budget, starting only at the head of the local FIFO; minimum 100 ms. Local queue waiting does not consume this budget and is not bounded by two seconds. Each lock allows 256 waiting callers; a holder stalled for 60 seconds rejects queued/new callers without unlocking its transaction, unless the deadline itself ran late because the event loop was blocked. An answered turn whose terminal publication meets any of these errors is still delivered; its next turn replays history. Request cancellation removes queued work or cancels acquisition, never an executing durable transaction; cleanup remains uncanceled. External timeout, queue capacity and stalled-holder failures answer **503 `overloaded_error`** with distinct reasons. |
 | `MERIDIAN_SESSION_PROFILE_COPY_PRUNE` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE` | `0` | Opt in to removing stale cross-profile session mappings during GC. Off preserves native resume history. Returning to a pruned profile uses flattened, context-trimmed replay, which cannot restore SDK thinking. |
 | `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` | `CLAUDE_PROXY_SESSION_PROFILE_COPY_GRACE_MS` | `86400000` (24 hours) | With several profiles, the same conversation gets its own stored session under each profile it has run on. When profile-copy pruning is enabled, on every session GC sweep a copy is removed once a newer copy of that conversation exists under another profile and the older copy has not been used for this many milliseconds. The newest copy, copies of a conversation with a request in flight, and mappings a priority route depends on are always kept. A conversation that returns to a profile while its copy exists resumes that profile's own session; after removal it is replayed into a fresh session on that account, as flattened history trimmed to the model's context window. The default covers an account's 5-hour usage window resetting and a day of switching back and forth. `0` keeps only the newest copy. Removal is paced to leave at least half of `MERIDIAN_SESSION_GC_MAX_PENDING` free for new requests, so a large store is trimmed over several sweeps. |
 | `MERIDIAN_SILENT_TURN_RECOVERY` | `CLAUDE_PROXY_SILENT_TURN_RECOVERY` | `1` | Set to `0` to stop spending a recovery turn on a [silent turn](#silent-turns). Detection and telemetry stay on either way |
 | `MERIDIAN_UPSTREAM_IDLE_MS` | `CLAUDE_PROXY_UPSTREAM_IDLE_MS` | `90000` | Milliseconds the upstream stream may go quiet before the turn is treated as stalled. Raise it for long-thinking turns that were being killed mid-flight; `0` disables the guard entirely. Applies to the recovery turn too. |
 | `MERIDIAN_UPSTREAM_IDLE_MAX_CONSECUTIVE` | `CLAUDE_PROXY_UPSTREAM_IDLE_MAX_CONSECUTIVE` | `3` | Consecutive idle stalls for the same request and session before returning a terminal error. Identical retries are then rejected before another SDK query for one idle window (at least 60 seconds). A changed request or completed turn resets the streak; rejected retries do not extend the pause. `0` disables this ceiling. Tracking is bounded and local to the proxy instance; requests without a correlatable session are not pooled. |
+| `MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS` | `CLAUDE_PROXY_UPSTREAM_UNREACHABLE_AFTER_MS` | `120000` | How long connection failures must keep arriving, with no observed configured-Claude-egress answer in between, before `/readyz` reports this instance's Claude connection failed. See [Readiness and upstream reachability](#readiness-and-upstream-reachability). Wins over `upstreamUnreachableAfterMs` in `settings.json`. |
+| `MERIDIAN_UPSTREAM_UNREACHABLE_HOLD_MS` | `CLAUDE_PROXY_UPSTREAM_UNREACHABLE_HOLD_MS` | `300000` | How long `/readyz` keeps failing after the latest connection failure before it lets traffic back in to observe the configured Claude egress again. `0` never fails readiness. Wins over `upstreamUnreachableHoldMs`. |
+| `MERIDIAN_UPSTREAM_UNREACHABLE_MIN_FAILURES` | `CLAUDE_PROXY_UPSTREAM_UNREACHABLE_MIN_FAILURES` | `3` | Connection failures a run needs before it counts, however long it lasted. Wins over `upstreamUnreachableMinFailures`. |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD` | — | `1` | Set to `0` to disable prompt-level scratchpad suppression in passthrough mode (#627, #1049) |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD_ENV` | — | `0` | Set to `1` to also pass `CLAUDE_CODE_SESSION_KIND=bg` to the SDK subprocess. Disabled by default to prevent CLI 2.1.274+ from registering persistent phantom background jobs under `~/.claude/jobs/` (#1049) |
 | `MERIDIAN_SUPPRESS_IMPLICIT_ATTACHMENTS` | — | `1` | Set to `0` to stop defaulting `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` in passthrough mode. Does not clear an explicitly inherited CLI setting. See [known limitations](#known-limitations). |
@@ -61,7 +64,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_DEFAULT_PROFILE` | — | *(first profile)* | Default profile ID when no header is sent |
 | `MERIDIAN_ADAPTER_INSTANCES` | — | unset | JSON [adapter instance](agents.md#adapter-instances) definitions, overriding `~/.config/meridian/adapter-instances.json` |
 | `MERIDIAN_BETA_POLICY` | — | `allow-safe` | Client `anthropic-beta` header handling: `allow-safe`, `strip-all`, or `allow-all` |
-| `MERIDIAN_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | — | canonical ids | Pin the model id the SDK resolves for each tier alias (e.g. `MERIDIAN_DEFAULT_OPUS_MODEL`) |
+| `MERIDIAN_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | — | canonical ids | Pin the model id the SDK resolves for each tier alias (e.g. `MERIDIAN_DEFAULT_OPUS_MODEL`); Haiku defaults to `claude-haiku-5-5` |
 | `MERIDIAN_SESSION_DIR` | `CLAUDE_PROXY_SESSION_DIR` | `~/.cache/meridian` | Directory for the persisted session store |
 | `MERIDIAN_NO_UPDATE_CHECK` | — | unset | Set to `1` to force the update check off even when the `checkForUpdates` setting is on. No outbound request is made at all when set. See [Build provenance](#build-provenance-and-staying-current). |
 | `MERIDIAN_UPDATE_CHECK_URL` | — | npm dist-tags | Registry endpoint for the update check. Point it at a mirror on restricted networks; it must return `{"latest":"<version>"}`. |
@@ -75,11 +78,54 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_HOST_ID` | — | derived | Stable, unique container identity for session locks; see [deployment](deployment.md#persistence-and-host-identity). |
 | `MERIDIAN_QUIET` | `CLAUDE_PROXY_QUIET` | unset | Suppress informational telemetry startup output; warnings and errors still print. |
 | `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` | — | `3` | Renewal warning horizon reported by health when credential renewal information is available. |
-| `MERIDIAN_PLUGIN_DIR` | — | `~/.config/meridian/plugins` | Plugin auto-discovery directory |
-| `MERIDIAN_PLUGIN_CONFIG` | — | `~/.config/meridian/plugins.json` | Plugin manifest path |
+| `MERIDIAN_PLUGIN_DIR` | — | `<config dir>/plugins` | Plugin auto-discovery directory |
+| `MERIDIAN_PLUGIN_CONFIG` | — | `<config dir>/plugins.json` | Plugin manifest path |
+| `MERIDIAN_CHATGPT_CREDENTIALS` | — | unset | Serve GPT models from ChatGPT subscriptions: `owned`, `follow-external` or `off`. Unset means `owned` when Meridian's own ChatGPT store holds seats, else off. See [ChatGPT subscriptions](#chatgpt-subscriptions). |
+| `MERIDIAN_CHATGPT_STORE_PATH` | — | `<config dir>/chatgpt-accounts.json` | Meridian's own ChatGPT seat store (`owned` mode). |
+| `MERIDIAN_CODEX_POOL_PATH` | — | `~/.opencode/oc-codex-multi-auth-accounts.json` | The oc-codex-multi-auth store read in `follow-external` mode. |
 | `MERIDIAN_CREDENTIALS_READONLY` | `CLAUDE_PROXY_CREDENTIALS_READONLY` | unset | Set to `1` to forbid this instance from refreshing or writing OAuth credentials. For a second instance sharing another's credential files — see [Read-only credentials](#read-only-credentials). |
 
 †These are Meridian context defaults, not a billing guarantee. Availability and extended-context charges depend on the model and account; consult [Anthropic model configuration](https://code.claude.com/docs/en/model-config#extended-context). Historical Max/Team tests do not establish entitlement for another account.
+
+### Haiku 5.5
+
+The bare `haiku` alias defaults to `claude-haiku-5-5`. Use Claude Code **2.1.293
+or newer** (including when selecting a system/custom executable). Haiku 5.5 has
+a native **1M context window**, up to **128K output tokens**, and adaptive
+thinking controlled by effort; it does not need a `haiku[1m]` SDK alias.
+Explicit `claude-haiku-4-5` and dated 4.5 requests retain their requested model
+and 200k context window (default replay allowance 160k, with a 20k reserve).
+Shell/profile pins and `MERIDIAN_DEFAULT_HAIKU_MODEL`
+still work; replay capacity follows the effective Haiku pin.
+
+The tested Claude Code 2.1.296 / Agent SDK 0.2.141 path cannot reliably honor
+explicit `thinking: disabled` or `thinking.display: omitted` on Haiku 5.5.
+Meridian refuses those requests with HTTP 400 **before generation**, including
+an authoritative adapter-off setting or a beta policy that disables thinking.
+Use adaptive thinking with effort, omit display/use `summarized`, or explicitly
+select Haiku 4.5. The native CLI converts legacy enabled/manual-budget inputs
+to adaptive thinking on Haiku 5.5; a numeric thinking budget is not an adaptive
+hard cap. Use effort for depth, or keep an explicit 4.5 pin for manual thinking.
+The tested native SDK path preserves a 4.5 budget supplied as SDK-style
+`budgetTokens`; conventional Anthropic `budget_tokens` is not translated by the
+existing HTTP builder and was not preserved in the retained control. This change
+does not fix that pre-existing limitation or guarantee snake-case manual budgets.
+The disabled/omitted refusal is a native SDK limitation, not a claim that Haiku
+5.5's API lacks those controls.
+
+Built-in cost estimates use Haiku 5.5's short-prompt rates ($0.10 input / $0.50
+output per million tokens). Above **100,000 prompt tokens**, including cache
+reads and writes, the entire request uses $0.50 / $2.50 instead. Five-minute
+cache writes cost 1.25× input and cache reads 0.10× input. Settings list the
+short-prompt rates; custom overrides remain flat. These are API-value estimates,
+not subscription bills; SDK-aggregated subrequests and one-hour cache writes
+cannot be reconstructed exactly from the retained request totals. New Haiku
+records retain the effective SDK pin for pricing, while request-key overrides
+still win. Historical bare aliases without that pin use today's alias valuation,
+not a reconstruction of the model actually served.
+
+See Anthropic's [overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview)
+and [migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide).
 
 ### Read-only credentials
 
@@ -105,6 +151,7 @@ With it set:
 |---|---|
 | Proactive refresh on boot and every 45s | Not scheduled |
 | Auth keepalive every 45s | Not scheduled |
+| Renewing owned ChatGPT seats ahead of expiry, on boot and every 60s | Not scheduled |
 | Auth-status cache (60s TTL) | Also invalidated when the credential file's mtime changes, so a rotation by the other instance is picked up on the next tick |
 | Any credential write | Refused at the credential store, and logged to stderr |
 | Any OAuth refresh request | Not sent — the grant would rotate the token server-side even if the result were never written |
@@ -166,10 +213,11 @@ second instance pointed at an empty directory starts genuinely empty:
 file when set. `XDG_CONFIG_HOME` is deliberately ignored: honouring it would
 relocate the configuration of everyone who has it set, without them asking.
 
-Two paths do **not** follow it yet — plugins (`plugins/`, `plugins.json`) and
-`design-token.json` still default under `~/.config/meridian` whatever this is set
-to. Point a second instance's plugins elsewhere with `MERIDIAN_PLUGIN_DIR` /
-`MERIDIAN_PLUGIN_CONFIG` / `MERIDIAN_DESIGN_TOKEN_PATH` in the meantime.
+Plugins follow it too: `plugins/` and `plugins.json` default under this
+directory, and `MERIDIAN_PLUGIN_DIR` / `MERIDIAN_PLUGIN_CONFIG` still win when
+set. One path does **not** follow it yet: `design-token.json` still defaults
+under `~/.config/meridian`; point a second instance's elsewhere with
+`MERIDIAN_DESIGN_TOKEN_PATH`.
 
 Running a second instance beside your usual one:
 
@@ -282,8 +330,12 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `POST /v1/sessions/:key/cancel` | Cancel live requests in a session subtree |
 | `GET/POST /v1/design/*` | Claude Design MCP proxy (see [Claude Design MCP](agents.md#claude-design-mcp)) |
 | `GET/POST /design-login` | OAuth flow for the design scopes |
-| `GET /health` | Auth status, mode, plugin status |
+| `GET /health` | Auth status, mode, plugin status, upstream reachability |
+| `GET /livez` | `ok` while the process is turning; for restart supervisors |
+| `GET /readyz` | `ok`, or `503` naming the failed checks: whether traffic should come to this instance. See [Readiness and upstream reachability](#readiness-and-upstream-reachability) |
+| `PUT /upstream-reachability` | Force or clear the upstream reachability state, to test a load balancer; loopback clients only |
 | `GET /inflight` | Client requests in flight per upstream; loopback clients only. See [Restarting when idle](#restarting-when-idle) |
+| `POST /drain`, `DELETE /drain` | Best-effort bounded generation hold for local supervisors; configured API key required. See [Draining for a restart](#draining-for-a-restart) |
 | `POST /auth/refresh` | Manually refresh the OAuth token |
 | `GET /telemetry` | Performance dashboard |
 | `GET /telemetry/requests` | Recent request metrics (JSON) |
@@ -321,6 +373,8 @@ Illustrative health response excerpt (versions and status vary by installation):
 ```
 
 `plugin.opencode` is `"configured"` when `meridian setup` has been run, `"not-configured"` otherwise.
+Claude and combined-provider health responses also carry `upstream.claude`, described under
+[Readiness and upstream reachability](#readiness-and-upstream-reachability).
 
 With `"showHostname": true` in `settings.json` (or the switch under **Site
 Header** at `/settings`), `/health` also carries `"hostname"`, the machine's
@@ -536,6 +590,120 @@ Restart=no
 
 The idle exit setting is optional. It starts a graceful shutdown after the configured period without a model request; the socket unit starts a new process on the next connection. The inherited fd is not passed on to the SDK subprocess. [E59](../E2E.md#e59-node-socket-activation-and-idle-exit) describes the process-level probe.
 
+## Readiness and upstream reachability
+
+Two probes for whatever sits in front of Meridian, shaped like
+kube-apiserver's: plain text `ok` when everything passes, and with `?verbose`
+one `[+]name ok` / `[-]name failed: reason` line per check.
+
+- `GET /livez` answers whether a restart would help. It has no checks: reaching
+  it means the process is turning. Point a restart supervisor here.
+- `GET /readyz` answers whether traffic should come to this instance rather
+  than another one. It answers `503` naming the failed checks: `profiles` (no
+  account configured), `claude-executable` (no CLI resolved) and
+  `upstream-claude` (native Claude traffic from this instance has definite connection failures).
+
+Neither needs the API key: a load balancer reads a `401` as "down".
+
+`upstream-claude` exists for a host whose network still serves HTTP while it
+has definite connection failures to its configured Claude egress: a dead resolver, a broken route, a firewall. Without it
+such an instance looks ready, keeps its share of traffic, and every request
+spends the CLI's whole retry budget before failing with "API Error: Can't reach
+the API server".
+
+- **Only connection failures count**: DNS (`ENOTFOUND`, `EAI_AGAIN`), refused,
+  reset, no route, connect-only timeouts, TLS and proxy-tunnel failures, read
+  from validated native terminal error envelopes on real SDK queries. A null
+  retry status is ambiguous (it includes slow/read timeouts) and supplies no
+  evidence. Generic timeout text, bare timeout codes, arbitrary model/tool
+  text, replay and synthetic normal answers do not change the check.
+- **Transport answers**: a valid native `system/api_retry` integer HTTP status
+  from 100 through 599, or a fresh real response start, clears the failure run
+  for this instance. This includes configured-egress refusals; it does not
+  establish Anthropic origin, usable credentials or successful inference.
+  HTTP-looking strings and bare error enums are insufficient. Old streaming
+  completions cannot clear an outage that began after their response start.
+- **When it fails**: after at least 3 connection failures spanning 2 minutes
+  with no answer in between.
+- **For how long**: until 5 minutes after the latest failure. Then the check
+  passes again, so real traffic can observe the configured Claude egress: the first
+  answer clears it, and the first failure fails it again at once.
+- **Passive**: Meridian never sends a request just to test reachability.
+
+```text
+[-]upstream-claude failed: This instance's configured Claude egress failed since 2026-10-01T21:00:00.000Z (last error: dns, 7 connection failures, last answered 2026-10-01T20:59:58.000Z)
+readyz check failed
+```
+
+The thresholds are `upstreamUnreachableAfterMs`, `upstreamUnreachableHoldMs`
+and `upstreamUnreachableMinFailures` in `settings.json`, or the
+`MERIDIAN_UPSTREAM_UNREACHABLE_*` variables in the
+[environment table](#configuration). `MERIDIAN_*` takes precedence over its
+`CLAUDE_PROXY_*` alias, then a valid persisted numeric setting, then the default;
+invalid environment values fall back to the persisted value. Values must be
+non-negative safe integers: timing values are bounded by the representable Date
+range, and the minimum failure count is at least one. Non-object or malformed
+settings and incorrectly typed values are ignored. They are re-read on every
+evaluation. A hold of `0` records the observations without failing readiness.
+State is ephemeral and local to each server instance, including embedded
+instances that share SDK capacity. Accounts on that instance aggregate; another
+instance or Antigravity traffic cannot clear it. `ok` means there is no currently
+declared outage; it can retain failures below the detection threshold, and a
+forced-ok override can mask a natural outage. It is not a fresh reachability
+guarantee.
+
+`/health` reports the state as `upstream.claude` (timestamps ISO-8601 or `null`;
+no error text, account or token):
+
+```json
+"upstream": {
+  "claude": {
+    "state": "unreachable",
+    "since": "2026-10-01T21:02:00.000Z",
+    "failingSince": "2026-10-01T21:00:00.000Z",
+    "consecutiveFailures": 7,
+    "lastReachedAt": "2026-10-01T20:59:58.000Z",
+    "lastFailureAt": "2026-10-01T21:03:10.000Z",
+    "lastErrorKind": "dns",
+    "holdUntil": "2026-10-01T21:08:10.000Z",
+    "override": null
+  }
+}
+```
+
+`state` is `ok`, `unreachable` or `probing` (the hold has expired and traffic is
+let back in). The site header shows it too: a red "Claude connection failed" pill and a
+yellow "Rechecking Claude connection" one while probing. Details name this
+instance's configured Claude egress and open on hover or button activation;
+Escape or blur dismisses them.
+Draining and offline status retain precedence. Combined instances label the
+Claude observation explicitly; it does not describe Antigravity availability.
+The hostname and build provenance retain their existing header positions.
+
+To test a load balancer's failover without breaking a host's DNS, force the
+state from the host itself:
+
+```bash
+curl -X PUT http://127.0.0.1:3456/upstream-reachability \
+  -H 'content-type: application/json' -d '{"state": "unreachable", "ttlMs": 300000}'
+curl -X PUT http://127.0.0.1:3456/upstream-reachability \
+  -H 'content-type: application/json' -d '{"state": null}'
+```
+
+`state` is `"unreachable"`, `"ok"` or `null` to clear; `ttlMs` defaults to ten
+minutes and is capped at a day, so a forgotten override expires. Like
+`/inflight`, only a loopback peer without forwarding headers gets an answer;
+when `MERIDIAN_API_KEY` is set the key is required as well. Browser writes must
+pass the same Origin policy as header settings: exact origin, or the narrow
+HTTPS-to-HTTP TLS-termination bridge preserving Host/port (including explicit
+default 443). Foreign, opaque, malformed and different-port origins are
+rejected. CLI requests without Origin are permitted after the loopback/key
+checks. Forwarding headers never confer authority. Responses are no-store.
+Forced `ok` masks only the reachability check, preserving executable/profile
+checks and shutdown behavior. Natural observations continue underneath an
+override and resume after expiry or clear; `since` describes the visible forced
+state truthfully.
+
 ## Restarting when idle
 
 `GET /inflight` lets a supervisor on the same host observe admitted client
@@ -549,13 +717,15 @@ HTTP requests before requesting a graceful shutdown:
   "oldestStartedAt": "2026-09-28T11:01:40.012Z",
   "upstreams": {
     "claude": { "streams": 1, "requests": 0, "queued": 2 },
-    "antigravity": { "streams": 0, "requests": 0, "queued": 0 }
+    "antigravity": { "streams": 0, "requests": 0, "queued": 0 },
+    "chatgpt": { "streams": 0, "requests": 0, "queued": 0 }
   }
 }
 ```
 
 - `scope` is `"client-http"`. `total` counts admitted Claude Messages requests
-  (including internal OpenAI translations) and combined Antigravity POSTs; zero
+  (including internal OpenAI translations), combined Antigravity POSTs and
+  ChatGPT gateway turns; zero
   means that none of those requests is currently admitted. It does not mean
   that restarting will interrupt no work. Each request counts once: in `queued`
   while it waits for its session's turn or a free SDK slot, otherwise in
@@ -568,6 +738,8 @@ HTTP requests before requesting a graceful shutdown:
   after their `POST` returned and processes waiting for a client tool result
   are not counted. The standalone
   `MERIDIAN_BACKEND=antigravity` server does not serve `/inflight`.
+- `chatgpt` appears only when the ChatGPT gateway is configured and counts
+  every turn it serves on `/v1/responses` and `/v1/messages`.
 - Meridian's own background work (token refresh, usage polling, session
   cleanup) is never counted.
 - Only a loopback peer (`127.0.0.0/8`, `::1`) gets an answer, and not through a
@@ -580,6 +752,75 @@ probe. Use the [graceful shutdown](#graceful-shutdown) drain; this endpoint
 is not an admission barrier. Background Responses jobs are not restart
 resumable, so a supervisor must also wait for those jobs and pending client
 tool continuations to finish through their own lifecycle APIs.
+
+### Draining for a restart
+
+Overlapping traffic can prevent `total` reaching zero. `POST /drain` opens a
+best-effort idle opportunity by delaying new generation requests while already
+admitted work continues. A zero snapshot does not authorize a safe restart or
+transfer accepted client connections. Long requests, time caps, saturation and
+background work can still prevent idle; a supervisor must give up or retry.
+
+- DELETE or the drain timeout releases held requests normally. Each request
+  also proceeds after its individual `holdMs` cap. There is no guarantee that
+  a client will tolerate the delay without its own timeout or retry.
+- A drain ends on `DELETE /drain`, after `timeoutMs`, or when Meridian begins
+  shutting down. At shutdown the held requests get the shutdown `503` with
+  `Retry-After`, as any new request does.
+- Held requests are not in `total`; `drain.held` counts them.
+- It holds Claude Messages and public OpenAI generation translations once,
+  plus combined Antigravity generation submissions (`/v1/messages`,
+  `/messages`, `/v1/chat/completions`, `/v1/responses` under `/antigravity`).
+  Cancellation, token estimates, polling/retrieval/deletion and other control
+  operations remain usable. Every admitted combined-provider POST retains its
+  existing HTTP count. Background Responses
+  jobs and pending client tool continuations keep running and are not held, so
+  a supervisor still waits for them through their own lifecycle APIs.
+- Body (optional JSON): `holdMs` (default 60000, 1000-240000) and `timeoutMs`
+  (default 600000, 10000-3600000). A `POST` while a drain is active changes
+  nothing and answers `started: false`.
+- The options body is limited to 1 KiB and a two-second read deadline. Shutdown
+  or socket abort revokes a pending read's authority. At the internal limit of
+  128 retained held reservations, additional requests proceed normally;
+  saturation does not increment `admittedAtCap`. This bounds held reservations,
+  timers and listeners, not all HTTP payloads or total server memory.
+- POST/DELETE require the actual loopback peer, no Forwarded/X-Forwarded-For/
+  X-Real-IP headers, and no Origin header, including empty or `null`. If
+  `MERIDIAN_API_KEY` is configured, the matching `x-api-key` or Bearer key is
+  also required. GET `/inflight` keeps its existing keyless read-only policy.
+- Same-key and declared subtree cancellation reaches live, parsed held
+  requests without remembering a cancellation for later requests. Socket
+  abort removes its waiter before any SDK/session-store work. A body-only
+  identity cannot be registered before its JSON bytes arrive. Held requests
+  keep the existing opt-in idle-exit lifetime busy.
+- State belongs to this instance and disappears at restart. Authorized local
+  operators share it; the first caller has no exclusive lease. Standalone
+  Antigravity is unchanged. Soft-hold `draining` is distinct from shutdown
+  health/readiness and does not change them.
+
+`GET /inflight` reports it:
+
+```json
+{
+  "scope": "client-http",
+  "total": 0,
+  "draining": true,
+  "drain": {
+    "active": true,
+    "startedAt": "2026-09-30T12:00:00.000Z",
+    "endsAt": "2026-09-30T12:10:00.000Z",
+    "holdMs": 60000,
+    "held": 2,
+    "admittedAtCap": 0,
+    "lastEnded": null
+  }
+}
+```
+
+A supervisor that gives up calls idempotent `DELETE /drain`. During shutdown,
+held clients receive the existing route-appropriate 503/Retry-After response;
+their client must retry if appropriate. A replacement process has no previous
+hold or accepted connection ownership.
 
 ## Graceful shutdown
 
@@ -662,7 +903,7 @@ when their opening text and working directory match.
 | `letta` | The `conv-<uuid>` id in the agent-info block Letta places in its opening user message (no session header) |
 | `passthrough` (LiteLLM) | `x-litellm-session-id` |
 | `cherry`, `openai` | Inherit OpenCode header handling; a headerless generic OpenAI tool loop additionally gets a derived `tool-loop:<hash>` key, so it resumes instead of packing |
-| `polytoken` | Valid `x-polytoken-session` |
+| `polytoken` | Nonblank `x-polytoken-conversation`, falling back to `x-polytoken-session` |
 | `droid`, `forgecode` | none — fingerprint fallback |
 
 ### Claude Code behind a gateway
@@ -805,8 +1046,9 @@ request-scoped context contract or a way to make content disappear from an
 active model session. In particular, do not use it for secrets or instructions
 that must be forgotten. For Pi and generic passthrough, persist advisory
 snapshots in append-only history when client and SDK context must agree. An
-explicit opt-in contract with defined retention semantics remains under
-discussion in [#1068](https://github.com/rynfar/meridian/issues/1068).
+explicit request-scoped context API was declined in
+[#1068](https://github.com/rynfar/meridian/issues/1068); append-only advisory
+snapshots remain the supported approach.
 
 ### Reading the log
 
@@ -1024,7 +1266,128 @@ Old-package negative-write probes are a separate acceptance step; this command a
 | `meridian profile login <name> [--headless]` | Re-authenticate an expired profile, adding it first if that name has no profile yet (browser-login profiles only); `--headless` uses the URL/code flow |
 | `meridian profile remove <name>` | Remove a profile and its credentials |
 | `meridian refresh-token` | Manually refresh the Claude OAuth token (exits 0/1) |
+| `meridian chatgpt-migrate [--reverse] [--dry-run] [--step <steps>]` | Move ChatGPT accounts from oc-codex-multi-auth and opencode's OpenAI login into Meridian's store, or with `--reverse` hand them back. See [ChatGPT migration](#chatgpt-migration) |
+| `meridian instance-import --from <dir> --to <dir> [--apply]` | Move one Meridian instance's ChatGPT seats, settings and telemetry into another, then retire the source. See [Moving ChatGPT seats between instances](#moving-chatgpt-seats-between-instances) |
 | `meridian test-error-report` | Crash on purpose so the configured [error-reporting](#error-reporting) collector receives a test issue. Always exits 1; when reporting is off it only prints how to turn it on |
+
+## ChatGPT subscriptions
+
+Meridian can serve OpenAI models from ChatGPT subscriptions (Plus, Pro,
+Business) beside Claude. A request for an OpenAI model (`gpt-*`, `chatgpt-*`,
+`codex*`, `o<n>*`) on `POST /v1/responses` is passed through to the Codex
+backend with one of your ChatGPT seats; every other model keeps going to
+Claude. The ChatGPT path never enters the Claude pipeline: no Agent SDK, no
+system prompt and no request plugins, so a Claude-oriented plugin cannot
+rewrite a GPT request. A GPT model is never answered by Claude: on
+`/v1/messages` it gets a 404 saying to use the Responses API.
+
+`POST /v1/images/generations` and `POST /v1/images/edits` (the OpenAI Images
+API) always go to ChatGPT, whatever model the body names, on the same seats
+and with the same failover as a Responses turn. The body is sent to the Codex
+backend's image endpoints as the client wrote it, and its JSON answer comes
+back unchanged. Without ChatGPT they answer 404.
+
+| `MERIDIAN_CHATGPT_CREDENTIALS` | Seats come from |
+|---|---|
+| `owned` | Meridian's own store (`MERIDIAN_CHATGPT_STORE_PATH`). Meridian takes a writer lease on it at startup and is the only program that renews its seats, each before its access token runs out. |
+| `follow-external` | The oc-codex-multi-auth store (`MERIDIAN_CODEX_POOL_PATH`), read-only. Meridian never refreshes or writes it; that tool owns sign-in, renewal and removal. |
+| `off` | Nowhere: GPT model names keep meaning Claude, as before. |
+
+Unset, Meridian runs `owned` once its own store holds a seat, and is off
+otherwise, so an instance nobody configured for ChatGPT is unchanged.
+
+**Adding a seat** (`owned`): on `/profiles`, type a name and choose
+**Connect with ChatGPT**, or run `meridian profile add <name> --chatgpt`
+(`--headless` for a device code). ChatGPT redirects the browser to
+`http://127.0.0.1:1455/auth/callback`; from another machine, paste the address
+the tab ended on into the panel, or use the device code. Seats already signed
+in to oc-codex-multi-auth move over with [`meridian chatgpt-migrate`](#chatgpt-migration).
+
+**Seats are profiles.** `/profiles/list`, `/v1/usage/quota/all`,
+`POST /profiles/active`, `/profiles/events` and `meridian profile
+list|switch|rename|remove|login` cover seats as they cover Claude profiles,
+with `type: "chatgpt"`. Each provider has its own active account. A turn goes
+to the active seat, else the next seat with plan quota in the saved profile
+order; a seat that is rate limited or refuses a model is benched and the next
+one is tried before any output reaches the client. `x-meridian-profile` pins a
+turn to one seat. `POST /profiles/chatgpt/remove` deletes an owned seat with
+its credentials.
+
+**Settings → ChatGPT** holds the gateway's own options: forwarding reasoning
+summaries, a per-request cost cap, a fallback model, when a seat with its plan
+spent may serve on purchased Codex credits (`never` by default), and where
+free-plan seats rank.
+
+**Telemetry and health.** Each turn is recorded with `adapter: "chatgpt"`,
+valued at OpenAI list prices for the model that served it. `/health` carries a
+`chatgpt` block (seat counts only) and judges the instance by every backend it
+serves, `/readyz` counts seats as profiles, and `/v1/models` lists the models
+the Codex backend's catalog offers.
+
+Point an OpenAI-compatible client's base URL at `http://127.0.0.1:3456/v1`.
+For OpenCode, set `provider.openai.options.baseURL` to that address.
+
+## ChatGPT migration
+
+`meridian chatgpt-migrate` hands ChatGPT subscription accounts from oc-codex-multi-auth (and opencode's own `openai` OAuth login in `auth.json`) to Meridian. Refresh tokens are single-use, so exactly one program may refresh each account; the command moves that authority rather than copying it.
+
+| Step | What it does |
+|------|--------------|
+| `processes` | Lists running opencode processes that still hold the tokens in memory: those whose effective config loads the plugin, and, while `auth.json` holds an OpenAI login, every opencode process. A process whose config changed after it started counts only if that file may have listed the plugin when it started: the `.meridian-backup` the `plugin` step wrote shows when the plugin was removed, so a later unrelated rewrite of the file does not flag processes started after the removal. systemd units are named with the command that stops them. Nothing is killed |
+| `import` | Reads every copy of every account (global and per-project stores, flagged store, `backups/`, keychain entries with `CODEX_KEYCHAIN=1` or `--keychain`, `auth.json`) and writes the freshest token per seat into Meridian's store. Accounts found only in backups need `--include-backup-only` |
+| `strip` | Removes the refresh tokens from the plugin's stores under its own locks, removes the `openai` OAuth entry from `auth.json`, and moves `backups/` aside. Each original is kept as `<name>.meridian-backup` (mode 0600). A source holding a seat Meridian does not hold yet, or holds an older token for, is refused unless `--strip-unowned` |
+| `plugin` | Removes oc-codex-multi-auth from every opencode config that loads it, global and project-level, and from the TUI configs (`tui.json`/`tui.jsonc`) that load its quota status bar, keeping comments |
+| `provider` | Sets `provider.<id>.options.baseURL` (default provider `openai`, `--provider` to change) to Meridian in the global config file that takes precedence |
+| `validate` | Checks through the running Meridian that each account reports its quota; `--test-prompt` also sends one short prompt on the cheapest model |
+
+Steps run in that order; `--step import,strip` runs a subset. `import` and `strip` refuse while a process holds the tokens unless `--force`, which overrides that check and nothing else: the `processes` step then reports the holders without failing the run. Run with `--dry-run` first: it reads everything, writes nothing, and never prints a token. After `import`, run Meridian with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset) so it refreshes the accounts, and restart opencode after `plugin` and `provider`.
+
+The store and the settings (where profile names are saved) are those of the Meridian server running at `--meridian-url`, found in `/proc` by its port, so an instance with its own `HOME` or `MERIDIAN_CHATGPT_STORE_PATH` is migrated into the files it actually reads. The command prints which ones it uses, and the flags to pass when that instance is stopped. `--store` and `--config-dir` win over everything, then `MERIDIAN_CHATGPT_STORE_PATH` and `MERIDIAN_CONFIG_DIR` when this shell sets them, then the running instance, then the defaults.
+
+### Duplicates on import
+
+`import` compares every seat with the ChatGPT profiles Meridian already holds:
+
+- **Same seat** (same `accountUserId`): never a second profile. The one record keeps whichever token is fresher, and its profile name. Two records for one seat would hold one single-use refresh token twice, and the second renewal would fail.
+- **Possible duplicate** (another `accountUserId` with the same email in the same workspace): imported under `<name> (possibly duplicate of <existing profile>)`, spelled as a profile id, e.g. `alice-shared-3b18-possibly-duplicate-of-alice-shared`. The name is saved in `chatGptProfileNames`; rename it on `/profiles` once checked. `--skip-possible-duplicates` leaves these seats out. Each such seat has its own refresh token, so importing it renews nothing twice.
+- A seat whose refresh token Meridian already holds under another seat is refused.
+
+Email alone is not identity (one person holds seats in several workspaces), and neither is the workspace (a Business workspace holds many people). The dry run prints every match.
+
+### Reverse: handing seats back to oc-codex-multi-auth
+
+`meridian chatgpt-migrate --reverse` undoes the migration, step by step:
+
+| Step | What it does |
+|------|--------------|
+| `processes` | Lists opencode processes that still hold plugin tokens (refused for `handback` without `--force`), and the ones that need a restart to load the plugin again |
+| `handback` | Writes Meridian's seats into the plugin's global store (`--plugin-store` for another), merged by `accountUserId`: every other account is kept, and the store as it was is preserved as `.meridian-backup`. A `.meridian-backup` original whose refresh token Meridian never renewed is restored whole; otherwise Meridian's current token is laid over the plugin's own record. Then the seats are removed from Meridian's store, under its writer lease, so exactly one program renews each. Stop Meridian first; a seat with an interrupted renewal is skipped unless `--include-interrupted` (`--force` only overrides the process check). `--seat <profile or seat id>` hands back only some |
+| `plugin` | Puts oc-codex-multi-auth back in every config whose preserved original listed it, at its old position, and in the global file whose plugin list opencode uses. Its TUI status bar goes back into the `tui.json` files that listed it, or into the global `tui.json` (where the plugin's installer puts it) when none did. The spec is the one the original named, else `oc-codex-multi-auth@latest`; `--plugin-path <repo>` writes `file://<repo>` instead (it must be a checkout of the plugin; build it with `npm ci && npm run build`) |
+| `provider` | Undoes the `provider` step: `baseURL` goes back to its value before the migration (or away), and the placeholder `apiKey` goes only if the provider had none before |
+| `verify` | Checks that no seat is renewed by both, that opencode's global config loads the plugin and its global TUI config the status bar, and that the provider no longer points at Meridian |
+
+The plugin restores opencode's own `openai` login in `auth.json` from its store when it loads; the `backups/` directory the forward `strip` moved aside holds spent tokens and stays aside. Restart opencode afterwards.
+
+## Moving ChatGPT seats between instances
+
+`meridian instance-import` folds one instance's ChatGPT seats into another, for example a separate ChatGPT instance into the one that serves Claude, so a single Meridian serves both. Each instance is named by its config directory (its `MERIDIAN_CONFIG_DIR`); `--from-store`/`--to-store` and `--from-telemetry`/`--to-telemetry` name a store or database the instance keeps elsewhere (`MERIDIAN_CHATGPT_STORE_PATH`, `MERIDIAN_TELEMETRY_DB`).
+
+```bash
+meridian instance-import --from ~/.config/meridian-gpt --to ~/.config/meridian          # what would happen
+meridian instance-import --from ~/.config/meridian-gpt --to ~/.config/meridian --apply  # do it
+```
+
+| Moved | How |
+|---|---|
+| ChatGPT seats | Every account in the source's store, with its credentials unchanged and in its order, written through the destination store's writer lease |
+| Seat names | `chatGptProfileNames`, `chatGptProfileAliases` and `chatGptActiveSeat` (unless the destination has an active seat of its own), so every seat keeps its profile name and former names |
+| ChatGPT features | `chatgpt` and `integrations` keys the destination does not set; a value both set differently is a conflict. Routing order entries that name a seat |
+| Prices | `model-pricing.json` overrides the destination does not have |
+| Telemetry | Every request and diagnostic log entry, with all its columns, under the same profile ids, so each seat's requests and estimated value on `/` and `/telemetry` are what they were |
+
+Other settings (`layout`, `claudeExecutable`, ...) and Claude profiles stay with their instance; a source with Claude profiles is refused. The plan is computed the way the destination will name its seats: a name the destination already uses for a Claude profile, a former name, or another seat, and requests filed under such a name, are conflicts, and nothing is written. `--rename <old>=<new>` files a seat, or requests filed under `<old>`, under another name.
+
+With `--apply`, neither instance may be serving ChatGPT: stop the source, and the destination unless it has no ChatGPT seats yet (a destination still serving Claude may keep running). Telemetry is copied first, in short transactions beside the running destination, and read back column by column; then the settings; the seats last. Only after the whole destination has been checked again is the source retired: each file it read is renamed to `<name>.imported-<time>`, and nothing is deleted. A run that stops part-way leaves the source in place, and running the command again continues it without copying a request twice. Once it succeeds, restart the destination with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset).
 
 ## SDK Feature Toggles (Experimental)
 
@@ -1150,14 +1513,17 @@ Measured against the live SDK (sonnet, one tool call), capped vs. uncapped: **66
 
 The cap is lifted for the cases that genuinely need the SDK to keep going — deferred tools (ToolSearch discovery is a real round-trip), a configured advisor, and structured output — and an explicit `MERIDIAN_PASSTHROUGH_MAX_TURNS` always wins. Kill switch: `MERIDIAN_PASSTHROUGH_EARLY_STOP=0` restores the uncapped multi-turn behavior.
 
+A lifted budget still stops at the tool boundary. Deferred tools and an advisor need turns *before* the client tool call, not after it, so whenever the budget is above one turn Meridian adds a `PostToolBatch` hook: once a batch holding a call forwarded to the client has resolved, the hook returns `continue: false` and the CLI ends the turn without another model request. The turn ends on a normal `success` result, so the transcript is committed at the tool boundary exactly as under the cap. The stop counts only calls Meridian captured for the client. A batch made only of other calls continues: SDK-internal ones (ToolSearch), a bare tool name the CLI refused, a repeat the hook dropped — so the CLI-refusal recovery (`MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY`) still runs to `error_max_turns`. Not covered: the one-turn cap, where `error_max_turns` is the expected terminal shape; structured output, whose answer is a StructuredOutput call that can only come after the denial; and the kill switch, which removes the stop along with the cap.
+
 > **Upgrade note.** If you previously set `MERIDIAN_PASSTHROUGH_MAX_TURNS` — most
-> likely to give deep orchestration chains more headroom (#494) — you will not
-> get this saving: an explicit budget wins over the cap by design, so every tool
-> call still pays for a digest turn. Try unsetting it. The reason the override
+> likely to give deep orchestration chains more headroom (#494) — an explicit
+> budget still wins over the cap by design. A budget above one turn no longer
+> pays for a digest turn: it gets the `PostToolBatch` stop described above, so
+> the pin only adds headroom before the tool boundary. The reason the override
 > was needed is largely gone: it existed because wide parallel tool calls could
-> exhaust the budget, and under the cap the SDK stops at the tool boundary
-> instead of competing for turns with its own internal loop. If unsetting it
-> causes trouble, that is worth an issue rather than a permanent pin.
+> exhaust the budget, and the SDK now stops at the tool boundary instead of
+> competing for turns with its own internal loop. If unsetting it causes
+> trouble, that is worth an issue rather than a permanent pin.
 >
 > Two other behaviours change with the cap, both deliberate. A passthrough tool
 > turn now ends on the SDK's `max_turns` result rather than a clean `success` —

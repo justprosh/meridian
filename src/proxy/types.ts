@@ -25,6 +25,8 @@ export interface AntigravityOptions {
   browserMcpExecutable?: string
   allowNativeSubagents?: boolean
   pendingToolTimeoutMs?: number
+  /** How long a finished conversation's live process waits for the next turn (default pendingToolTimeoutMs). After it expires the next turn replays the whole history. */
+  idleConversationMs?: number
 }
 
 export interface ProxyConfig {
@@ -82,6 +84,7 @@ export function resolveBackendConfig(config: Partial<ProxyConfig>): ProxyConfig 
       maxConcurrent: process.env.MERIDIAN_AGY_MAX_CONCURRENT === undefined ? undefined : Number(process.env.MERIDIAN_AGY_MAX_CONCURRENT),
       turnTimeoutMs: process.env.MERIDIAN_AGY_TURN_TIMEOUT_MS === undefined ? undefined : Number(process.env.MERIDIAN_AGY_TURN_TIMEOUT_MS),
       pendingToolTimeoutMs: process.env.MERIDIAN_AGY_TOOL_TIMEOUT_MS === undefined ? undefined : Number(process.env.MERIDIAN_AGY_TOOL_TIMEOUT_MS),
+      idleConversationMs: process.env.MERIDIAN_AGY_IDLE_CONVERSATION_MS === undefined ? undefined : Number(process.env.MERIDIAN_AGY_IDLE_CONVERSATION_MS),
       ...config.antigravity,
     } } : {}),
   }
@@ -118,6 +121,25 @@ export interface ProxyServer {
   getInFlightCount?(): number
   /** Run one fail-closed transcript maintenance sweep. */
   sweepSessionGc?(): Promise<void>
+  /** Present only when this instance has a ChatGPT credential source. */
+  chatGpt?: ChatGptUpstreamControl
+}
+
+/** The ChatGPT credential source, as much of it as a host lifecycle needs. */
+export interface ChatGptUpstreamControl {
+  readonly mode: "owned" | "follow-external"
+  accounts(): number
+  isServing(): boolean
+  /** Take refresh authority (owned). Rejects rather than degrading. No-op for follow-external. */
+  acquire(): Promise<void>
+  release(): void
+  /** Renew the seat most overdue for renewal (owned); true when one was renewed. Always false for follow-external. */
+  renewDue(): Promise<boolean>
+  /**
+   * Resolves once every credential exchange already under way (renewals,
+   * sign-ins) has recorded its result. Await it before `release`.
+   */
+  settle(): Promise<void>
 }
 
 export const DEFAULT_PROXY_CONFIG: ProxyConfig = {

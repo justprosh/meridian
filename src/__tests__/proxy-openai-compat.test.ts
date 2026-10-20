@@ -895,6 +895,56 @@ describe("POST /v1/chat/completions — streaming", () => {
     expect(text).toContain("data: [DONE]")
   })
 
+  it("forwards a mid-stream error instead of reporting only a length finish", async () => {
+    // A turn that fails after message_start is closed with a max_tokens
+    // message_delta followed by an error event (see terminateFailedStream).
+    // Dropping the error left OpenAI clients with finish_reason "length", so
+    // an upstream refusal looked like truncation and clients that continue
+    // truncated turns resent the refused request.
+    const app = createTestApp()
+    const originalFetch = app.fetch.bind(app)
+    const refusal = "API Error: safeguards flagged this message."
+    const internalFrames = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-sonnet-5", stop_reason: null, usage: { input_tokens: 10, output_tokens: 0 } } })}`,
+      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Partial" } })}`,
+      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "max_tokens", stop_sequence: null }, usage: { output_tokens: 3 } })}`,
+      `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: refusal } })}`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+    ]
+    app.fetch = (req, env, executionCtx) => {
+      if (req.url === "http://internal/v1/messages") {
+        return Promise.resolve(new Response(`${internalFrames.join("\n\n")}\n\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }))
+      }
+      return originalFetch(req, env, executionCtx)
+    }
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    const frames = (await readStream(res)).split("\n")
+      .filter(l => l.startsWith("data: ") && l !== "data: [DONE]")
+      .map(l => JSON.parse(l.slice(6)) as Record<string, unknown>)
+    const errorIndex = frames.findIndex(frame => frame.error !== undefined)
+    expect(errorIndex).toBeGreaterThan(-1)
+    expect(frames[errorIndex]!.error).toEqual({
+      type: "invalid_request_error",
+      code: "invalid_request_error",
+      message: refusal,
+    })
+    // The error must reach the client after the length finish it qualifies.
+    const lengthIndex = frames.findIndex(frame =>
+      (frame.choices as Array<{ finish_reason?: string }> | undefined)?.[0]?.finish_reason === "length")
+    expect(lengthIndex).toBeGreaterThan(-1)
+    expect(errorIndex).toBeGreaterThan(lengthIndex)
+  })
+
   // --- tool_call_counter increment behavior ---
 
   type DeltaToolCall = {
@@ -988,6 +1038,49 @@ describe("POST /v1/chat/completions — streaming", () => {
       )
     expect(argChunks.map(a => a.index)).toEqual([0, 1, 2])
     expect(argChunks.map(a => a.function!.arguments)).toEqual(['{"x":1}', '{"y":2}', '{"z":3}'])
+  })
+
+  it("keeps each tool's arguments on its own call when they arrive after a later tool starts", async () => {
+    // Fragments for block 0 arrive after block 1 has started. Routing by the
+    // most recently started tool concatenates both inputs onto the second call
+    // ({"path":"a.txt"}{"path":"b.txt"}) and leaves the first call empty.
+    mockMessages = [
+      messageStart("msg_1"),
+      toolUseBlockStart(0, "read", "tu_a"),
+      toolUseBlockStart(1, "read", "tu_b"),
+      inputJsonDelta(0, '{"path":'),
+      inputJsonDelta(1, '{"path":"b.txt"}'),
+      inputJsonDelta(0, '"a.txt"}'),
+      blockStop(0),
+      blockStop(1),
+      messageDelta("tool_use"),
+      messageStop(),
+    ]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      messages: [{ role: "user", content: "read a and b" }],
+    })
+
+    const calls = new Map<number, { id?: string; arguments: string }>()
+    for (const chunk of streamChunks(await readStream(res))) {
+      for (const tc of chunk.choices[0]?.delta.tool_calls ?? []) {
+        if (tc.index === undefined) continue
+        const call = calls.get(tc.index) ?? { arguments: "" }
+        if (tc.id) call.id = tc.id
+        call.arguments += tc.function?.arguments ?? ""
+        calls.set(tc.index, call)
+      }
+    }
+    const assembled = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => ({
+      id: call.id,
+      input: JSON.parse(call.arguments),
+    }))
+    expect(assembled).toEqual([
+      { id: "tu_a", input: { path: "a.txt" } },
+      { id: "tu_b", input: { path: "b.txt" } },
+    ])
   })
 
   it("text-then-tool stream: tool indexes start at 0 (not affected by preceding text block)", async () => {

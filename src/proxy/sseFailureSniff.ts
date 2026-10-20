@@ -293,10 +293,26 @@ export async function relayStreamAttempt(
     const contentType = inner.headers.get("content-type") ?? ""
     if (!contentType.includes("text/event-stream")) {
       const chunks: Uint8Array[] = []
+      let bufferedBytes = 0
       while (!opts.isCancelled()) {
         const { done, value } = await reader.read()
         if (done) break
-        if (value) chunks.push(value)
+        if (value) {
+          bufferedBytes += value.byteLength
+          if (bufferedBytes > 64 * 1024) {
+            // Headers already went out on an earlier SSE attempt. An
+            // oversized JSON fallback is not evidence permitting another
+            // account replay; stop reading and join its cancellation first.
+            await discard()
+            opts.onMeaningfulForwarded()
+            await opts.enqueue(new TextEncoder().encode(`event: error\ndata: ${JSON.stringify({
+              type: "error",
+              error: { type: "api_error", message: "Non-SSE fallback response exceeds the 64 KiB inspection limit" },
+            })}\n\n`))
+            return { kind: "relayed" }
+          }
+          chunks.push(value)
+        }
       }
       if (opts.isCancelled()) return { kind: "relayed" }
       let payload: unknown = null

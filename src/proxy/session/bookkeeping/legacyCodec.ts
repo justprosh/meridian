@@ -191,6 +191,12 @@ export function validateStoredSession(key: string, value: unknown): asserts valu
   if (entry.lineageHash !== undefined && typeof entry.lineageHash !== "string") {
     throw new Error(`session store entry ${JSON.stringify(key)} has invalid lineageHash`)
   }
+  if (entry.clientLineageHash !== undefined && typeof entry.clientLineageHash !== "string") {
+    throw new Error(`session store entry ${JSON.stringify(key)} has invalid clientLineageHash`)
+  }
+  if (entry.resumeContextHash !== undefined && (
+    typeof entry.resumeContextHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.resumeContextHash)
+  )) throw new Error(`session store entry ${JSON.stringify(key)} has invalid resumeContextHash`)
   const stringArrays = ["messageHashes", "passthroughToolCallIds"] as const
   for (const field of stringArrays) {
     const item = entry[field]

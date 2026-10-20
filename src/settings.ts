@@ -19,6 +19,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "./configDir"
 import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
 
 /**
@@ -43,6 +44,16 @@ export interface MeridianSettings {
    *  profiles.json order. MERIDIAN_PROFILE_ORDER env var takes precedence. */
   profileOrder?: string[]
   priorityFailback?: PriorityFailbackPolicy
+  /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
+  chatGptActiveSeat?: string
+  /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
+  chatGptProfileNames?: Record<string, string>
+  /**
+   * Former ids of renamed ChatGPT seats, keyed by seat id. The ChatGPT half of
+   * a Claude profile's `aliases`: a request, link or exclusion naming one still
+   * reaches the seat until a profile takes that name again.
+   */
+  chatGptProfileAliases?: Record<string, string[]>
 
   /**
    * Keep telemetry in SQLite instead of memory, so it survives a restart.
@@ -61,6 +72,11 @@ export interface MeridianSettings {
   telemetrySize?: number
   /** Entries the in-memory diagnostic log ring holds. MERIDIAN_DIAGNOSTIC_LOG_SIZE wins. */
   diagnosticLogSize?: number
+
+  integrations?: MeridianIntegrationSettings
+
+  /** ChatGPT gateway features. Re-read per request; resolved in proxy/chatgpt/features.ts. */
+  chatgpt?: ChatGptFeatureSettings
 
   /**
    * Sentry-protocol DSN (GlitchTip, Sentry) that Meridian's own uncaught
@@ -81,6 +97,59 @@ export interface MeridianSettings {
    *  them in a centered column, "wide" spans the window. Read on every page
    *  load, so a change shows on the next reload. */
   layout?: PageLayout
+  /** Which Claude Code executable runs each turn: "system" (default) prefers
+   *  the `claude` on PATH, "bundled" the copy Meridian ships with, "custom"
+   *  `claudeExecutablePath`. MERIDIAN_CLAUDE_PATH wins over all three. Read
+   *  whenever the executable is resolved, so a change applies to the next turn. */
+  claudeExecutable?: ClaudeExecutableMode
+  /** The absolute path custom mode runs. Kept when another mode is chosen, so
+   *  switching back does not mean typing it again. */
+  claudeExecutablePath?: string
+
+  /**
+   * When `/readyz` declares a connection outage on this instance's configured
+   * Claude egress: after at
+   * least `upstreamUnreachableMinFailures` connection failures (default 3)
+   * spanning `upstreamUnreachableAfterMs` (default 120000) with no qualifying configured-egress transport answer
+   * in between. It then holds for `upstreamUnreachableHoldMs` after
+   * the latest failure (default 300000; 0 never fails readiness) before letting
+   * traffic back in. MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS / _HOLD_MS /
+   * _MIN_FAILURES win over CLAUDE_PROXY_* aliases and persisted numeric
+   * fields. Invalid values fall back safely. Re-read on every evaluation.
+   */
+  upstreamUnreachableAfterMs?: number
+  upstreamUnreachableHoldMs?: number
+  upstreamUnreachableMinFailures?: number
+}
+
+/** What the operator saved; absent keys take the defaults in proxy/chatgpt/features.ts. */
+export type ChatGptFeatureSettings = {
+  thinkingPassthrough?: boolean
+  /** "client" | "auto" | "concise" | "detailed"; see ChatGptReasoningSummary. */
+  reasoningSummary?: string
+  maxBudgetUsd?: number
+  fallbackModel?: string
+  /** "never" | "reserve" | "immediately"; see ChatGptCreditsPolicy. */
+  creditsPolicy?: string
+  /** Seat id (accountUserId) -> policy overriding `creditsPolicy` for that seat. */
+  seatCreditsPolicy?: Record<string, string>
+  /** "before-credits" | "after-credits"; see ChatGptFreeSeatOrder. */
+  freeSeatOrder?: string
+}
+
+/**
+ * A type alias rather than an interface so it carries an implicit index
+ * signature: flags written by a newer build survive a round-trip through an
+ * older one.
+ */
+export type MeridianIntegrationSettings = {
+  /** ChatGPT account usage windows, read with the accounts' own access tokens. Never refreshes. */
+  codexUsage?: boolean
+}
+
+/** On unless the operator turned it off; off means no usage request at all. */
+export function isCodexUsageEnabled(settings: MeridianSettings): boolean {
+  return settings.integrations?.codexUsage ?? true
 }
 
 /**

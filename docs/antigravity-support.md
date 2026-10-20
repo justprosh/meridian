@@ -71,9 +71,13 @@ Keep the client's own conversation history.
 1. **Interrupted delivery with a saved answer:** the supported integration can
    retrieve the same answer/tool IDs. It checks the already displayed text before
    appending a recovered suffix. It does not run a second model to invent a suffix.
-2. **A tool completed and its result is in client history:** continue using the
-   complete history/result. The supported history-replay paths recover expired
-   CLI sessions without requesting that completed action again.
+2. **A tool completed and its result is in client history:** Meridian supplies
+   the recorded calls and results when recovering through full history replay.
+   A fresh model can still request a successful action again. The
+   [retained long-history probe](https://github.com/rynfar/meridian/blob/cd6b31a752e2f2d20240fee1e63ea46a39830dd9/docs/maintenance/antigravity-history-1314-proof.md)
+   with Pi 1.1.0, agy 1.2.7 and Gemini 3.8 Flash Low on macOS observed two
+   identical successful writes after backend replacement. Review repeated actions
+   against their recorded results and external state before executing them again.
 3. **Service died before saving the identified response:** the same request gets
    HTTP 409 with an uncertain-outcome explanation, before any CLI probe or
    generation. A cache-only lookup still returns 404 when no snapshot exists.
@@ -98,7 +102,15 @@ or active-resume guarantee. No automatic client-side reconciliation UI is claime
 `MERIDIAN_AGY_TURN_TIMEOUT_MS` bounds an active CLI turn (default 300,000 ms).
 `MERIDIAN_AGY_TOOL_TIMEOUT_MS` bounds idle waiting for a client result
 (default 60,000 ms); a late result can recover through completed history.
+`MERIDIAN_AGY_IDLE_CONVERSATION_MS` keeps a completed conversation's live process
+for the next turn (default: the tool timeout); a later turn replays the full history.
 `MERIDIAN_AGY_MAX_CONCURRENT` bounds concurrent CLI processes (default 4).
+agy keeps only about 192,000 bytes of one input step and silently drops the rest;
+a started or replayed conversation sends its whole history in one step, history last.
+`MERIDIAN_AGY_MAX_PROMPT_BYTES` (default 190,000) keeps that prompt under the limit by
+shortening the oldest large tool results, arguments and text first and the newest round
+last, with a note to the model to re-read what it needs. A current request that alone does
+not fit fails with 400 `prompt is too long` instead of being answered from part of it.
 Request/response/attachment buffers are also bounded; see the backend guide.
 
 These controls do not cap the entire multi-turn task's tokens, number of tool

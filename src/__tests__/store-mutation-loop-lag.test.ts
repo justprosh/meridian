@@ -75,11 +75,19 @@ function buildFixture(dir: string, entries: number, messagesPerEntry: number): {
 }
 
 /** Event-loop delay caused by a synchronous call: how late an immediately due timer fires. */
-async function loopLagOf(work: () => unknown): Promise<number> {
+async function loopLagOf(label: string, work: () => unknown): Promise<number> {
+  const cpuBefore = process.cpuUsage()
   const scheduledAt = performance.now()
   const fired = new Promise<number>((resolve) => setTimeout(() => resolve(performance.now()), 0))
   work()
-  return (await fired) - scheduledAt
+  const workFinishedAt = performance.now()
+  const lag = (await fired) - scheduledAt
+  const cpu = process.cpuUsage(cpuBefore)
+  console.log(`[loop-lag-sample] ${JSON.stringify({
+    label, lagMs: lag, synchronousWorkMs: workFinishedAt - scheduledAt,
+    processCpuMs: (cpu.user + cpu.system) / 1_000,
+  })}`)
+  return lag
 }
 
 function median(values: number[]): number {
@@ -107,19 +115,19 @@ describe("session store mutation cost on a large store", () => {
     // Full-document work with the same lock, atomic rename and directory flush as a mutation.
     const baselines: number[] = []
     for (let run = 0; run < 3; run++) {
-      baselines.push(await loopLagOf(() => rewriteFullStore(dir)))
+      baselines.push(await loopLagOf(`baseline-${run}`, () => rewriteFullStore(dir)))
     }
 
     // The first mutation after a foreign write parses once and encodes every entry once.
     storeSharedSession(keys[0]!, randomUUID(), 3, hash(), [hash(), hash(), hash()])
     const lags: number[] = []
     for (let index = 1; index <= 5; index++) {
-      lags.push(await loopLagOf(() => {
+      lags.push(await loopLagOf(`warm-${index}`, () => {
         storeSharedSession(keys[index]!, randomUUID(), 3, hash(), [hash(), hash(), hash()])
       }))
     }
     const entry = lookupSharedSession(keys[6]!)!
-    lags.push(await loopLagOf(() => {
+    lags.push(await loopLagOf("warm-locator", () => {
       attachSharedTranscriptLocator(keys[6]!, entry.claudeSessionId, {
         sessionId: entry.claudeSessionId,
         configDir: "/home/user/.claude",
