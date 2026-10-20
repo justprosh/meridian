@@ -9,6 +9,7 @@ import { once } from "node:events"
 import { randomUUID } from "node:crypto"
 import { lstatSync } from "node:fs"
 import { fileURLToPath } from "node:url"
+import { observeChildClosure, stopAndJoinChild } from "./lib/e2eProcessCustody.mjs"
 
 const argument = process.argv.indexOf("--package")
 if (argument < 0 || !process.argv[argument + 1]) throw new Error("usage: --package <fresh.tgz>")
@@ -19,8 +20,11 @@ const root = mkdtempSync(join(tmpdir(), "meridian-packaged-bookkeeping-"))
 const children = []
 const home = join(root, "home")
 mkdirSync(home, { mode: 0o700 })
+const nativeConfig = join(root, "native-config")
+mkdirSync(nativeConfig, { mode: 0o700 })
 const env = {
   PATH: process.env.PATH, HOME: home, TMPDIR: root, SystemRoot: process.env.SystemRoot,
+  CLAUDE_CONFIG_DIR: nativeConfig,
   MERIDIAN_CREDENTIALS_READONLY: "1", MERIDIAN_NO_UPDATE_CHECK: "1", MERIDIAN_SESSION_GC_INTERVAL_MS: "0",
 }
 function run(command, args, cwd, expected = 0) {
@@ -41,7 +45,9 @@ async function start(packageRoot, sessionDirectory, mode, instances = "1", extra
   const child = fork(childFile, [packageRoot, sessionDirectory, mode, instances], {
     env: { ...env, ...extraEnv }, stdio: ["ignore", "pipe", "pipe", "ipc"],
   })
-  children.push(child)
+  const witness = observeChildClosure(child)
+  children.push({ child, witness })
+  child.stdout.resume()
   let stderr = ""
   child.stderr.on("data", bytes => { stderr += bytes })
   const ready = await Promise.race([
@@ -56,10 +62,17 @@ async function start(packageRoot, sessionDirectory, mode, instances = "1", extra
   return { child, url: ready.url }
 }
 async function stop(child) {
-  const exit = once(child, "exit")
+  const actor = children.find(actor => actor.child === child)
+  assert(actor, "Stop only an original owned child")
   child.send({ type: "close" })
-  const [code] = await exit
-  assert.equal(code, 0)
+  let timer
+  try {
+    await Promise.race([
+      actor.witness.joined,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("package child did not join after close")), 20_000) }),
+    ])
+  } finally { clearTimeout(timer) }
+  assert.equal(actor.witness.state.exitCode, 0)
 }
 async function usage(url, expected) {
   const response = await fetch(`${url}/v1/sessions/packaged-session/context-usage`)
@@ -178,12 +191,9 @@ try {
     architecture: process.arch, surface: "packaged runtime, migration, two HTTP processes, restart, export and baseline read",
     liveSdk: false }))
 } finally {
-  for (const child of children) {
-    if (child.exitCode === null && child.signalCode === null) {
-      const exit = once(child, "exit")
-      child.kill("SIGKILL")
-      await exit
-    }
-  }
-  rmSync(root, { recursive: true, force: true })
+  const joined = []
+  for (const { child, witness } of children) joined.push(await stopAndJoinChild(child, witness))
+  const allJoined = joined.every(state => state.joined)
+  if (allJoined) rmSync(root, { recursive: true, force: true })
+  assert(allJoined, `Original package children/pipes did not join; fixture retained at ${root}`)
 }

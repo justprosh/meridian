@@ -8581,6 +8581,14 @@ fresh directory initializes without migration. The baseline tarball is explicit
 because registry 1.78.0 has the known bundled-libsql import defect; a failed old
 import is not a successful rollback test.
 
+The smoke uses an explicit nonsecret API profile pointed at loopback, plus a
+private native config directory. This makes the health assertions independent
+of an operator login; an unauthenticated Claude profile correctly reports 503
+even when storage works. No model request is made. Normal stop and failure
+cleanup join each original child exit/close and both captured pipes before
+removing the temporary package installs and state. Missing custody fails the
+gate and retains that fixture for diagnosis.
+
 This gate exercises storage and server integration, **not** real model/SDK turns.
 It does not replace the affected-flow chain/parallel, stream/non-stream, resume,
 Linux admission or deletion-child platform scenarios in this guide. Run the same final
