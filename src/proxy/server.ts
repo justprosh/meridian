@@ -45,7 +45,7 @@ import { plog, setProxyDiagnosticSink, setProxyLogSilent } from "./operationalLo
 import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./admissionHold"
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
-import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
+import { closeServerWithGracePeriod, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
@@ -261,7 +261,7 @@ import {
 import { createSdkProcessGate } from "./session/sdkProcessGate"
 import {
   admitSessionStoreWrite, bookkeepingMode, checkpointProxyBookkeeping,
-  initializeProxyBookkeeping as initializeProxyBookkeepingRuntime, retainProxyBookkeeping,
+  initializeProxyBookkeeping as initializeProxyBookkeepingRuntime, retainProxyBookkeeping, closeProxyBookkeepingWhenSettled,
 } from "./session/bookkeeping/runtime"
 import { BookkeepingBusyError, BookkeepingCommitUncertainError } from "./session/bookkeeping/database"
 import { SessionLifecycleLockError, SessionLifecycleQueueCapacityError, SessionLifecycleQueueStalledError } from "./session/lifecycleErrors"
@@ -11558,27 +11558,38 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   }
 
   const bookkeepingHandle = retainProxyBookkeeping()
+  const getInFlightCount = () => inFlightRequests + pendingControlOperations + pendingProviderRequests + (antigravity?.getInFlightCount?.() ?? 0)
+  const beginDrain = () => {
+    if (draining) return
+    draining = true
+    shutdownAdmission.abort(new Error("Proxy shutdown started"))
+    // Held requests leave admission with 503; they remain owned through finally.
+    admissionHold.end("shutdown")
+    antigravity?.beginDrain?.()
+    chatGptLoginClosed = chatGptLogin?.close()
+  }
+  let backendClosePromise: Promise<void> | undefined
   return {
     app,
     config: finalConfig,
     initPlugins: initPluginsAsync,
-    closeBackend: async () => {
-      if (inFlightRequests) throw new Error("drain requests before closing the bookkeeping backend")
-      const results = await Promise.allSettled([executableProbeOwner.close(), authOwner.close(), antigravity?.closeBackend?.()])
-      if (sessionGcRunning) await sessionGcRunning
-      bookkeepingHandle?.close()
-      for (const result of results) if (result.status === "rejected") throw result.reason
+    closeBackend: () => {
+      if (backendClosePromise) return backendClosePromise
+      beginDrain()
+      backendClosePromise = (async () => {
+        const results = await Promise.allSettled([
+          executableProbeOwner.close(), authOwner.close(), antigravity?.closeBackend?.(),
+          waitForShutdownIdle(() => getInFlightCount() > 0),
+        ])
+        // Failed child cleanup is not permission to release its native owner.
+        const failures = results.filter(result => result.status === "rejected")
+        if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Backend cleanup failed; ownership retained")
+        await sweepSessionGc()
+        if (bookkeepingHandle) await closeProxyBookkeepingWhenSettled(bookkeepingHandle)
+      })()
+      return backendClosePromise
     },
-    beginDrain: () => {
-      draining = true
-      shutdownAdmission.abort(new Error("Proxy shutdown started"))
-      // Held requests are released into the shutdown 503 rather than left
-      // hanging until the grace period cuts their connections.
-      admissionHold.end("shutdown")
-      antigravity?.beginDrain?.()
-      // Closes the ChatGPT sign-in redirect listener, if one is open.
-      chatGptLoginClosed = chatGptLogin?.close()
-    },
+    beginDrain,
     forceAbortInFlight: () => {
       antigravity?.forceAbortInFlight?.()
       durableWritesRevoked = true
@@ -11589,7 +11600,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         controller.abort(new Error("Proxy shutdown grace period elapsed"))
       }
     },
-    getInFlightCount: () => inFlightRequests + pendingControlOperations + pendingProviderRequests + (antigravity?.getInFlightCount?.() ?? 0),
+    getInFlightCount,
     sweepSessionGc,
     ...(chatGptSource ? { chatGpt: {
       mode: chatGptSource.mode,
@@ -11909,12 +11920,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
 
   let closePromise: Promise<void> | undefined
   let idleExitCheck: ReturnType<typeof setInterval> | undefined
-  // The bookkeeping backend stays open while a revoked request may still use
-  // it, but this instance's auth-status children are cancelled either way.
-  const closeBackendWhenSettled = async (): Promise<void> => {
-    if ((getInFlightCount?.() ?? 0) === 0) await closeBackend?.()
-    else await authOwner.close().catch((error) => console.error("[PROXY] Auth status shutdown failed:", error))
-  }
   const instance: ProxyInstance = {
     server,
     config: finalConfig,
@@ -11931,7 +11936,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         stopBackgroundRefresh()
         stopUpdateCheck()
 
-        try {
+        let httpCloseError: unknown
         // Stop admitting new requests, then give whatever is already in flight
         // up to SHUTDOWN_GRACE_MS to finish naturally before pulling the plug.
         // This makes existing "call close() on SIGTERM" plugin code (see the
@@ -11947,34 +11952,24 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
             },
           })
         } catch (error) {
-          await closeBackendWhenSettled()
-          throw error
+          httpCloseError = error
+          forceAbortInFlight?.()
         } finally {
           connectionTracker.dispose()
         }
-        // Give aborted SDK iterators one short bounded window to observe the
-        // revocation and release their fencing leases. Durable callbacks also
-        // check the revocation synchronously, so a late task cannot republish.
-        const settleDeadline = Date.now() + 2_000
-        while ((getInFlightCount?.() ?? 0) > 0 && Date.now() < settleDeadline) {
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, 25)
-            timer.unref?.()
-          })
-        }
-        // Never delete while an unjoined request may still own an SDK child.
-        if ((getInFlightCount?.() ?? 0) === 0) {
-          if (sweepSessionGc) await sweepSessionGc()
-        } else if (!finalConfig.silent) {
-          console.warn("[PROXY] Skipping final session GC because revoked requests have not settled.")
-        }
-        await closeBackendWhenSettled()
-        } finally {
-          // Keep ownership until every renewal and sign-in has joined.
-          await chatGptRenewalStopped
-          await chatGpt?.settle()
-          chatGpt?.release()
-        }
+        // Keep the original cleanup alive after a bounded failure. The backend
+        // joins request finalizers and admitted durable work before releasing SQL;
+        // ChatGPT ownership must remain attached to that actual cleanup as well.
+        const joined = (async () => {
+          try { await closeBackend?.() }
+          finally {
+            await chatGptRenewalStopped
+            await chatGpt?.settle()
+            chatGpt?.release()
+          }
+          if (httpCloseError) throw httpCloseError
+        })()
+        await withShutdownDeadline(joined)
       })()
       return closePromise
     },

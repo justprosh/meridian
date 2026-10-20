@@ -69,6 +69,17 @@ export function finalProxyBookkeepingOwnerHasPendingWork(): boolean {
   return Boolean(connection.scope || connection.pending)
 }
 
+/** Keep the final ownership check and native close in one synchronous turn. */
+export async function closeProxyBookkeepingWhenSettled(handle: BookkeepingHandle): Promise<void> {
+  while (finalProxyBookkeepingOwnerHasPendingWork()) {
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, 25)
+      timer.unref?.()
+    })
+  }
+  handle.close()
+}
+
 /** CLI/library startup: initialization is not permission to migrate legacy data. */
 export async function initializeProxyBookkeeping(): Promise<BookkeepingHandle | undefined> {
   const directory = getSessionStoreDir()

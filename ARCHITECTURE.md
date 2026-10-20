@@ -200,7 +200,7 @@ src/
 │   ├── requestAbort.ts        ← HTTP request abort → SDK query abort bridge
 │   ├── runtimeCancelWarning.ts ← Startup warning under Bun, whose HTTP server misses a client gone before the first byte (leaf)
 │   ├── sessionTree.ts         ← Live parent→child request registry; subtree cancellation (PURE bookkeeping)
-│   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
+│   ├── shutdown.ts            ← HTTP drain, retained cleanup deadlines and connection tracking
 │   ├── inflight.ts            ← Per-upstream in-flight request counts for GET /inflight (PURE bookkeeping)
 │   ├── admissionHold.ts       ← Bounded per-instance generation reservations for the best-effort POST /drain hold
 │   ├── drainBody.ts           ← Tiny operator body byte/deadline limits and joined reader cancellation
@@ -432,6 +432,14 @@ A bounded close failure retains the original cleanup and guard until admitted
 durable work settles. Internal handles are reference-counted and the
 maintenance guard remains shared until the last owner closes. Backend/directory
 changes while a SQLite runtime is owned are rejected.
+
+`closeBackend()` caches the original cleanup and joins admitted requests,
+control/provider operations and their finalizers before releasing its owner.
+`ProxyInstance.close()` bounds the wait after HTTP drain: an unjoined cleanup
+rejects instead of reporting success, while the original cleanup retains SQL
+and ChatGPT ownership until those operations join. Repeated calls return the
+same promise. This request-ownership guarantee is distinct from the remaining
+GC deletion-child join/accounting acceptance gate.
 
 Native handles remain owned through post-open provenance validation. A startup
 failure closes the native handle before releasing its guard; an uncertain close

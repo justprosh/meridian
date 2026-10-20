@@ -1,4 +1,4 @@
-import { finalProxyBookkeepingOwnerHasPendingWork, initializeProxyBookkeeping as initializeRuntime } from "./runtime"
+import { closeProxyBookkeepingWhenSettled, initializeProxyBookkeeping as initializeRuntime } from "./runtime"
 
 /** Public embedding ownership. Native readers, paths and SQL capabilities stay internal. */
 export interface ProxyBookkeepingHandle {
@@ -15,15 +15,7 @@ export async function initializeProxyBookkeeping(): Promise<ProxyBookkeepingHand
   return {
     close() {
       if (closing) return closing
-      const joined = (async () => {
-        while (finalProxyBookkeepingOwnerHasPendingWork()) {
-          await new Promise<void>(resolve => {
-            const timer = setTimeout(resolve, 25)
-            timer.unref?.()
-          })
-        }
-        owned.close()
-      })()
+      const joined = closeProxyBookkeepingWhenSettled(owned)
       let timedOut = false
       let timer: ReturnType<typeof setTimeout>
       const deadline = new Promise<never>((_resolve, reject) => {
