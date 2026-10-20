@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, spyOn } from "bun:test"
 import Database from "libsql"
 import { spawnSync } from "node:child_process"
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import * as store from "../proxy/sessionStore"
 import { initializeSessionBookkeeping, type BookkeepingHandle } from "../proxy/session/bookkeeping/database"
 import { BookkeepingTextParameterError, connectionFor } from "../proxy/session/bookkeeping/connection"
@@ -14,6 +14,18 @@ import { withStoreWrite } from "../proxy/session/bookkeeping/storeScope"
 
 let directory: string
 let handle: BookkeepingHandle | undefined
+let cliRoot: string
+beforeAll(() => {
+  cliRoot = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-contract-cli-")))
+  symlinkSync(resolve("node_modules"), join(cliRoot, "node_modules"), "junction")
+  const built = spawnSync(process.execPath, ["build", resolve("bin/session-bookkeeping.ts"),
+    "--target=node", "--external", "libsql", `--outfile=${join(cliRoot, "bookkeeping.mjs")}`], {
+    encoding: "utf8", timeout: 30_000,
+  })
+  expect(built.error).toBeUndefined()
+  expect(built.status, built.stdout + built.stderr).toBe(0)
+})
+afterAll(() => { if (cliRoot) rmSync(cliRoot, { recursive: true, force: true }) })
 beforeEach(() => {
   directory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-store-contract-")))
   store.setSessionStoreBackendForTest(null)
@@ -32,10 +44,11 @@ async function migrate() {
   store.setSessionStoreBackendForTest(sqliteSessionStoreBackend)
 }
 async function cli(command: string) {
-  const result = spawnSync("node", ["dist/session-bookkeeping.js", command,
+  const result = spawnSync("node", [join(cliRoot, "bookkeeping.mjs"), command,
     "--session-dir", directory, "--json"], { encoding: "utf8", timeout: 30_000 })
   expect(result.error).toBeUndefined()
   expect(result.signal).toBeNull()
+  expect(result.stdout.trim().length, result.stderr).toBeGreaterThan(0)
   return { code: result.status, output: JSON.parse(result.stdout) }
 }
 
