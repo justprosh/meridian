@@ -1,5 +1,6 @@
 import type { StoredSession, TranscriptLocator } from "./types"
 import type { StoredSessionGeneration, PriorityAssignmentGeneration } from "./legacyCodec"
+import type { ProfileCopyPruneOptions } from "./profileCopies"
 import type {
   SharedSessionLookupResult, PriorityAssignmentLookupResult, PriorityAttemptTurn, PriorityAttemptClaim,
   SharedSessionAndPriorityAssignmentOptions, SharedSessionAndPriorityAssignmentResult,
@@ -35,6 +36,8 @@ export interface SessionStoreBackend {
   lookupSessionRecovery(directory: string, key: string): SessionRecoveryInfo | undefined
   listStoredSessions(directory: string): Array<SessionRecoveryInfo & { key: string }>
   clearSharedSessions(directory: string): void
+  listSupersededProfileConversations(directory: string, options: ProfileCopyPruneOptions): string[]
+  pruneSupersededProfileCopies(directory: string, options: ProfileCopyPruneOptions): number
 }
 
 let selected: SessionStoreBackend | undefined

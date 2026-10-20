@@ -17,13 +17,14 @@ export interface SessionLifecycleBackend {
   abandonFork: typeof Lifecycle.abandonFork
   reconcile: typeof Lifecycle.reconcile
   runGc: typeof Lifecycle.runGc
+  releaseSupersededProfileCopies: typeof Lifecycle.releaseSupersededProfileCopies
 }
 
 export const lifecycleBackendMethods = [
   "acquireActiveTranscriptLease", "attachActiveTranscriptExecutor", "releaseActiveTranscriptLease",
   "releaseJoinedTranscriptLease", "prepareFork", "prepareForkForPublication", "ensureTranscriptJournaled",
   "registerLiveTranscript", "commitFork", "publishPinnedTranscript", "attachPinnedTranscript",
-  "abandonFork", "reconcile", "runGc",
+  "abandonFork", "reconcile", "runGc", "releaseSupersededProfileCopies",
 ] as const satisfies readonly (keyof SessionLifecycleBackend)[]
 
 export class SessionLifecycleOperationUnavailableError extends Error {

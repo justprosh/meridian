@@ -763,6 +763,8 @@ export async function releaseSupersededProfileCopies(
   options: SessionLifecycleOptions = {},
   turnCoordinator = new CrossProcessTurnCoordinator(join(options.storeDir ?? getSessionStoreDir(), "turn-locks")),
 ): Promise<number> {
+  const backend = activeLifecycleBackend()
+  if (backend) return backend.releaseSupersededProfileCopies(copies, options, turnCoordinator)
   const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
   if (!options.pinProvider) throw new SessionLifecycleError("profile-copy pruning requires an authoritative pin provider")
   return withSidecarLock(options, async paths => {

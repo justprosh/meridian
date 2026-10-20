@@ -38,7 +38,7 @@ beforeEach(() => {
   facade.setSessionLifecycleBackendForTest({ ...sqliteLifecyclePrepare, ...sqliteLifecyclePublication },
     ["acquireActiveTranscriptLease", "attachActiveTranscriptExecutor", "releaseActiveTranscriptLease",
       "releaseJoinedTranscriptLease", "ensureTranscriptJournaled", "registerLiveTranscript", "commitFork",
-      "abandonFork", "reconcile", "runGc"])
+      "abandonFork", "reconcile", "runGc", "releaseSupersededProfileCopies"])
 })
 afterEach(() => {
   facade.setSessionLifecycleBackendForTest(null)

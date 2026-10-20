@@ -8,6 +8,7 @@ import { claimPriorityAttempt, releasePriorityAttempt, blockPriorityAttempt } fr
 import { storeSharedSessionAndPriorityAssignment } from "./storePublicationSql"
 import { finalizeSharedSessionAndPriorityAssignment, rollbackSharedSessionAndPriorityAssignment } from "./storeSettlementSql"
 import { attachSharedTranscriptLocator, evictSharedSession, clearSharedSessions } from "./storeMaintenanceWriteSql"
+import { listSupersededProfileConversations, pruneSupersededProfileCopies } from "./storeProfileCopiesSql"
 
 /** Explicit installation only; importing the JSON facade never activates or loads this backend. */
 export const sqliteSessionStoreBackend: SessionStoreBackend = {
@@ -17,4 +18,5 @@ export const sqliteSessionStoreBackend: SessionStoreBackend = {
   claimPriorityAttempt, releasePriorityAttempt, blockPriorityAttempt,
   storeSharedSessionAndPriorityAssignment, finalizeSharedSessionAndPriorityAssignment,
   rollbackSharedSessionAndPriorityAssignment, attachSharedTranscriptLocator, evictSharedSession, clearSharedSessions,
+  listSupersededProfileConversations, pruneSupersededProfileCopies,
 }

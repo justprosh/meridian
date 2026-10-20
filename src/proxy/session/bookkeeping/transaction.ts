@@ -243,6 +243,9 @@ export function withBookkeepingWriteAsync<T>(
   directory: string,
   options: BookkeepingWriteOptions,
   callback: (tx: BookkeepingTransaction) => T,
+  /** Refresh synchronous application preconditions after FIFO/busy waits, before BEGIN.
+   * No await separates this observation from the admitted transaction. */
+  beforeBegin?: () => void,
 ): Promise<T> {
   const connection = addressed(directory)
   if (active)
@@ -275,6 +278,8 @@ export function withBookkeepingWriteAsync<T>(
         if (budget && performance.now() - started >= budget) throw timeout
         try {
           recover(connection)
+          if (beforeBegin) synchronous(beforeBegin)
+          controller.signal.throwIfAborted()
           executeTransaction(connection, "BEGIN IMMEDIATE")
           break
         } catch (error) {

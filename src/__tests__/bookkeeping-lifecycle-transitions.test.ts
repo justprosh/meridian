@@ -24,7 +24,7 @@ let directory: string
 let handle: BookkeepingHandle
 let options: facade.SessionLifecycleOptions
 const unavailable = ["prepareFork", "prepareForkForPublication", "ensureTranscriptJournaled", "registerLiveTranscript",
-  "commitFork", "publishPinnedTranscript", "attachPinnedTranscript", "abandonFork", "reconcile", "runGc"] as const
+  "commitFork", "publishPinnedTranscript", "attachPinnedTranscript", "abandonFork", "reconcile", "runGc", "releaseSupersededProfileCopies"] as const
 beforeEach(() => {
   directory = realpathSync(mkdtempSync(join(tmpdir(), "lifecycle-sql-")))
   handle = initializeSessionBookkeeping(directory)

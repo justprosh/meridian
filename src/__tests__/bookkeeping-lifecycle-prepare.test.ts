@@ -25,7 +25,7 @@ beforeEach(() => {
   options = { storeDir: directory, now: () => 1000 }
   facade.setSessionLifecycleBackendForTest({ ...sqliteLifecycleLeases, ...sqliteLifecyclePrepare,
     ...sqliteLifecycleRegister, ...sqliteLifecycleTransitions },
-  ["publishPinnedTranscript", "attachPinnedTranscript", "reconcile", "runGc"])
+  ["publishPinnedTranscript", "attachPinnedTranscript", "reconcile", "runGc", "releaseSupersededProfileCopies"])
 })
 afterEach(() => {
   facade.setSessionLifecycleBackendForTest(null)

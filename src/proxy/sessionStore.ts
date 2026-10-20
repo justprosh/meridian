@@ -68,6 +68,8 @@ import {
 import type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 export type { TranscriptLocator, StoredSession } from "./session/bookkeeping/types"
 import { activeStoreBackend } from "./session/bookkeeping/storeBackend"
+import { selectProfileCopies, type ProfileCopyPruneOptions } from "./session/bookkeeping/profileCopies"
+export type { ProfileCopyPruneOptions } from "./session/bookkeeping/profileCopies"
 import { assertBookkeepingIdentityChangeAllowed } from "./session/bookkeeping/storeIdentity"
 import { retainedBookkeepingRuntimeDirectory } from "./session/bookkeeping/runtimeIdentity"
 export { setSessionStoreBackendForTest } from "./session/bookkeeping/storeBackend"
@@ -1674,17 +1676,6 @@ export function evictSharedSession(
  */
 export const DEFAULT_PROFILE_COPY_GRACE_MS = 24 * 60 * 60_000
 
-export interface ProfileCopyPruneOptions {
-  /** Configured non-default profile IDs; only their `${id}:` prefixes are recognized. */
-  profileIds: Iterable<string>
-  /** Copies used within this window are kept alongside the newest one. */
-  graceMs: number
-  /** Most transcripts the removed mappings may stop pinning in this call. */
-  maxUnpinnedTranscripts: number
-  /** A conversation with a request arrived or running keeps every copy. */
-  isConversationActive: (conversationId: string) => boolean
-}
-
 function pinnedTranscriptCount(session: StoredSession): number {
   let count = 0
   if (session.currentTranscript?.sessionId === session.claudeSessionId) count++
@@ -1697,50 +1688,20 @@ function selectSupersededProfileCopies(
   options: ProfileCopyPruneOptions,
   now: number,
 ): string[] {
-  const profileIds = new Set(options.profileIds)
-  profileIds.delete("default")
   const protectedKeys = new Set(document.meta.version === PRIORITY_STORE_META_VERSION
     ? [
-        ...Object.values(document.meta.priorityAssignments).map((assignment) => assignment.mappingKey),
-        ...Object.values(document.meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
-      ]
-    : [])
-  const copiesByConversation = new Map<string, string[]>()
-  for (const key of Object.keys(document.sessions)) {
-    const separator = key.indexOf(":")
-    const conversationId = separator > 0 && profileIds.has(key.slice(0, separator))
-      ? key.slice(separator + 1)
-      : key
-    const copies = copiesByConversation.get(conversationId)
-    if (copies) copies.push(key)
-    else copiesByConversation.set(conversationId, [key])
-  }
-
-  const lastUsed = (key: string): number => document.sessions[key]!.lastUsedAt || 0
-  const candidates: string[] = []
-  for (const [conversationId, copies] of copiesByConversation) {
-    if (copies.length < 2) continue
-    const newest = copies.reduce((best, key) => (lastUsed(key) > lastUsed(best) ? key : best))
-    const superseded = copies.filter((key) => (
-      key !== newest && !protectedKeys.has(key) && now - lastUsed(key) > options.graceMs
-    ))
-    if (superseded.length > 0 && !options.isConversationActive(conversationId)) candidates.push(...superseded)
-  }
-  candidates.sort((left, right) => lastUsed(left) - lastUsed(right))
-
-  const victims: string[] = []
-  let remaining = options.maxUnpinnedTranscripts
-  for (const key of candidates) {
-    const cost = pinnedTranscriptCount(document.sessions[key]!)
-    if (cost > remaining) continue
-    remaining -= cost
-    victims.push(key)
-  }
-  return victims
+        ...Object.values(document.meta.priorityAssignments).map(assignment => assignment.mappingKey),
+        ...Object.values(document.meta.priorityRollbackMappings).map(rollback => rollback.mappingKey),
+      ] : [])
+  return selectProfileCopies(Object.entries(document.sessions).map(([key, session]) => ({
+    key, lastUsedAt: session.lastUsedAt || 0, pinnedTranscripts: pinnedTranscriptCount(session),
+  })), protectedKeys, options, now)
 }
 
 /** Candidate conversations only; callers must fence turns before deleting their mappings. */
 export function listSupersededProfileConversations(options: ProfileCopyPruneOptions): string[] {
+  const backend = activeStoreBackend()
+  if (backend) return backend.listSupersededProfileConversations(getSessionStoreDir(), options)
   const profileIds = new Set(options.profileIds)
   const candidates = selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()),
     { ...options, profileIds }, Date.now())
@@ -1760,6 +1721,8 @@ export function listSupersededProfileConversations(options: ProfileCopyPruneOpti
  * Returns the number of mappings removed.
  */
 export function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): number {
+  const backend = activeStoreBackend()
+  if (backend) return backend.pruneSupersededProfileCopies(getSessionStoreDir(), options)
   // Select from the cached document first so the common no-op sweep takes no
   // lock and writes nothing.
   if (selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()), options, Date.now()).length === 0) {
