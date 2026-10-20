@@ -1634,6 +1634,11 @@ WAL and SHM files are private (0600). Corruption, incompatible schema, path
 identity drift or incomplete maintenance prevents startup, without salvage or
 JSON fallback. Windows migration/crash behavior needs separate platform evidence.
 
+An uncertain GC deletion remains fenced while its claiming proxy is alive or
+its identity is indeterminate. Recovery requires authoritative death of that
+proxy and its recorded executor, plus an empty process group on POSIX. A child
+exit alone does not release the original owner's child and pipe custody.
+
 ## Explicit migration and rollback
 
 Stop and drain **every** proxy and its SDK/deletion children first. A missing

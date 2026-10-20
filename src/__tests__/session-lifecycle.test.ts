@@ -751,6 +751,26 @@ describe("session transcript lifecycle", () => {
     expect((await runGc([], { ...options, deleter: async () => undefined })).deleted).toBe(1)
   })
 
+  it.each(["live", "indeterminate"] as const)("keeps a dead executor fenced while its deletion owner is %s", async ownerState => {
+    const current = captureProcessIncarnation()
+    if (!current) throw new Error("test process incarnation unavailable")
+    const fork = locator(`unjoined-owner-${ownerState}`)
+    const exact = await prepareFork(fork, options)
+    await abandonFork(exact, options)
+    const resource = readSidecar(storeDir).resources[getTranscriptResourceKey(exact)]!
+    resource.state = "deleting"
+    resource.deletionToken = "unjoined-owner-token"
+    if (ownerState === "live") resource.deletionOwner = current
+    else if (ownerState === "indeterminate") resource.deletionOwner = {
+      ...current, hostId: current.hostId === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64),
+    }
+    resource.deletionExecutor = deadProcessIncarnation(999_999_999)
+    resource.deletionProcessGroupId = 999_999_999
+    injectDeletingResource(storeDir, resource)
+    expect((await reconcile([], options)).deletingRecovered).toBe(0)
+    expect(readSidecar(storeDir).resources[resource.key]?.deletionToken).toBe("unjoined-owner-token")
+  })
+
   it("keeps a deleting orphan fenced while its exact executor may be alive", async () => {
     const current = captureProcessIncarnation()
     if (!current) throw new Error("test process incarnation unavailable")

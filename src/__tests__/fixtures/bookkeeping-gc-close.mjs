@@ -31,6 +31,7 @@ const options = {storeDir: directory, preparedGraceMs: 0, retiredGraceMs: 0,
   deletionTimeoutMs: mode === 'custom' ? 50 : process.platform === 'win32' ? 1000 : 250,
   sdkModuleUrl: pathToFileURL(sdk).href}
 let release, releaseAdmission, admissionReached, replay, child, observedClose = false, observer, mkdirObserver, gcWork
+let nativeDeletionChildren = 0, peerRecovery
 const custom = new Promise(resolve => release = resolve)
 const admitted = new Promise(resolve => admissionReached = resolve)
 const admission = new Promise(resolve => releaseAdmission = resolve)
@@ -38,6 +39,7 @@ if (mode === 'custom') options.deleter = () => custom
 else {
   const original = cp.spawn
   observer = spyOn(cp, 'spawn').mockImplementation((...args) => {
+    nativeDeletionChildren++
     child = Reflect.apply(original, cp, args)
     child.once('close', () => observedClose = true)
     if (mode === 'native') {
@@ -73,6 +75,17 @@ try {
   void gcWork.catch(() => undefined)
   if (mode === 'admission') await admitted
   else assert.deepEqual(await gcWork, {deleted: 0, notFound: 0, failed: 0, deferred: 1})
+  if (mode === 'native') {
+    const peer = cp.spawnSync(process.execPath, [join(repo, 'src/__tests__/fixtures/bookkeeping-gc-peer-reconcile.mjs'), repo, directory], {
+      env: process.env, encoding: 'utf8', timeout: process.platform === 'win32' ? 60000 : 10000,
+    })
+    assert.equal(peer.status, 0, peer.stderr)
+    peerRecovery = JSON.parse(peer.stdout.split('\n').find(line => line.startsWith('PEER_RECONCILE ')).slice('PEER_RECONCILE '.length))
+    assert.equal(peerRecovery.deletingRecovered, 0, 'A peer recovered the live original owner before its child and pipes joined')
+    assert.equal((await lifecycle.reconcile([], options)).deletingRecovered, 0)
+    assert.deepEqual(await owner.run(() => lifecycle.runGc([], options)), {deleted: 0, notFound: 0, failed: 0, deferred: 1})
+    assert.equal(nativeDeletionChildren, 1, 'A repeat sweep started a second physical deletion')
+  }
   assert(hasPendingSessionDeletionCleanup(directory), 'Original cleanup disappeared at its timeout')
   await sibling.join() // Closing a separate proxy owner remains independent.
   const joined = owner.join().then(() => joinOutcome = 'fulfilled')
@@ -101,5 +114,5 @@ try {
   observer?.mockRestore()
   mkdirObserver?.mockRestore()
   console.log('GC_CLOSE_REPORT ' + JSON.stringify({mode, closeOutcome, closeError, joinOutcome, before, after,
-    nativeChildCloseSeen: observedClose, modelCalls: 0}))
+    nativeChildCloseSeen: observedClose, nativeDeletionChildren, peerRecovery, modelCalls: 0}))
 }

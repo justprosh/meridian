@@ -30,11 +30,12 @@ function deadLease(row: SqlRow, now: number, ttl: number): boolean {
 
 function recoverable(resource: BookkeepingResource): boolean {
   if (resource.state !== "deleting") return false
+  // A live/unknown proxy still owns the original child and pipe handles.
+  if (!resource.deletionOwner || !processIncarnationIsDead(resource.deletionOwner)) return false
   if (resource.deletionExecutor && resource.deletionProcessGroupId !== undefined)
     return processIncarnationIsDead(resource.deletionExecutor)
       && (process.platform === "win32" || sessionDeletionRuntime.processGroupIsEmpty(resource.deletionProcessGroupId))
-  return !resource.deletionExecutor && resource.deletionOwner !== undefined
-    && processIncarnationIsDead(resource.deletionOwner)
+  return !resource.deletionExecutor
 }
 
 function indexPins(pins: readonly TranscriptLocator[], options: SessionLifecycleOptions) {

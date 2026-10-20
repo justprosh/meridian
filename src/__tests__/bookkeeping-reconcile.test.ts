@@ -202,6 +202,22 @@ it("recovers dead pre-handshake owner but cannot rescue an in-flight deleting pi
   expect(row(locator).state).toBe("live")
 })
 
+it.each(["live", "indeterminate"] as const)("keeps a dead executor fenced while its SQL deletion owner is %s", async ownerState => {
+  const owner = incarnations.captureProcessIncarnation()!
+  const locator = seed("unjoined-owner", "retired")
+  const claim = await claimDeletion([], options)
+  await attachDeletionExecutor(resourceKey(locator), claim!.deletionToken!, {
+    ...owner, pid: 999_999_999, bootId: "00000000-0000-4000-8000-000000000000",
+  }, 999_999_999, options)
+  const retainedOwner = ownerState === "live" ? owner : {
+    ...owner, hostId: owner.hostId === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64),
+  }
+  withBookkeepingWrite(directory, {}, tx => tx.run("UPDATE resources SET deletion_owner_json=?,row_version=row_version+1 WHERE key=?",
+    retainedOwner ? JSON.stringify(retainedOwner) : null, resourceKey(locator)))
+  expect((await facade.reconcile([], options)).deletingRecovered).toBe(0)
+  expect(row(locator).deletionToken).toBe(claim!.deletionToken)
+})
+
 it("a surviving process group prevents recovery even after the executor died", async () => {
   if (process.platform === "win32") return // Recovery skips the POSIX process-group probe on win32.
   const locator = seed("a", "retired")

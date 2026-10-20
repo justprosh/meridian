@@ -446,6 +446,11 @@ a deferred timeout. `deletionChildClosure.ts` requires the original child's
 exit, close and both captured pipe closures; POSIX also requires an empty
 process group. Timed-out custom deleters retain custody until their original
 promise settles. Logging a deferred GC result cannot discharge those owners.
+Recovery also requires authoritative death of the original claiming proxy,
+then its recorded executor and POSIX group. A live, indeterminate or missing
+owner cannot be replaced merely because the executor exited. A deferred claim
+stays fenced until the owning proxy stops; late cleanup may release storage
+ownership without retroactively completing that claim.
 
 Native handles remain owned through post-open provenance validation. A startup
 failure closes the native handle before releasing its guard; an uncertain close

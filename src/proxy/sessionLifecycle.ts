@@ -671,20 +671,21 @@ async function reconcileUnderLock(
     // passive cleanup entirely, so preserve its existing behavior.
     const passiveRetirementLimit = maxPending > 1 ? maxPending - 1 : maxPending
 
-    // A deletion claim is recoverable only after the exact persisted executor
-    // is provably dead. Before the executor handshake, authoritative death of
-    // the claiming proxy is enough because the gated child cannot start the
-    // physical SDK deletion without that handshake.
+    // The claiming proxy owns the original child and pipe handles. Its death
+    // is required before another sweep may recover a claim: executor death
+    // alone cannot establish that the live owner's cleanup joined. After a
+    // handshake, the exact executor and its POSIX group must also be gone.
     for (const resource of Object.values(sidecar.resources)) {
       if (resource.state !== "deleting") continue
+      if (!resource.deletionOwner || !processIncarnationIsDead(resource.deletionOwner)) continue
       // The incarnation probe (pid + OS start id) is immune to pid reuse. On
       // POSIX the group probe additionally waits out surviving descendants.
       // win32 has no process groups and recycles pids aggressively: probing
       // the stored pid there could misread an unrelated process as a live
       // deleter forever, permanently blocking recovery of this claim, and a
       // single-pid probe observes no descendants anyway — executor death is
-      // the entire win32 signal (the un-detached deletion child spawns none;
-      // see deleteWithSdkChild).
+      // the remaining win32 signal after owner death (the un-detached
+      // deletion child spawns none; see deleteWithSdkChild).
       const executorDead = resource.deletionExecutor
         && resource.deletionProcessGroupId !== undefined
         ? processIncarnationIsDead(resource.deletionExecutor)
@@ -692,8 +693,6 @@ async function reconcileUnderLock(
             || processGroupIsEmpty(resource.deletionProcessGroupId))
         : false
       const ownerDiedBeforeHandshake = !resource.deletionExecutor
-        && resource.deletionOwner !== undefined
-        && processIncarnationIsDead(resource.deletionOwner)
       if (!executorDead && !ownerDiedBeforeHandshake) continue
       resource.state = "retired"
       resource.updatedAt = now
