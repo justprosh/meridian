@@ -23,6 +23,8 @@ import { canonicalizeLocator } from "../proxy/session/bookkeeping/locator"
 import { tmpdir } from "node:os"
 import { buildNodeFixture, writeBenchArtifact } from "./fixtures/bookkeeping-support"
 import { SessionLifecycleLockError, SessionLifecycleReentrancyError } from "../proxy/session/lifecycleErrors"
+import { acquireMaintenanceGuard } from "../proxy/session/bookkeeping/guard"
+import { openForMaintenance } from "../proxy/session/bookkeeping/maintenance"
 import type { BookkeepingTransaction } from "../proxy/session/bookkeeping/types"
 import { assertAdmissionDeadline, assertAdmissionHeartbeat, type AdmissionHeartbeat } from "./fixtures/bookkeeping-heartbeat"
 
@@ -512,9 +514,19 @@ it("defers WAL checkpoint to maintenance and reserves file shrink for explicit o
   expect(result.checkpointed).toBe(result.log)
   expect(statSync(handle.path).size).toBeGreaterThan(initial)
   expect(statSync(handle.path + "-wal").size).toBe(walGrown)
-  const truncated = checkpointBookkeepingOffline(directory, "TRUNCATE")
-  expect(truncated.busy).toBe(0)
-  expect(statSync(handle.path + "-wal").size).toBe(0)
+  expect(() => checkpointBookkeepingOffline(directory, "TRUNCATE")).toThrow("exclusive maintenance")
+  handle.close()
+  const guard = acquireMaintenanceGuard(directory)
+  let maintenance: BookkeepingHandle | undefined
+  try {
+    maintenance = openForMaintenance(directory, { expectPhase: "READY", guard })
+    const truncated = checkpointBookkeepingOffline(directory, "TRUNCATE")
+    expect(truncated.busy).toBe(0)
+    expect(statSync(maintenance.path + "-wal").size).toBe(0)
+  } finally {
+    maintenance?.close()
+    guard.close()
+  }
 })
 
 it("rolls back a leftover transaction on close and releases the file to another process", () => {

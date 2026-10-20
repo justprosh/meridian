@@ -12,7 +12,7 @@ import {
   MAINTENANCE_GUARD_FILENAME,
 } from "../proxy/session/bookkeeping/guard"
 import type { GuardLease } from "../proxy/session/bookkeeping/guard"
-import { initializeSessionBookkeeping, withBookkeepingWrite } from "../proxy/session/bookkeeping/database"
+import { checkpointBookkeeping, checkpointBookkeepingOffline, initializeSessionBookkeeping, withBookkeepingWrite } from "../proxy/session/bookkeeping/database"
 import type { BookkeepingHandle } from "../proxy/session/bookkeeping/database"
 import { openForMaintenance } from "../proxy/session/bookkeeping/maintenance"
 import { buildNodeFixture } from "./fixtures/bookkeeping-support"
@@ -29,6 +29,31 @@ beforeEach(() => {
 afterEach(() => {
   for (const handle of held.splice(0).reverse()) handle.close()
   rmSync(directory, { recursive: true, force: true })
+})
+
+it("refuses offline TRUNCATE from a sole local runtime owner without shrinking its WAL", () => {
+  const runtime = track(initializeSessionBookkeeping(directory))
+  withBookkeepingWrite(directory, { scope: "store" }, tx => tx.run("INSERT INTO fence_slots VALUES('store','abcd',1)"))
+  const wal = runtime.path + "-wal"
+  const before = statSync(wal).size
+  expect(before).toBeGreaterThan(0)
+  expect(() => checkpointBookkeepingOffline(directory, "TRUNCATE")).toThrow("exclusive maintenance")
+  expect(statSync(wal).size).toBe(before)
+  // Runtime owners retain their ordinary non-truncating checkpoint path.
+  expect(checkpointBookkeeping(directory).busy).toBe(0)
+})
+
+it("allows native TRUNCATE only after runtime owners close and exclusive maintenance is acquired", () => {
+  const runtime = track(initializeSessionBookkeeping(directory))
+  expect(() => acquireMaintenanceGuard(directory)).toThrow(BookkeepingGuardBusyError)
+  runtime.close()
+  const guard = track(acquireMaintenanceGuard(directory))
+  const maintenance = track(openForMaintenance(directory, { expectPhase: "READY", guard }))
+  withBookkeepingWrite(directory, { scope: "store" }, tx => tx.run("INSERT INTO fence_slots VALUES('store','abcd',1)"))
+  expect(statSync(maintenance.path + "-wal").size).toBeGreaterThan(0)
+  expect(() => acquireRuntimeGuard(directory)).toThrow(BookkeepingGuardBusyError)
+  expect(checkpointBookkeepingOffline(directory, "TRUNCATE").busy).toBe(0)
+  expect(statSync(maintenance.path + "-wal").size).toBe(0)
 })
 
 it("allows multiple shared holders and requires every one to stop before maintenance", () => {

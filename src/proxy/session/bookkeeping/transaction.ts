@@ -16,6 +16,7 @@ import {
   poison,
   recover,
   BookkeepingBusyError,
+  BookkeepingMaintenanceRequiredError,
 } from "./connection"
 import type { Connection } from "./connection"
 import type { BookkeepingReader, BookkeepingTransaction, BookkeepingWriteOptions, SqlRow } from "./types"
@@ -320,6 +321,8 @@ function checkpointIdle(connection: Connection, mode: "PASSIVE" | "TRUNCATE"): B
   if (active) throw new Error("checkpoint requires idle bookkeeping connection")
   if (mode === "TRUNCATE" && connection.refs !== 1)
     throw new Error("offline checkpoint requires sole local handle")
+  if (mode === "TRUNCATE" && !connection.maintenance)
+    throw new BookkeepingMaintenanceRequiredError("offline checkpoint requires exclusive maintenance ownership")
   recover(connection)
   const db = database(connection)
   if (db.inTransaction) throw new Error("checkpoint requires idle bookkeeping connection")

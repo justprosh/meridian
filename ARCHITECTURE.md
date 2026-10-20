@@ -387,6 +387,12 @@ proxy's `closeBackend` after draining. Handles are reference-counted and the
 maintenance guard remains shared until the last owner closes. Backend/directory
 changes while a SQLite runtime is owned are rejected.
 
+Native handles remain owned through post-open provenance validation. A startup
+failure closes the native handle before releasing its guard; an uncertain close
+retains the guard and requires process restart before maintenance. Offline WAL
+TRUNCATE requires an exclusive maintenance connection and one local handle.
+A sole runtime handle still holds shared ownership and may only use PASSIVE.
+
 Standalone synchronous cache/store operations retain their signatures. Server
 mutation roots enter asynchronous admission around the complete operation;
 nested store writes join the same transaction. Lifecycle publication promotes
