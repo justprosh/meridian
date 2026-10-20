@@ -329,6 +329,7 @@ export function openHandle(
       (expectPhase === undefined ? acquireRuntimeGuard(canonical) : acquireMaintenanceGuard(canonical))
     const ownsGuard = maintenanceGuard === undefined
     let releaseGuardReference: (() => void) | undefined
+    let openingDatabase: Database.Database | undefined
     try {
       if (freshGuard) {
         const provenance = prepareFreshBootstrap(canonical, freshGuard)
@@ -372,17 +373,11 @@ export function openHandle(
       if (expectPhase === undefined && publication.isFile() && publication.nlink !== 1)
         throw new BookkeepingMaintenanceRequiredError("published bootstrap alias requires recover-bootstrap --writers-stopped before runtime")
       cleanupBootstrapOrphans(path)
-      const db = openDatabase(path, expectPhase ?? "READY", true, skipRealpathAudit)
+      const db = openingDatabase = openDatabase(path, expectPhase ?? "READY", true, skipRealpathAudit)
       if (expectPhase === undefined) {
         const meta = getRow(db, "SELECT migration_id,source_digests_json FROM schema_meta", [])
         if ((meta?.migration_id ?? undefined) !== migration?.id
           || (migration && meta?.source_digests_json !== JSON.stringify(migration.finalSources))) {
-          try {
-            closeNative(db)
-          } catch (error) {
-            if (error instanceof BookkeepingMaintenanceRequiredError) terminal.set(path, error)
-            throw error
-          }
           throw new BookkeepingMaintenanceRequiredError("migration database/journal identity mismatch")
         }
       }
@@ -401,7 +396,21 @@ export function openHandle(
         closeDatabase: options.closeDatabase,
       }
       registry.set(path, connection)
+      openingDatabase = undefined
     } catch (error) {
+      // Keep native ownership until every post-open validation has succeeded.
+      // In particular, a provenance prepare/get failure must close SQLite
+      // before maintenance can acquire the released guard.
+      if (openingDatabase) {
+        try {
+          closeNative(openingDatabase, options.closeDatabase)
+        } catch (closeError) {
+          if (closeError instanceof BookkeepingMaintenanceRequiredError) terminal.set(path, closeError)
+          error = new AggregateError([error, closeError], "bookkeeping startup cleanup failed")
+        }
+      }
+      // An uncertain native close retains the guard and its reference. Only
+      // process exit can establish that this startup no longer owns SQLite.
       if (terminal.has(path)) throw error
       releaseGuardReference?.()
       if (ownsGuard) guard.close()
