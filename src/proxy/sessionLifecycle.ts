@@ -27,6 +27,8 @@ import type { TranscriptLocator, TranscriptResource } from "./session/bookkeepin
 export type { TranscriptLocator, TranscriptResourceState } from "./session/bookkeeping/types"
 import { lifecycleLockQueue } from "./session/lifecycleLockQueue"
 import { activeLifecycleBackend } from "./session/bookkeeping/lifecycleBackend"
+import { deletionChildClosure } from "./session/deletionChildClosure"
+import { ownSessionDeletionWork, trackSessionDeletionCleanup } from "./session/deletionCleanup"
 export { setSessionLifecycleBackendForTest } from "./session/bookkeeping/lifecycleBackend"
 import {
   SessionLifecycleError,
@@ -804,10 +806,14 @@ export async function releaseSupersededProfileCopies(
  * Delete a bounded batch of unpinned retired transcripts through the supported
  * SDK API, after retrying deferred lease releases that would otherwise fence them.
  */
-export async function runGc(
+export function runGc(
   pins: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<GcResult> {
+  return ownSessionDeletionWork(getStoreDir(options), () => runGcOwned(pins, options))
+}
+
+async function runGcOwned(pins: readonly TranscriptLocator[], options: SessionLifecycleOptions): Promise<GcResult> {
   const backend = activeLifecycleBackend()
   if (backend) return backend.runGc(pins, options)
   await retryDeferredLeaseReleases(options)
@@ -834,7 +840,7 @@ export async function runGc(
       // The run deadline only gates the next claim; this one keeps its full budgets.
       const deletionTimeout = option(options.deletionTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "deletionTimeoutMs")
       if (options.deleter) {
-        await awaitCustomDeleter(options.deleter(candidate.locator), deletionTimeout)
+        await awaitCustomDeleter(options.deleter(candidate.locator), deletionTimeout, getStoreDir(options))
       } else {
         await deleteWithSdkChild(
           candidate.locator,
@@ -861,7 +867,6 @@ export async function runGc(
       // The SDK has no deletion fencing token. Keep the resource permanently
       // deleting until an operator proves the old deleter is gone; retrying
       // could let an old physical delete race a newly pinned generation.
-      result.deferred++
       break
     }
     await finishDeletion(candidate.key, candidate.deletionToken!, failure, options)
@@ -999,7 +1004,9 @@ export const sessionDeletionRuntime = Object.freeze({
   retryBaseMs: DEFAULT_RETRY_BASE_MS, retryMaxMs: DEFAULT_RETRY_MAX_MS,
 })
 
-async function awaitCustomDeleter(deletion: Promise<void>, timeoutMs: number): Promise<void> {
+async function awaitCustomDeleter(deletion: Promise<void>, timeoutMs: number, directory: string): Promise<void> {
+  // A timeout fences the transcript; it does not cancel or join the original work.
+  trackSessionDeletionCleanup(directory, deletion.then(() => undefined, () => undefined))
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new DeletionStillRunningError("custom deleter did not settle before timeout")), timeoutMs)
@@ -1072,8 +1079,8 @@ async function waitForProcessGroupEmpty(
   return processGroupIsEmpty(processGroupId)
 }
 
-async function waitForDeletionExit(
-  exited: Promise<unknown>,
+async function waitForDeletionClosure(
+  closed: Promise<void>,
   timeoutMs: number,
 ): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -1082,7 +1089,7 @@ async function waitForDeletionExit(
     timer.unref?.()
   })
   try {
-    return await Promise.race([exited.then(() => true, () => true), timeout])
+    return await Promise.race([closed.then(() => true), timeout])
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -1172,6 +1179,15 @@ try {
     windowsHide: true,
     detached: process.platform !== "win32",
   })
+  const originalClosure = deletionChildClosure(child)
+  // A bounded caller may give up before cleanup joins. Keep its owner attached
+  // to the original handle/pipes and read-only group proof beyond that deadline.
+  trackSessionDeletionCleanup(getStoreDir(options), originalClosure.then(async () => {
+    if (process.platform === "win32" || !child.pid) return
+    while (!processGroupIsEmpty(child.pid)) {
+      await new Promise<void>(resolve => { const timer = setTimeout(resolve, 25); timer.unref?.() })
+    }
+  }))
   let output = ""
   const collect = (chunk: Buffer | string): void => {
     if (output.length < 64 * 1024) output += chunk.toString()
@@ -1187,13 +1203,14 @@ try {
   let timer: ReturnType<typeof setTimeout> | undefined
   const joinTimeoutMs = Math.max(100, Math.min(2_000, timeoutMs))
   const processGroupId = child.pid
-  // win32 recycles a pid the instant the child is reaped, so pid-level kills
-  // are only safe while our un-reaped handle still pins it. If the leader is
-  // already gone there, so is its taskkill-visible tree.
+  // Signal only while the original leader is still live. After its exit,
+  // retain unknown custody instead of targeting a possibly reused group ID.
   let deletionTreeKilled = false
   const killDeletionTree = (): void => {
     if (!processGroupId || deletionTreeKilled) return
-    if (process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null)) return
+    // Once the original leader exited, its numeric PID/group may be reused.
+    // Retain unknown custody rather than signal a later process by that ID.
+    if (child.exitCode !== null || child.signalCode !== null) return
     signalProcessGroup(processGroupId, "SIGKILL")
     // macOS can reject a second signal to a killed, not-yet-reaped group
     // with EPERM. Join the original kill instead of masking its timeout.
@@ -1255,18 +1272,23 @@ try {
       timer.unref?.()
     })
     const status = await Promise.race([exited, timeout])
-    // The leader was just joined through its own ChildProcess handle, which
-    // is immune to pid reuse. On win32 the un-detached leader is the entire
+    // Exit alone does not establish child/pipe closure. Join the original
+    // handle and both captured pipes before accepting any deletion verdict.
+    // On win32 the un-detached leader is the entire
     // observable "group" (the SDK's deleteSession spawns no descendants) and
     // its pid is already reusable, so probing it could only misread a reused
     // pid as a still-running deleter and wedge this resource in permanent
     // deferral; the handle join is the fence. POSIX still waits out group
     // survivors.
-    joined = process.platform === "win32"
-      ? true
-      : await waitForProcessGroupEmpty(processGroupId, joinTimeoutMs)
+    const [handleClosed, groupEmpty] = await Promise.all([
+      waitForDeletionClosure(originalClosure, joinTimeoutMs),
+      process.platform === "win32"
+        ? Promise.resolve(true)
+        : waitForProcessGroupEmpty(processGroupId, joinTimeoutMs),
+    ])
+    joined = handleClosed && groupEmpty
     if (!joined) {
-      throw new DeletionStillRunningError("session deletion process group remains active")
+      throw new DeletionStillRunningError("session deletion child, pipes or process group remain unjoined")
     }
     if (status.code === SESSION_GC_NOT_FOUND_EXIT_CODE) {
       throw new TranscriptAlreadyAbsentError(
@@ -1278,17 +1300,17 @@ try {
     }
   } finally {
     if (timer) clearTimeout(timer)
-    if (!joined && processGroupId) {
+    if (!joined) {
       killDeletionTree()
-      const [leaderExited, groupEmpty] = await Promise.all([
-        waitForDeletionExit(exited, joinTimeoutMs),
+      const [handleClosed, groupEmpty] = await Promise.all([
+        waitForDeletionClosure(originalClosure, joinTimeoutMs),
         // win32: the leader's ChildProcess handle is the only reuse-proof
         // join signal; see the comment on the un-timed-out path above.
-        process.platform === "win32"
+        process.platform === "win32" || !processGroupId
           ? Promise.resolve(true)
           : waitForProcessGroupEmpty(processGroupId, joinTimeoutMs),
       ])
-      joined = leaderExited && groupEmpty
+      joined = handleClosed && groupEmpty
       unjoined = !joined
     }
     await unlink(gatePath).catch((error) => {
@@ -1297,7 +1319,7 @@ try {
       }
     })
     if (unjoined) {
-      throw new DeletionStillRunningError("session deletion process group remains unjoined")
+      throw new DeletionStillRunningError("session deletion child, pipes or process group remain unjoined")
     }
   }
 }

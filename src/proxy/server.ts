@@ -184,6 +184,7 @@ import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { profileStartBody, profileLoginCompleteBody, profileAddCompleteBody } from "./profileOAuthBody"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
+import { SessionDeletionCleanupOwner } from "./session/deletionCleanup"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
 import { computeCacheHitRate, formatUsageSummary } from "./tokenUsage"
 import { sanitizeTextContent } from "./sanitize"
@@ -856,6 +857,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     runTimeoutMs: Math.max(1_000, envInt("SESSION_GC_RUN_TIMEOUT_MS", 30_000)),
   }
   let sessionGcRunning: Promise<void> | undefined
+  const sessionDeletionOwner = new SessionDeletionCleanupOwner()
 
   const activeSessionGcPins = new Map<string, { locator: TranscriptLocator; refs: number }>()
   const pinActiveSessionGcLocators = (...locators: TranscriptLocator[]): (() => void) => {
@@ -914,7 +916,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     if (sessionGcRunning) return sessionGcRunning
     sessionGcRunning = (async () => {
       if (profileCopyPruningEnabled) await pruneSupersededProfileCopies()
-      const result = await runSessionGc(collectSessionGcPins(), sessionGcOptions)
+      const result = await sessionDeletionOwner.run(() => runSessionGc(collectSessionGcPins(), sessionGcOptions))
       if (result.deleted || result.notFound || result.failed) {
         claudeLog("session.gc", { ...result })
         if (result.failed) {
@@ -11587,6 +11589,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // Embedders and failed startup join work already owned here. They do
         // not start fresh transcript deletions merely by closing the backend.
         if (sessionGcRunning) await sessionGcRunning
+        await sessionDeletionOwner.join()
         if (bookkeepingHandle) await closeProxyBookkeepingWhenSettled(bookkeepingHandle)
       })()
       return backendClosePromise

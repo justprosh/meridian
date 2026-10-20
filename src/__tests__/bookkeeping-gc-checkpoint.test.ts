@@ -7,6 +7,7 @@ import ts from "typescript"
 import { initializeSessionBookkeeping, connectionFor, BookkeepingBusyError } from "../proxy/session/bookkeeping/connection"
 import { checkpointBookkeepingAsync, withBookkeepingWriteAsync } from "../proxy/session/bookkeeping/transaction"
 import { SessionLifecycleLockError, SessionLifecycleQueueCapacityError, SessionLifecycleQueueStalledError } from "../proxy/session/lifecycleErrors"
+import { SessionDeletionCleanupOwner } from "../proxy/session/deletionCleanup"
 
 // Execute the authored server closure with explicit dependencies rather than importing
 // the SDK/server's process-global mocks. SQL admission/checkpoint remain real libsql.
@@ -25,10 +26,10 @@ function sweepHarness(run: () => Promise<object>, checkpoint: () => Promise<unkn
   const rows: Array<{ name: string; data: Record<string, unknown> }> = []
   const warnings: string[] = []
   const create = new Function("runSessionGc", "checkpointProxyBookkeeping", "collectSessionGcPins", "sessionGcOptions",
-    "profileCopyPruningEnabled", "pruneSupersededProfileCopies",
+    "profileCopyPruningEnabled", "pruneSupersededProfileCopies", "sessionDeletionOwner",
     "claudeLog", "plog", "SessionLifecycleLockError", "SessionLifecycleQueueCapacityError", "SessionLifecycleQueueStalledError", "BookkeepingBusyError",
     code + "return sweep;")
-  const sweep: () => Promise<void> = create(run, checkpoint, () => [], {}, false, async () => {},
+  const sweep: () => Promise<void> = create(run, checkpoint, () => [], {}, false, async () => {}, new SessionDeletionCleanupOwner(),
     (name: string, data: Record<string, unknown>) => rows.push({ name, data }),
     (message: string) => warnings.push(message),
     SessionLifecycleLockError, SessionLifecycleQueueCapacityError, SessionLifecycleQueueStalledError, BookkeepingBusyError)

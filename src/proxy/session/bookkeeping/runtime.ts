@@ -16,6 +16,7 @@ import type { BookkeepingWriteOptions } from "./types"
 import { retainBookkeepingRuntimeIdentity } from "./runtimeIdentity"
 import { maintainBookkeepingBeforeListen } from "./startupMaintenance"
 import { assertJsonBookkeepingAuthority } from "./jsonAuthority"
+import { hasPendingSessionDeletionCleanup } from "../deletionCleanup"
 
 export type BookkeepingMode = "json" | "sqlite"
 
@@ -66,7 +67,7 @@ function ownRuntime(handle: BookkeepingHandle): BookkeepingHandle {
 export function finalProxyBookkeepingOwnerHasPendingWork(): boolean {
   if (!runtime || runtime.refs !== 1) return false
   const connection = connectionFor(runtime.directory)
-  return Boolean(connection.scope || connection.pending)
+  return Boolean(connection.scope || connection.pending || hasPendingSessionDeletionCleanup(runtime.directory))
 }
 
 /** Keep the final ownership check and native close in one synchronous turn. */

@@ -260,7 +260,7 @@ it("phase distinguishes session-specific absence from a generic ENOENT/failure",
   expect(result).toEqual({ deleted: 0, notFound: 1, failed: 1, deferred: 1 })
 })
 
-it("hung custom deleter retains permanent fence, double deferred count and break exactly as JSON", async () => {
+it("hung custom deleter retains its fence and counts the one deferred resource once", async () => {
   const locator = seed()
   let calls = 0
   let settle: (() => void) | undefined
@@ -270,7 +270,7 @@ it("hung custom deleter retains permanent fence, double deferred count and break
       calls++
       return new Promise<void>((resolve) => { settle = resolve })
     } })
-    expect(result).toEqual({ deleted: 0, notFound: 0, failed: 0, deferred: 2 })
+    expect(result).toEqual({ deleted: 0, notFound: 0, failed: 0, deferred: 1 })
     const fenced = row(locator)
     settle!()
     expect(await runDeletionPhase([], { ...options, deleter: async () => { calls++ } }))

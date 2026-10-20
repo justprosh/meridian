@@ -132,13 +132,12 @@ export async function runDeletionPhase(pins: readonly TranscriptLocator[],
     let notFound = false
     try {
       const timeout = positiveOption(options.deletionTimeoutMs, runtime.timeoutMs, "deletionTimeoutMs")
-      if (options.deleter) await runtime.awaitCustomDeleter(options.deleter(candidate.locator), timeout)
+      if (options.deleter) await runtime.awaitCustomDeleter(options.deleter(candidate.locator), timeout, directoryFor(options))
       else await runtime.deleteWithSdkChild(candidate.locator, candidate.deletionToken!, timeout,
         (executor, group, signal) => attachDeletionExecutor(candidate.key, candidate.deletionToken!, executor, group,
           { ...options, admissionSignal: signal }), options)
     } catch (error) {
       if (error instanceof runtime.DeletionStillRunningError) {
-        result.deferred++
         break
       }
       if (runtime.isNotFoundError(error, candidate.locator.sessionId)) notFound = true

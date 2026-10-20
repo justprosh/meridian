@@ -438,8 +438,14 @@ control/provider operations and their finalizers before releasing its owner.
 `ProxyInstance.close()` bounds the wait after HTTP drain: an unjoined cleanup
 rejects instead of reporting success, while the original cleanup retains SQL
 and ChatGPT ownership until those operations join. Repeated calls return the
-same promise. This request-ownership guarantee is distinct from the remaining
-GC deletion-child join/accounting acceptance gate.
+same promise. `session/deletionCleanup.ts` separately owns GC from admission,
+including gaps between transactions and native child creation. Its per-proxy
+async context keeps sibling shutdown independent; its directory ledger retains
+the final SQL owner until original cleanup settles, including after GC returns
+a deferred timeout. `deletionChildClosure.ts` requires the original child's
+exit, close and both captured pipe closures; POSIX also requires an empty
+process group. Timed-out custom deleters retain custody until their original
+promise settles. Logging a deferred GC result cannot discharge those owners.
 
 Native handles remain owned through post-open provenance validation. A startup
 failure closes the native handle before releasing its guard; an uncertain close
