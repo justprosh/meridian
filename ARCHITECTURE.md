@@ -425,8 +425,11 @@ addressed lookups, not GC pin collection.
 
 `startProxyServer` awaits READY initialization before binding. Synchronous
 `createProxyServer` requires an initialized handle; embedders call the exported
-`initializeProxyBookkeeping` first and close both the returned handle and the
-proxy's `closeBackend` after draining. Handles are reference-counted and the
+`initializeProxyBookkeeping` first and await both its opaque handle's async close
+and the proxy's `closeBackend` after draining. The public handle exposes only
+`close(): Promise<void>`; native reader/path capabilities remain internal.
+A bounded close failure retains the original cleanup and guard until admitted
+durable work settles. Internal handles are reference-counted and the
 maintenance guard remains shared until the last owner closes. Backend/directory
 changes while a SQLite runtime is owned are rejected.
 

@@ -47,6 +47,10 @@ function ownRuntime(handle: BookkeepingHandle): BookkeepingHandle {
   let closed = false
   return { path: handle.path, reader: handle.reader, close() {
     if (closed) return
+    // A private native reader is not a serving runtime owner. It must not let
+    // the last runtime release its ports/identity while admitted work still uses them.
+    if (finalProxyBookkeepingOwnerHasPendingWork())
+      throw new Error("cannot close during transaction/admission")
     handle.close()
     closed = true
     if (runtime && --runtime.refs === 0) {
@@ -56,6 +60,13 @@ function ownRuntime(handle: BookkeepingHandle): BookkeepingHandle {
       runtime = undefined
     }
   } }
+}
+
+/** Internal ownership observation for opaque close; native reader refs are independent. */
+export function finalProxyBookkeepingOwnerHasPendingWork(): boolean {
+  if (!runtime || runtime.refs !== 1) return false
+  const connection = connectionFor(runtime.directory)
+  return Boolean(connection.scope || connection.pending)
 }
 
 /** CLI/library startup: initialization is not permission to migrate legacy data. */

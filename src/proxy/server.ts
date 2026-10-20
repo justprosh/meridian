@@ -261,12 +261,13 @@ import {
 import { createSdkProcessGate } from "./session/sdkProcessGate"
 import {
   admitSessionStoreWrite, bookkeepingMode, checkpointProxyBookkeeping,
-  initializeProxyBookkeeping, retainProxyBookkeeping,
+  initializeProxyBookkeeping as initializeProxyBookkeepingRuntime, retainProxyBookkeeping,
 } from "./session/bookkeeping/runtime"
 import { BookkeepingBusyError, BookkeepingCommitUncertainError } from "./session/bookkeeping/database"
 import { SessionLifecycleLockError, SessionLifecycleQueueCapacityError, SessionLifecycleQueueStalledError } from "./session/lifecycleErrors"
 setProxyDiagnosticSink((message) => diagnosticLog.session(message))
-export { initializeProxyBookkeeping } from "./session/bookkeeping/runtime"
+export { initializeProxyBookkeeping } from "./session/bookkeeping/embedding"
+export type { ProxyBookkeepingHandle } from "./session/bookkeeping/embedding"
 // Re-export for backwards compatibility (existing tests import from here)
 export { computeLineageHash, hashMessage, computeMessageHashes }
 export { clearSessionCache, getMaxSessionsLimit }
@@ -11707,7 +11708,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   logCredentialsModeBanner()
   // Resolved now, not on the first turn, so the startup line and /health name it.
   await resolveClaudeExecutableAsync()
-  const startupBookkeeping = await initializeProxyBookkeeping()
+  const startupBookkeeping = await initializeProxyBookkeepingRuntime()
   const authOwner = createAuthStatusOwner()
   const getInstanceAuthStatus = (profileId?: string, envOverrides?: Record<string, string>) =>
     authOwner.run(() => getClaudeAuthStatusAsync(profileId, envOverrides))

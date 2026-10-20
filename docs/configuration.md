@@ -1761,10 +1761,15 @@ const proxy = createProxyServer(config)
 // Serve proxy.app.fetch, then stop admissions and drain outstanding requests.
 proxy.beginDrain?.()
 await proxy.closeBackend?.()
-handle?.close()
+await handle?.close()
 ```
 
 Keep the directory/backend fixed for the lifetime of these owners. Closing one
-proxy never closes another owner's connection. Unknown COMMIT outcomes are not
+proxy never closes another owner's connection. The returned handle is opaque:
+it exposes only idempotent `close(): Promise<void>`, with repeated calls joining
+the same promise. Successful close waits for the final owner's admitted durable
+work. If its two-second close budget expires, it rejects and retains ownership
+until that original work joins; a rejected close is not permission to start
+offline maintenance. Unknown COMMIT outcomes are not
 replayed and do not authorize retiring a possibly published transcript. Periodic
 GC performs a PASSIVE checkpoint; physical WAL shrinking is an offline operation.

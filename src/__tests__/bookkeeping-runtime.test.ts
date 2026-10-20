@@ -20,6 +20,7 @@ import { setSessionStoreDir, storeSharedSession, lookupSharedSession, readSessio
 import { resourceKey } from "../proxy/session/bookkeeping/locator"
 import { registerLiveTranscript, runGc } from "../proxy/sessionLifecycle"
 import { connectionFor } from "../proxy/session/bookkeeping/connection"
+import { lifecycleLockQueue } from "../proxy/session/lifecycleLockQueue"
 
 let directory: string
 const handles: BookkeepingHandle[] = []
@@ -79,6 +80,26 @@ it("releases only a nonfinal owner during admission while the last owner retains
   expect(lookupSharedSession("active-owner")?.claudeSessionId).toBe("sdk")
   second.close()
   expect(activeStoreBackend()).toBeUndefined()
+})
+
+it("a private native reader cannot release the last serving runtime during admission", async () => {
+  const runtime = await initializeProxyBookkeeping()
+  if (!runtime) throw new Error("runtime owner missing")
+  const reader = initializeSessionBookkeeping(directory)
+  handles.push(runtime, reader)
+  const gate = Promise.withResolvers<void>()
+  const blocked = lifecycleLockQueue.run(connectionFor(directory).path, undefined, () => gate.promise)
+  const admitted = admitSessionStoreWrite(() => storeSharedSession("runtime-owned", "sdk"))
+  try {
+    expect(() => runtime.close()).toThrow("cannot close during transaction/admission")
+    expect(activeStoreBackend()).toBeDefined()
+    gate.resolve()
+    await blocked
+    expect(await admitted).not.toBe(false)
+  } finally {
+    gate.resolve()
+    await Promise.allSettled([blocked, admitted])
+  }
 })
 
 it("does not import legacy data implicitly and permits only explicit offline migration", async () => {
