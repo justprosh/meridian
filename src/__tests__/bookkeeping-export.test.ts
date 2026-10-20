@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "bun:test"
 import { randomUUID } from "node:crypto"
 import { createHash } from "node:crypto"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { pathToFileURL } from "node:url"
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

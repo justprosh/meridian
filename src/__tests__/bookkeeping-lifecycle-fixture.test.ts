@@ -1,9 +1,10 @@
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 import { expect, it } from "bun:test"
 import { fileURLToPath } from "node:url"
 
 it("the SQLite lifecycle fixture joins store callbacks and closes both ports", async () => {
   const modulePath = (relative: string) => JSON.stringify(fileURLToPath(new URL(relative, import.meta.url)))
-  const child = Bun.spawn([process.execPath, "--eval", `
+  const child = Bun.spawn([process.execPath, ...bookkeepingBunPreloadArgs(), "--eval", `
     import assert from "node:assert/strict";
     import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
     import { tmpdir } from "node:os";

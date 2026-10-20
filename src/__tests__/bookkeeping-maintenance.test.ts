@@ -1,5 +1,6 @@
+import { unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { afterEach, beforeEach, expect, it } from "bun:test"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { spawn, spawnSync } from "node:child_process"
 import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -209,7 +210,7 @@ it("detects a second process winning the exclusive-to-shared gap", async () => {
           encoding: "utf8",
           timeout: 4000,
         })
-        expect({ exit: child.status, stderr: child.stderr }).toEqual({ exit: 0, stderr: "" })
+        expect({ exit: child.status, stderr: unexpectedNodeSqliteStderr(child.stderr) }).toEqual({ exit: 0, stderr: "" })
       },
     ),
   ).toThrow(BookkeepingGuardBusyError)
@@ -261,8 +262,8 @@ it("two real runtime processes exclude maintenance until the last process releas
     children[1]!.send("close")
     expect(await exits[1]).toBe(0)
     const last = probe()
-    expect({ exit: last.status, stderr: last.stderr }).toEqual({ exit: 0, stderr: "" })
-    expect(errors).toEqual(["", ""])
+    expect({ exit: last.status, stderr: unexpectedNodeSqliteStderr(last.stderr) }).toEqual({ exit: 0, stderr: "" })
+    expect(errors.map(unexpectedNodeSqliteStderr)).toEqual(["", ""])
   } finally {
     clearTimeout(timer)
     children.forEach((child) => {

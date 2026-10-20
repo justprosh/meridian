@@ -234,7 +234,7 @@ it("yields while a real Node child holds BEGIN IMMEDIATE; joined cleanup is retr
   const locator = seed()
   const lease = await facade.acquireActiveTranscriptLease([locator], options)
   const child = spawn("node", ["--input-type=module", "-e", `
-    import Database from 'libsql';
+    import { DatabaseSync as Database } from 'node:sqlite';
     const db = new Database(${JSON.stringify(handle.path)});
     db.exec('BEGIN IMMEDIATE'); process.send('locked');
     process.on('disconnect', () => { db.exec('ROLLBACK'); db.close(); process.exit(0); });

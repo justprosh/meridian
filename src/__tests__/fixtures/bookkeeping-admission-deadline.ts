@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { fork } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../../proxy/session/bookkeeping/nativeDatabase"
 import { initializeSessionBookkeepingAsync, withBookkeepingWriteAsync } from "../../proxy/session/bookkeeping/database"
 import { SessionLifecycleLockError } from "../../proxy/session/lifecycleErrors"
 import { assertAdmissionDeadline, measureAdmissionHeartbeat, type AdmissionHeartbeat } from "./bookkeeping-heartbeat"

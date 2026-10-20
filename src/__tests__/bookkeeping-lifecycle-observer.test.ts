@@ -1,10 +1,11 @@
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 import { expect, it } from "bun:test"
 import { fileURLToPath } from "node:url"
 
 for (const mode of ["legacy", "sqlite"]) {
   it(`observes resource, lease, fence and counts without altering the ${mode} ledger`, async () => {
     const modulePath = (relative: string) => JSON.stringify(fileURLToPath(new URL(relative, import.meta.url)))
-    const child = Bun.spawn([process.execPath, "--eval", `
+    const child = Bun.spawn([process.execPath, ...bookkeepingBunPreloadArgs(), "--eval", `
       import assert from "node:assert/strict";
       import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
       import { tmpdir } from "node:os";

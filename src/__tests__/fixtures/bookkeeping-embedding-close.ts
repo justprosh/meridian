@@ -3,14 +3,14 @@ import { initializeSessionBookkeeping } from "../../proxy/session/bookkeeping/da
 import { initializeProxyBookkeeping } from "../../proxy/session/bookkeeping/embedding"
 import { acquireMaintenanceGuard } from "../../proxy/session/bookkeeping/guard"
 import { setSessionStoreDir } from "../../proxy/sessionStore"
-import type Database from "libsql"
+import type { NativeDatabase as Database } from "../../proxy/session/bookkeeping/nativeDatabase"
 
 assert(!process.versions.bun, "native Node actor required")
 const directory = process.argv[2]
 assert(directory)
 process.env.MERIDIAN_BOOKKEEPING = "sqlite"
 setSessionStoreDir(directory)
-let native: Database.Database | undefined
+let native: Database | undefined
 const reader = initializeSessionBookkeeping(directory, { closeDatabase(db) {
   native = db
   throw new Error("owned uncertain native close")

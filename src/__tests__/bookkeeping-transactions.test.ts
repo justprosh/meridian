@@ -1,5 +1,6 @@
+import { unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { afterEach, beforeEach, expect, it } from "bun:test"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { spawn, spawnSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } from "node:fs"
 import { join, resolve } from "node:path"
@@ -352,7 +353,7 @@ it("two real Node processes contend without a long synchronous event-loop stall"
   } finally {
     clearTimeout(timeout)
   }
-  expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" })
+  expect({ exit, stderr: unexpectedNodeSqliteStderr(stderr) }).toEqual({ exit: 0, stderr: "" })
   const evidence = JSON.parse(stdout) as {
     node: string
     calls: number
@@ -414,7 +415,7 @@ for (const afterDurableCommit of [false, true]) {
     let inject = true,
       calls = 0,
       hooks = 0
-    let poisoned: Database.Database | undefined
+    let poisoned: Database | undefined
     handle = initializeSessionBookkeeping(directory, {
       executeTransaction(db, sql) {
         if (sql === "COMMIT" && inject) {
@@ -471,7 +472,7 @@ it("retains a multi-SELECT snapshot while a second process commits between reads
       [
         "--input-type=module",
         "-e",
-        `import D from 'libsql'; const d=new D(process.argv[1]);
+        `import { DatabaseSync as D } from 'node:sqlite'; const d=new D(process.argv[1]);
           d.exec(\`BEGIN IMMEDIATE; UPDATE mappings SET generation_id='new';
             UPDATE mapping_history SET history_json='{"messageHashes":["new"]}'; COMMIT\`);
           d.close()`,
@@ -479,7 +480,7 @@ it("retains a multi-SELECT snapshot while a second process commits between reads
       ],
       { encoding: "utf8" },
     )
-    expect({ code: child.status, stderr: child.stderr }).toEqual({ code: 0, stderr: "" })
+    expect({ code: child.status, stderr: unexpectedNodeSqliteStderr(child.stderr) }).toEqual({ code: 0, stderr: "" })
     expect(readMapping(reader, "key")?.messageHashes).toEqual(["old"])
     expect(() => withBookkeepingWrite(directory, { scope: "store" }, () => true)).toThrow(
       SessionLifecycleReentrancyError,
@@ -532,7 +533,7 @@ it("defers WAL checkpoint to maintenance and reserves file shrink for explicit o
 it("rolls back a leftover transaction on close and releases the file to another process", () => {
   if (process.platform === "win32") return // Windows rename/ACL evidence is a separate gate.
   handle.close()
-  let native: Database.Database | undefined
+  let native: Database | undefined
   handle = initializeSessionBookkeeping(directory, {
     executeTransaction(db, sql) {
       native = db
@@ -548,7 +549,7 @@ it("rolls back a leftover transaction on close and releases the file to another 
     [
       "--input-type=module",
       "-e",
-      `import D from 'libsql'; import{renameSync}from'node:fs'; const p=process.argv[1],d=new D(p);
+      `import { DatabaseSync as D } from 'node:sqlite'; import{renameSync}from'node:fs'; const p=process.argv[1],d=new D(p);
         d.exec('BEGIN EXCLUSIVE');
         if(d.prepare("SELECT counter FROM fence_slots WHERE slot='uncommitted'").get()) process.exit(2);
         d.exec('ROLLBACK');d.close(); renameSync(p,p+'.moved');renameSync(p+'.moved',p)`,
@@ -556,7 +557,7 @@ it("rolls back a leftover transaction on close and releases the file to another 
     ],
     { encoding: "utf8" },
   )
-  expect({ code: child.status, stderr: child.stderr }).toEqual({ code: 0, stderr: "" })
+  expect({ code: child.status, stderr: unexpectedNodeSqliteStderr(child.stderr) }).toEqual({ code: 0, stderr: "" })
   handle = initializeSessionBookkeeping(directory)
 })
 
@@ -569,7 +570,7 @@ it(`never expires ${ADMISSION_DEADLINE_SAMPLES} Node admission budgets early whi
   const child = spawnSync("node", [join(directory, "deadline.mjs"), directory, String(ADMISSION_DEADLINE_SAMPLES)], {
     encoding: "utf8", timeout: 35_000,
   })
-  expect({ status: child.status, stderr: child.stderr, error: child.error }).toEqual({
+  expect({ status: child.status, stderr: unexpectedNodeSqliteStderr(child.stderr), error: child.error }).toEqual({
     status: 0, stderr: "", error: undefined,
   })
   const evidence = JSON.parse(child.stdout) as { node: string; samples: AdmissionHeartbeat[] }
@@ -604,7 +605,7 @@ it("measures three competing Node writers and bounds lock starvation by the admi
   } finally {
     clearTimeout(timer)
   }
-  expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" })
+  expect({ exit, stderr: unexpectedNodeSqliteStderr(stderr) }).toEqual({ exit: 0, stderr: "" })
   const rows = JSON.parse(stdout) as Array<{
     completed: number
     rejected: number

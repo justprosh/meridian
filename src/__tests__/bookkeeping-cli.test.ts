@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, expect, it } from "bun:test"
 import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
 import { runBookkeepingCli } from "../proxy/session/bookkeeping/cli"
 import { acquireMaintenanceGuard } from "../proxy/session/bookkeeping/guard"
@@ -50,12 +50,12 @@ it("migrate → export in one Node process completes 50 times without a retained
 it("an external child read transaction still refuses export with exit 4 and WAL-lock diagnostics", async () => {
   success("migrate", ["--writers-stopped"])
   const child = spawn("node", ["--input-type=module", "-e", `
-    import Database from 'libsql';
+    import { DatabaseSync as Database } from 'node:sqlite';
     const db = new Database(process.argv[1]);
     db.exec("INSERT INTO fence_slots VALUES('store','ffff',1)");
     db.exec('BEGIN');
     const statement = db.prepare('SELECT * FROM schema_meta'); statement.get();
-    if (!db.inTransaction) throw new Error('reader transaction missing');
+    if (!db.isTransaction) throw new Error('reader transaction missing');
     console.log('ready'); setInterval(() => { void statement; }, 1000);
   `, join(directory, "session-bookkeeping.sqlite")], { stdio: "pipe" })
   try {
@@ -251,9 +251,9 @@ it("inspects and archives an incomplete directory candidate without inventing an
 it("refuses a foreign SQLite before guard creation without changing files or inodes", async () => {
   const path = join(directory, "session-bookkeeping.sqlite")
   const child = spawn("node", ["--input-type=module", "-e", `
-    import Database from 'libsql';
+    import { DatabaseSync as Database } from 'node:sqlite';
     const db = new Database(${JSON.stringify(path)});
-    db.pragma('journal_mode=WAL');
+    db.exec('PRAGMA journal_mode=WAL');
     db.exec("CREATE TABLE foreign_authority(value TEXT); INSERT INTO foreign_authority VALUES ('kept')");
     process.send('ready');
     process.on('disconnect', () => { db.close(); process.exit(0); });

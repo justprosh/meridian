@@ -9,10 +9,11 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
-import { buildNodeFixture } from "./fixtures/bookkeeping-support"
+import { buildNodeFixture, withIdleWalReader } from "./fixtures/bookkeeping-support"
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-old-artifacts-")))
 const artifacts: Array<{ name: string; module: string }> = []
+let idleReaderScript: string
 const unavailable = new Map<string, string>()
 const tarballs: Array<[string, string]> = []
 const pack = spawnSync("npm", ["pack", "@rynfar/meridian@1.78.0", "--pack-destination", root,
@@ -52,6 +53,11 @@ beforeAll(async () => {
   }
   const build = await buildNodeFixture("bookkeeping-transition.ts", "transition.mjs", root)
   expect(build.success).toBe(true)
+  const readerDirectory = join(root, "idle-reader")
+  mkdirSync(readerDirectory)
+  const reader = await buildNodeFixture("bookkeeping-idle-wal-reader.ts", "reader.mjs", readerDirectory)
+  expect(reader.success).toBe(true)
+  idleReaderScript = join(readerDirectory, "reader.mjs")
   const cli = await Bun.build({ entrypoints: [resolve("bin/session-bookkeeping.ts")], target: "node",
     naming: "cli.mjs", outdir: root, external: ["libsql"] })
   expect(cli.success, String(cli.logs)).toBe(true)
@@ -124,10 +130,15 @@ for (const name of ["npm", "compat"]) for (const cut of cuts) {
     const directory = realpathSync(mkdtempSync(join(root, "data-")))
     await migrateBookkeeping(directory, { writersStopped: true })
     if (cut) {
-      const result = spawnSync("node", [join(root, "transition.mjs"), "export", directory], {
-        encoding: "utf8", timeout: 15000, env: { ...process.env, MERIDIAN_BOOKKEEPING_TEST_CRASH: cut },
-      })
-      expect(result.signal, result.stdout + result.stderr).toBe("SIGKILL")
+      const exercise = () => {
+        const result = spawnSync("node", [join(root, "transition.mjs"), "export", directory], {
+          encoding: "utf8", timeout: 15000, env: { ...process.env, MERIDIAN_BOOKKEEPING_TEST_CRASH: cut },
+        })
+        expect(result.signal, result.stdout + result.stderr).toBe("SIGKILL")
+      }
+      if (cut.endsWith("-wal") || cut.endsWith("-shm")) {
+        await withIdleWalReader(directory, idleReaderScript, exercise)
+      } else exercise()
     }
     const baseline = new Map(["sessions.json", "session-gc.json"].map((file) => [file,
       existsSync(join(directory, file)) ? readFileSync(join(directory, file), "utf8") : undefined]))

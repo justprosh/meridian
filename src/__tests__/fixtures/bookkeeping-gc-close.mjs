@@ -76,7 +76,7 @@ try {
   if (mode === 'admission') await admitted
   else assert.deepEqual(await gcWork, {deleted: 0, notFound: 0, failed: 0, deferred: 1})
   if (mode === 'native') {
-    const peer = cp.spawnSync(process.execPath, [join(repo, 'src/__tests__/fixtures/bookkeeping-gc-peer-reconcile.mjs'), repo, directory], {
+    const peer = cp.spawnSync(process.execPath, ['--preload', join(repo, 'src/__tests__/fixtures/bookkeeping-engine-preload.mjs'), join(repo, 'src/__tests__/fixtures/bookkeeping-gc-peer-reconcile.mjs'), repo, directory], {
       env: process.env, encoding: 'utf8', timeout: process.platform === 'win32' ? 60000 : 10000,
     })
     assert.equal(peer.status, 0, peer.stderr)

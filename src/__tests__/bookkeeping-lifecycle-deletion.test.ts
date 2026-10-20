@@ -1,3 +1,4 @@
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -361,7 +362,7 @@ it("SIGKILL of the real deletion parent after the SDK gate opens never releases 
       setInterval(() => {}, 1000); await new Promise(() => {});
     }`)
   const moduleUrl = (name: string) => pathToFileURL(join(import.meta.dir, "../proxy/session/bookkeeping", name)).href
-  const parent = Bun.spawn([process.execPath, "--eval", `
+  const parent = Bun.spawn([process.execPath, ...bookkeepingBunPreloadArgs(), "--eval", `
     import { initializeSessionBookkeeping } from ${JSON.stringify(moduleUrl("database.ts"))};
     import { sqliteLifecycleBackend } from ${JSON.stringify(moduleUrl("lifecycleSql.ts"))};
     const handle = initializeSessionBookkeeping(${JSON.stringify(directory)});

@@ -1,3 +1,4 @@
+import { unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { afterAll, beforeAll, expect, it } from "bun:test"
 import { spawnSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
@@ -29,7 +30,7 @@ function probe(mode: string) {
   expect(result.error).toBeUndefined()
   expect(result.signal).toBeNull()
   expect(result.status).toBe(0)
-  expect(result.stderr).toBe("")
+  expect(unexpectedNodeSqliteStderr(result.stderr)).toBe("")
   const report = JSON.parse(result.stdout)
   console.info(JSON.stringify(report))
   return report

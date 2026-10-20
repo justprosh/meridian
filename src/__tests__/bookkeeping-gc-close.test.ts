@@ -1,3 +1,4 @@
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 import { expect, it } from "bun:test"
 import { spawnSync } from "node:child_process"
 import { mkdtempSync, realpathSync, rmSync } from "node:fs"
@@ -9,8 +10,8 @@ for (const mode of ["custom", "native", "admission"]) {
   it(`retains the final SQLite owner until original timed-out GC cleanup joins: ${mode}`, () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-gc-close-")))
     try {
-      const child = spawnSync(process.execPath, [resolve("src/__tests__/fixtures/bookkeeping-gc-close.mjs"), resolve("."), root, mode], {
-        env: { PATH: process.env.PATH, HOME: root, USERPROFILE: root,
+      const child = spawnSync(process.execPath, [...bookkeepingBunPreloadArgs(), resolve("src/__tests__/fixtures/bookkeeping-gc-close.mjs"), resolve("."), root, mode], {
+        env: { BOOKKEEPING_TEST_SQLITE_LIBRARY: process.env.BOOKKEEPING_TEST_SQLITE_LIBRARY, PATH: process.env.PATH, HOME: root, USERPROFILE: root,
           SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR },
         encoding: "utf8", timeout: process.platform === "win32" ? 65000 : 20000,
       })

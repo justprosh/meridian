@@ -1,4 +1,4 @@
-import Database from "libsql"
+import { NativeDatabase } from "./nativeDatabase"
 import {
   constants,
   closeSync,
@@ -39,11 +39,11 @@ import { EXPORT_JOURNAL_NAME } from "./exportJournal"
 
 export const BOOKKEEPING_FILENAME = "session-bookkeeping.sqlite"
 export interface BookkeepingInitializeOptions {
-  executeTransaction?: (db: Database.Database, sql: string) => void
-  closeDatabase?: (db: Database.Database) => void
+  executeTransaction?: (db: NativeDatabase, sql: string) => void
+  closeDatabase?: (db: NativeDatabase) => void
 }
 export interface Connection {
-  db?: Database.Database
+  db?: NativeDatabase
   path: string
   refs: number
   pending: number
@@ -90,8 +90,8 @@ function checkFiles(path: string): void {
   }
 }
 export function closeNative(
-  db: Database.Database,
-  close: (value: Database.Database) => void = (value) => { value.close() },
+  db: NativeDatabase,
+  close: (value: NativeDatabase) => void = (value) => { value.close() },
 ): void {
   try {
     if (db.inTransaction) db.exec("ROLLBACK")
@@ -105,7 +105,7 @@ export function closeNative(
     }
   }
 }
-export function database(connection: Connection): Database.Database {
+export function database(connection: Connection): NativeDatabase {
   assertNotTerminal(connection.path)
   if (!connection.db) throw new Error("bookkeeping connection is closed")
   assertGuardHeld(connection.guard, connection.maintenance ? "exclusive" : "shared")
@@ -121,7 +121,7 @@ export function checkParameters(parameters: SqlValue[]): void {
     throw new RangeError("bookkeeping numbers must be safe integers")
   }
 }
-export function getRow(db: Database.Database, sql: string, parameters: SqlValue[]): SqlRow | undefined {
+export function getRow(db: NativeDatabase, sql: string, parameters: SqlValue[]): SqlRow | undefined {
   checkParameters(parameters)
   const row = db.prepare(sql).get(...parameters) as SqlRow | undefined
   if (row) delete row._metadata
@@ -141,7 +141,7 @@ export function assertRead(sql: string): void {
 export function assertSingleStatement(sql: string): void {
   if (/;\s*\S/.test(sql)) throw new Error("multiple SQL statements are forbidden")
 }
-function pragmas(db: Database.Database, journal: "WAL" | "DELETE"): void {
+function pragmas(db: NativeDatabase, journal: "WAL" | "DELETE"): void {
   const values = [
     ["busy_timeout=0", 0],
     ["wal_autocheckpoint=0", 0],
@@ -160,7 +160,7 @@ function bootstrap(path: string, phase = "READY", provenance?: MigrationJournal)
   if (existsSync(path)) return
   const temporary = createBootstrapPath(path)
   closeSync(openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600))
-  let db: Database.Database | undefined
+  let db: NativeDatabase | undefined
   const close = () => {
     const owned = db
     db = undefined
@@ -172,7 +172,7 @@ function bootstrap(path: string, phase = "READY", provenance?: MigrationJournal)
     }
   }
   try {
-    db = new Database(temporary)
+    db = new NativeDatabase(temporary)
     pragmas(db, "DELETE")
     db.exec("BEGIN IMMEDIATE")
     initializeBookkeepingSchema(db, true)
@@ -206,9 +206,9 @@ export function createMaintenanceDatabase(directory: string, guard: MaintenanceG
   bootstrap(join(canonical, BOOKKEEPING_FILENAME), "PREPARED")
 }
 
-function openDatabase(path: string, phase: string, full: boolean, skipRealpathAudit = false): Database.Database {
+function openDatabase(path: string, phase: string, full: boolean, skipRealpathAudit = false): NativeDatabase {
   checkFiles(path)
-  const db = new Database(path)
+  const db = new NativeDatabase(path)
   try {
     pragmas(db, "WAL")
     db.exec("BEGIN")
@@ -329,7 +329,7 @@ export function openHandle(
       (expectPhase === undefined ? acquireRuntimeGuard(canonical) : acquireMaintenanceGuard(canonical))
     const ownsGuard = maintenanceGuard === undefined
     let releaseGuardReference: (() => void) | undefined
-    let openingDatabase: Database.Database | undefined
+    let openingDatabase: NativeDatabase | undefined
     try {
       if (freshGuard) {
         const provenance = prepareFreshBootstrap(canonical, freshGuard)
@@ -426,7 +426,7 @@ export function openHandle(
   directories.set(resolve(directory), path)
   directories.set(canonical, path)
   let owned: Connection | undefined = connection
-  function readable(): Database.Database {
+  function readable(): NativeDatabase {
     if (!owned) throw new Error("bookkeeping handle is closed")
     if (owned.scope === "write") throw new Error("use the transaction reader inside a write")
     return database(owned)

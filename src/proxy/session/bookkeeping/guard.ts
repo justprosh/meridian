@@ -1,4 +1,4 @@
-import Database from "libsql"
+import { NativeDatabase } from "./nativeDatabase"
 import {
   closeSync,
   constants,
@@ -45,7 +45,7 @@ export interface MaintenanceGuardLease extends GuardLease {
   toShared(verifyBackend: () => void, afterExclusiveCommitForTest?: () => void): GuardLease
 }
 interface State {
-  db?: Database.Database
+  db?: NativeDatabase
   mode: "shared" | "exclusive"
   path: string
   epoch: number
@@ -62,7 +62,7 @@ function busyError(error: unknown): boolean {
     error instanceof BookkeepingBusyError || /^(SQLITE_BUSY|SQLITE_LOCKED)(_|$)/.test(errorCode(error) ?? "")
   )
 }
-function closeDatabase(db: Database.Database): void {
+function closeDatabase(db: NativeDatabase): void {
   try {
     if (db.inTransaction) db.exec("ROLLBACK")
   } finally {
@@ -79,7 +79,7 @@ function checkFiles(path: string): void {
     }
   }
 }
-function pragmas(db: Database.Database): void {
+function pragmas(db: NativeDatabase): void {
   db.pragma("busy_timeout=0")
   db.pragma("synchronous=FULL")
   if (pragmaValue(db, "busy_timeout") !== 0 || pragmaValue(db, "synchronous") !== 2) {
@@ -89,7 +89,7 @@ function pragmas(db: Database.Database): void {
     throw new SessionLifecycleCorruptError("maintenance guard must use DELETE journal, never WAL")
   }
 }
-function validate(db: Database.Database): number {
+function validate(db: NativeDatabase): number {
   const schema = db
     .prepare("SELECT name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
     .all() as Array<{ name: string; sql: string }>
@@ -123,7 +123,7 @@ function bootstrap(path: string): { dev: number; ino: number } | undefined {
   if (existsSync(path)) return
   const temporary = createBootstrapPath(path)
   closeSync(openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600))
-  let db: Database.Database | undefined
+  let db: NativeDatabase | undefined
   const close = () => {
     const owned = db
     db = undefined
@@ -135,7 +135,7 @@ function bootstrap(path: string): { dev: number; ino: number } | undefined {
     }
   }
   try {
-    db = new Database(temporary)
+    db = new NativeDatabase(temporary)
     db.pragma("journal_mode=DELETE")
     pragmas(db)
     db.exec("BEGIN EXCLUSIVE")
@@ -232,11 +232,11 @@ function openGuard(directory: string, mode: State["mode"], recoveringIdentity?: 
       checkFiles(path)
     }
   }
-  let db: Database.Database | undefined
+  let db: NativeDatabase | undefined
   try {
     let state = existing
     if (!state) {
-      db = new Database(path)
+      db = new NativeDatabase(path)
       pragmas(db)
       db.exec(mode === "shared" ? "BEGIN" : "BEGIN EXCLUSIVE")
       let epoch = validate(db) // SELECT obtains an actual shared read lock, not merely a deferred BEGIN.
@@ -366,8 +366,7 @@ export function acquireInspectionGuard(directory: string): GuardLease | undefine
   for (const suffix of ["", "-journal", "-wal", "-shm"]) {
     if (existsSync(path + suffix)) closeSync(ownedFd(path + suffix, false, false, true))
   }
-  // libsql 0.5 ignores the JS readonly option; the SQLite URI flag is the actual boundary.
-  const db = new Database(`${pathToFileURL(path).href}?mode=ro`)
+  const db = new NativeDatabase(`${pathToFileURL(path).href}?mode=ro`, { readonly: true })
   try {
     db.pragma("busy_timeout=0")
     db.exec("BEGIN")

@@ -1625,6 +1625,20 @@ Once a directory contains SQLite or active maintenance journals, JSON startup
 refuses it rather than creating a second authority. Never remove lock barriers
 by hand.
 
+The runtime must provide SQLite with the upstream WAL-reset fix: 3.51.3 or
+later, or the 3.44.6/3.50.7 backports. Node 22.22.3 includes SQLite 3.51.3;
+use a Node release whose built-in engine meets this requirement. The actual
+version and source ID are checked in memory before opening a persistent main
+database or maintenance guard. Older engines fail initialization with upgrade
+guidance. The default JSON backend is unaffected.
+
+Bun uses its own SQLite API and, on macOS, normally loads the OS library.
+Its version can therefore differ from Node's. Advanced Bun embedders may select
+a patched library with Bun's `Database.setCustomSQLite()` before initialization;
+Meridian never changes that process-wide setting. Running the CLI with a
+qualified Node runtime is the direct option. Node 22 may print its standard
+experimental SQLite notice on stderr; structured command results remain on stdout.
+
 SQLite uses `session-bookkeeping.sqlite`, WAL, `synchronous=FULL`, foreign keys,
 `busy_timeout=0` and disabled automatic checkpoints. Use a local filesystem
 with working SQLite locks: Linux ext2/3/4, xfs, btrfs or tmpfs; macOS APFS/HFS.

@@ -1,3 +1,4 @@
+import { unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { afterEach, beforeEach, expect, it } from "bun:test"
 import { randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
@@ -191,7 +192,7 @@ for (const point of ["PREPARED", "barrier:session-gc.json", "barrier:sessions.js
       env: { ...process.env, MERIDIAN_BOOKKEEPING_TEST_CRASH: point }, encoding: "utf8", timeout: 15000,
     })
     expect(child.error).toBeUndefined()
-    expect(child.stderr).toBe("")
+    expect(unexpectedNodeSqliteStderr(child.stderr)).toBe("")
     expect(child.signal).toBe("SIGKILL")
     const journal = readJournal(directory)
     expect(journal).toBeDefined()

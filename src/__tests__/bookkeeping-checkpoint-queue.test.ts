@@ -1,5 +1,5 @@
 import { expect, it } from "bun:test"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { once } from "node:events"
@@ -15,8 +15,8 @@ it("waits for a separate-process native writer before draining the queued checkp
   const handle = initializeSessionBookkeeping(dir)
   const ready = join(dir, "ready")
   const writer = spawn("node", ["--input-type=module", "-e", `
-    import Database from 'libsql'; import {writeFileSync} from 'node:fs';
-    const [p,r]=process.argv.slice(1); const db=new Database(p); db.pragma('busy_timeout=0');
+    import { DatabaseSync as Database } from 'node:sqlite'; import {writeFileSync} from 'node:fs';
+    const [p,r]=process.argv.slice(1); const db=new Database(p); db.exec('PRAGMA busy_timeout=0');
     db.exec('BEGIN IMMEDIATE'); writeFileSync(r,'1');
     setTimeout(()=>{db.exec('ROLLBACK');db.close()},400)`, handle.path, ready], { stdio: "inherit" })
   const exited = once(writer, "exit")

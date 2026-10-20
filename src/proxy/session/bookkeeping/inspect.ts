@@ -1,4 +1,4 @@
-import Database from "libsql"
+import { NativeDatabase } from "./nativeDatabase"
 import { closeSync, existsSync, lstatSync, readdirSync, realpathSync } from "node:fs"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -83,9 +83,9 @@ export function inspectBookkeeping(input: string): Inspection {
     if (sizes.main && !bootstrap.length) {
       if (!migration || !guard) throw new Error("database without migration journal/guard")
       if (!sizes.shm && sizes.wal) throw new Error("WAL without shared memory; offline recovery required")
-      // libsql's JS readonly option is ignored; enforce read-only in the native SQLite URI.
+      // Without live WAL/SHM, immutable URI mode must not create inspection sidecars.
       const address = `${pathToFileURL(path).href}?mode=ro${sizes.shm ? "" : "&immutable=1"}`
-      const db = new Database(address)
+      const db = new NativeDatabase(address, { readonly: true })
       try {
         db.exec("BEGIN")
         if (pragmaValue(db, "application_id") !== BOOKKEEPING_APPLICATION_ID) {
@@ -99,8 +99,7 @@ export function inspectBookkeeping(input: string): Inspection {
         for (const row of counts) resources[row.state] = row.n
         mappings = (db.prepare("SELECT count(*) AS n FROM mappings").get() as { n: number }).n
       } finally {
-        // libsql close can defer native teardown until statements are collected. End the
-        // snapshot explicitly: an inspection must not leave a read mark behind until GC.
+        // End the snapshot explicitly before closing its original native owner.
         try { if (db.inTransaction) db.exec("ROLLBACK") } finally { db.close() }
       }
     } else if (!sizes.main) {

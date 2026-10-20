@@ -8561,6 +8561,21 @@ See [bounded proof](docs/maintenance/evidence/1257-profile-credential-isolation.
 
 # Packaged SQLite bookkeeping gate
 
+Bookkeeping uses the runtime's built-in SQLite, and qualification requires the
+upstream WAL-reset fix on every writer/checkpointer. Record the actual engine
+version/source ID alongside Node/Bun and platform. Node 22.22.3 exposes SQLite
+3.51.3; the installed package gates must use a qualified runtime. Unpatched
+engines must refuse before a persistent native main/guard open, without fallback.
+
+On macOS, Bun normally loads Apple's SQLite. For source/unit checks on a host
+whose OS library is older, explicitly select an installed patched shared library:
+`MERIDIAN_TEST_SQLITE_LIBRARY=/absolute/path/to/patched/libsqlite3.dylib npm test`.
+The test-only preload uses Bun's public `Database.setCustomSQLite()` before any
+test database and passes the selection to owned Bun test actors. Record the
+library hash and actual source ID. Product code never selects a global library;
+stock Node package tests independently exercise its bundled engine. The custom
+test selection is not proof that the host's default Bun engine is qualified.
+
 For a SQLite candidate, build and pack the final tree, then install both artifacts
 through the canonical smoke (Node 22):
 

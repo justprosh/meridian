@@ -1,5 +1,6 @@
+import { unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { afterEach, beforeEach, expect, it } from "bun:test"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { spawn, spawnSync } from "node:child_process"
 import { chmodSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -183,7 +184,7 @@ for (const mode of ["no-open", "close-fault", "close-direct-fault"] as const) {
       encoding: "utf8", timeout: 10000,
     })
     expect(child.error).toBeUndefined()
-    expect(child.stderr).toBe("")
+    expect(unexpectedNodeSqliteStderr(child.stderr)).toBe("")
     expect(child.status).toBe(0)
   })
 }
@@ -200,7 +201,7 @@ for (const suffix of ["", "-wal"]) {
       encoding: "utf8", timeout: 5000,
     })
     expect(child.error).toBeUndefined()
-    expect(child.stderr).toBe("")
+    expect(unexpectedNodeSqliteStderr(child.stderr)).toBe("")
     expect(child.status).toBe(0)
   })
 }
@@ -450,7 +451,7 @@ it("a holder exits and releases its transaction when its IPC parent disconnects"
     ])
     child.disconnect()
     expect(await exited).toBe(0)
-    expect(stderr).toBe("")
+    expect(unexpectedNodeSqliteStderr(stderr)).toBe("")
     expect(write(() => "admitted")).toBe("admitted")
   } finally {
     clearTimeout(timer)

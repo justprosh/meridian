@@ -1,4 +1,4 @@
-import Database from "libsql"
+import { NativeDatabase as Database } from "../../proxy/session/bookkeeping/nativeDatabase"
 import { initializeSessionBookkeeping } from "../../proxy/session/bookkeeping/connection"
 import { acquireMaintenanceGuard } from "../../proxy/session/bookkeeping/guard"
 
@@ -9,7 +9,7 @@ if (!directory || !["prepare", "get", "identity", "close-failure"].includes(mode
 initializeSessionBookkeeping(directory).close()
 
 const prepare = Database.prototype.prepare
-let captured: Database.Database | undefined
+let captured: Database | undefined
 let closes = 0
 let openError: unknown
 let nativeUsable = false
@@ -18,11 +18,11 @@ let maintenanceError: unknown
 let reopened = false
 let reopenError: unknown
 
-Database.prototype.prepare = function <BindParameters extends unknown[] | {} = unknown[]>(sql: string) {
-  if (sql !== "SELECT migration_id,source_digests_json FROM schema_meta") return (prepare<BindParameters>).call(this, sql)
+Database.prototype.prepare = function (sql: string) {
+  if (sql !== "SELECT migration_id,source_digests_json FROM schema_meta") return prepare.call(this, sql)
   captured = this
   if (mode === "prepare" || mode === "close-failure") throw new Error("owned provenance prepare fault")
-  const statement = (prepare<BindParameters>).call(this, sql)
+  const statement = prepare.call(this, sql)
   statement.get = () => {
     if (mode === "get") throw new Error("owned provenance get fault")
     return { migration_id: "owned-wrong-identity", source_digests_json: "{}" }

@@ -1,6 +1,7 @@
+import { unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { afterAll, beforeAll, expect, it } from "bun:test"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { migrateBookkeeping } from "../proxy/session/bookkeeping/migration"
@@ -13,7 +14,7 @@ import {
   getStoredSessionGeneration, parseLegacySidecar, parseLegacyStoreForMaintenance, STORE_META_KEY,
 } from "../proxy/session/bookkeeping/legacyCodec"
 import { readJournal, requireBarriers } from "../proxy/session/bookkeeping/maintenanceJournal"
-import { buildNodeFixture } from "./fixtures/bookkeeping-support"
+import { buildNodeFixture, withIdleWalReader } from "./fixtures/bookkeeping-support"
 import { readExportJournal } from "../proxy/session/bookkeeping/exportJournal"
 import { legacyInput, expectLegacyInput } from "./fixtures/bookkeeping-export-oracle"
 import {
@@ -59,10 +60,16 @@ for (const cut of ["PREPARED", "linked:session-gc.migrated.json", "moved:session
 }
 
 let buildDirectory: string
+let idleReaderScript: string
 beforeAll(async () => {
   buildDirectory = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-crash-build-")))
   const build = await buildNodeFixture("bookkeeping-transition.ts", "transition.mjs", buildDirectory)
   expect(build.success).toBe(true)
+  const readerDirectory = join(buildDirectory, "idle-reader")
+  mkdirSync(readerDirectory)
+  const reader = await buildNodeFixture("bookkeeping-idle-wal-reader.ts", "reader.mjs", readerDirectory)
+  expect(reader.success).toBe(true)
+  idleReaderScript = join(readerDirectory, "reader.mjs")
 })
 afterAll(() => { rmSync(buildDirectory, { recursive: true, force: true }) })
 function child(action: string, directory: string, point: string): void {
@@ -70,7 +77,7 @@ function child(action: string, directory: string, point: string): void {
     env: { ...process.env, MERIDIAN_BOOKKEEPING_TEST_CRASH: point }, encoding: "utf8", timeout: 15000,
   })
   expect(result.error).toBeUndefined()
-  expect(result.stderr).toBe("")
+  expect(unexpectedNodeSqliteStderr(result.stderr)).toBe("")
   expect(result.status).toBeNull()
   expect(result.signal).toBe("SIGKILL")
 }
@@ -145,23 +152,28 @@ for (const sidecarVersion of [1, 2] as const) for (const storeVersion of [1, 3])
       const original = legacyInput(directory)
       await migrateBookkeeping(directory, { writersStopped: true })
       const expected = richSnapshot(directory)
-      child("export", directory, point.startsWith("barrier:") ? point : `export:${point}`)
-      expect(() => initializeSessionBookkeeping(directory)).toThrow("export in progress or completed")
-      const result = exportBookkeepingJson(directory)
-      expect(result.phase).toBe("EXPORTED")
-      expectLegacyInput(directory, original)
-      expect(result.documents).toEqual(expected.documents)
-      const store = parseLegacyStoreForMaintenance(readFileSync(join(directory, "sessions.json"), "utf8"))
-      expect(JSON.stringify(store.sessions.entry)).toBe(JSON.stringify(entry))
-      expect(store.meta.version).toBe(storeVersion as 1 | 3)
-      expect(store.meta.slots.abcd).toBe(0)
-      const sidecar = parseLegacySidecar(readFileSync(join(directory, "session-gc.json"), "utf8"))
-      expect(sidecar.resources[key]?.generation).toBe(`r:${key}:1`)
-      expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
-      expect(existsSync(join(directory, "sessions.json.lock"))).toBe(false)
-      expect(existsSync(join(directory, "session-gc.json.lock"))).toBe(false)
-      await migrateBookkeeping(directory, { writersStopped: true })
-      expect(richSnapshot(directory)).toEqual(expected)
+      const exercise = async () => {
+        child("export", directory, point.startsWith("barrier:") ? point : `export:${point}`)
+        expect(() => initializeSessionBookkeeping(directory)).toThrow("export in progress or completed")
+        const result = exportBookkeepingJson(directory)
+        expect(result.phase).toBe("EXPORTED")
+        expectLegacyInput(directory, original)
+        expect(result.documents).toEqual(expected.documents)
+        const store = parseLegacyStoreForMaintenance(readFileSync(join(directory, "sessions.json"), "utf8"))
+        expect(JSON.stringify(store.sessions.entry)).toBe(JSON.stringify(entry))
+        expect(store.meta.version).toBe(storeVersion as 1 | 3)
+        expect(store.meta.slots.abcd).toBe(0)
+        const sidecar = parseLegacySidecar(readFileSync(join(directory, "session-gc.json"), "utf8"))
+        expect(sidecar.resources[key]?.generation).toBe(`r:${key}:1`)
+        expect(existsSync(join(directory, "session-bookkeeping.sqlite"))).toBe(false)
+        expect(existsSync(join(directory, "sessions.json.lock"))).toBe(false)
+        expect(existsSync(join(directory, "session-gc.json.lock"))).toBe(false)
+        await migrateBookkeeping(directory, { writersStopped: true })
+        expect(richSnapshot(directory)).toEqual(expected)
+      }
+      if (point.endsWith("-wal") || point.endsWith("-shm")) {
+        await withIdleWalReader(directory, idleReaderScript, exercise)
+      } else await exercise()
     } finally { rmSync(directory, { recursive: true, force: true }) }
   }, 20000)
 }

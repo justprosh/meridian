@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from "bun:test"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { createHash } from "node:crypto"
 import {
   chmodSync,

@@ -1,11 +1,11 @@
-import Database from "libsql"
+import { NativeDatabase } from "./nativeDatabase"
 import { initializeBookkeepingSchema, validateBookkeepingSchema } from "./schema"
 import { checkParameters, getRow } from "./connection"
 import type { BookkeepingTransaction, SqlRow } from "./types"
 
 /** Exercise the exact row codecs, bindings, triggers and constraints without publishing authority. */
 export function validateImportTransaction(importRows: (tx: BookkeepingTransaction) => void): void {
-  const db = new Database(":memory:")
+  const db = new NativeDatabase(":memory:")
   try {
     db.pragma("foreign_keys=ON")
     db.exec("BEGIN IMMEDIATE")

@@ -29,9 +29,9 @@ it.each(["busy", "clear", "external-cancel"] as const)("handshake cancellation r
     if (row?.state === "deleting" && mode !== "clear" && !writerStarted) {
       writerStarted = true
       writer = spawn("node", ["--input-type=module", "-e", `
-        import Database from 'libsql'; import {writeFileSync} from 'node:fs';
+        import { DatabaseSync as Database } from 'node:sqlite'; import {writeFileSync} from 'node:fs';
         const [path,ready,released]=process.argv.slice(1); const db=new Database(path);
-        db.pragma('busy_timeout=0'); db.exec('BEGIN IMMEDIATE'); writeFileSync(ready,'locked');
+        db.exec('PRAGMA busy_timeout=0'); db.exec('BEGIN IMMEDIATE'); writeFileSync(ready,'locked');
         setTimeout(()=>{db.exec('ROLLBACK'); db.close(); writeFileSync(released,'done');},1100);
       `, handle.path, ready, released], { stdio: ["ignore", "pipe", "pipe"] })
       writerExit = once(writer, "exit")

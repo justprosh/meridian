@@ -230,9 +230,9 @@ it("async-admits real production store operations against another Node writer wi
   if (!handle) throw new Error("SQL startup missing")
   handles.push(handle)
   const child = spawn("node", ["--input-type=module", "-e", `
-    import Database from 'libsql';
+    import { DatabaseSync as Database } from 'node:sqlite';
     const db = new Database(process.argv[1]);
-    db.pragma('busy_timeout=0'); db.exec('BEGIN IMMEDIATE');
+    db.exec('PRAGMA busy_timeout=0'); db.exec('BEGIN IMMEDIATE');
     process.stdout.write('locked\\n');
     process.stdin.resume(); process.stdin.once('data', () => { db.exec('ROLLBACK'); db.close(); process.exit(0) });
   `, handle.path], { stdio: ["pipe", "pipe", "pipe"] })

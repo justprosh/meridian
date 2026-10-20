@@ -1,3 +1,4 @@
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 import { expect, it } from "bun:test"
 import { spawnSync } from "node:child_process"
 import { mkdtempSync, realpathSync, rmSync } from "node:fs"
@@ -11,9 +12,9 @@ for (const mode of ["sqlite-slow", "json-slow", "embedded-slow", "embedded-idle"
   it(`joins original request cleanup before releasing backend ownership: ${mode}`, () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "bookkeeping-proxy-close-")))
     try {
-      const child = spawnSync(process.execPath, [resolve("src/__tests__/fixtures/bookkeeping-proxy-close.mjs"),
+      const child = spawnSync(process.execPath, [...bookkeepingBunPreloadArgs(), resolve("src/__tests__/fixtures/bookkeeping-proxy-close.mjs"),
         resolve("."), root, mode], {
-        env: { PATH: process.env.PATH, HOME: root, USERPROFILE: root,
+        env: { BOOKKEEPING_TEST_SQLITE_LIBRARY: process.env.BOOKKEEPING_TEST_SQLITE_LIBRARY, PATH: process.env.PATH, HOME: root, USERPROFILE: root,
           SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
           TMPDIR: root, TMP: root, TEMP: root },
         encoding: "utf8", timeout: process.platform === "win32" ? 65_000 : 15_000,

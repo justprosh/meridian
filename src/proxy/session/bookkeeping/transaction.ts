@@ -331,15 +331,19 @@ function checkpointIdle(connection: Connection, mode: "PASSIVE" | "TRUNCATE"): B
   recover(connection)
   const db = database(connection)
   if (db.inTransaction) throw new Error("checkpoint requires idle bookkeeping connection")
-  let rows: BookkeepingCheckpoint[]
+  let rows: Array<Record<string, unknown>>
   try {
-    rows = db.pragma(`wal_checkpoint(${mode})`) as BookkeepingCheckpoint[]
+    rows = db.pragma(`wal_checkpoint(${mode})`)
   } catch (error) {
     if (busy(error)) throw new BookkeepingBusyError("bookkeeping checkpoint busy", { cause: error })
     throw error
   }
   if (!rows[0]) throw new Error("missing checkpoint result")
-  return rows[0]
+  const { busy: busyResult, log, checkpointed } = rows[0]
+  if (typeof busyResult !== "number" || typeof log !== "number" || typeof checkpointed !== "number") {
+    throw new Error("invalid checkpoint result")
+  }
+  return { busy: busyResult, log, checkpointed }
 }
 function checkpoint(directory: string, mode: "PASSIVE" | "TRUNCATE"): BookkeepingCheckpoint {
   const connection = addressed(directory)

@@ -1,4 +1,4 @@
-import Database from "libsql"
+import { NativeDatabase as Database } from "../../proxy/session/bookkeeping/nativeDatabase"
 import { fork } from "node:child_process"
 import { performance } from "node:perf_hooks"
 import { setTimeout as delay } from "node:timers/promises"

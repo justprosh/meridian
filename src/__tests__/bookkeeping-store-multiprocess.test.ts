@@ -1,3 +1,4 @@
+import { bookkeepingBunPreloadArgs, unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 import { expect, it } from "bun:test"
 import { spawn } from "node:child_process"
 import { once } from "node:events"
@@ -32,7 +33,7 @@ it("allows exactly one real-process winner for identical SQLite dual generations
           priority: { routeKey: "race", profileId: "work", lastHumanTurnDigest: "a".repeat(43),
             lastHumanTurnIssuedAt: 1_900_000_000, expectedAssignmentGeneration: route.generation },
         }
-        const child = spawn(process.execPath, [join(import.meta.dir, "fixtures/bookkeeping-store-racer.ts")], {
+        const child = spawn(process.execPath, [...bookkeepingBunPreloadArgs(), join(import.meta.dir, "fixtures/bookkeeping-store-racer.ts")], {
           env: { ...process.env, RACE_INPUT: JSON.stringify({ directory, publication }) },
           stdio: ["ignore", "ignore", "pipe", "ipc"],
         })
@@ -54,7 +55,7 @@ it("allows exactly one real-process winner for identical SQLite dual generations
           for (const worker of workers) worker.child.send("go")
           const exits = await Promise.all(workers.map((worker) => worker.exited))
           expect(exits).toEqual([[0, null], [0, null]])
-          expect(workers.map((worker) => worker.stderr())).toEqual(["", ""])
+          expect(workers.map((worker) => unexpectedNodeSqliteStderr(worker.stderr()))).toEqual(["", ""])
           for (const worker of workers) expect(worker.messages).toHaveLength(2)
           const results = workers.map((worker) => worker.messages[1] as Result)
           expect(results.filter((result) => result.outcome === "won")).toHaveLength(1)

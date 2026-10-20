@@ -6,6 +6,13 @@ export class BookkeepingMaintenanceRequiredError extends SessionLifecycleError {
 export class BookkeepingFormatError extends SessionLifecycleCorruptError { readonly exitCode = 5 }
 
 export function errorCode(error: unknown): string | undefined {
+  if (error instanceof Error && "code" in error && error.code === "ERR_SQLITE_ERROR"
+    && "errcode" in error && typeof error.errcode === "number") {
+    // node:sqlite reports SQLite's numeric (possibly extended) result code.
+    // Preserve the existing cross-process admission/guard retry boundary.
+    if ((error.errcode & 0xff) === 5) return "SQLITE_BUSY"
+    if ((error.errcode & 0xff) === 6) return "SQLITE_LOCKED"
+  }
   return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined
 }
 

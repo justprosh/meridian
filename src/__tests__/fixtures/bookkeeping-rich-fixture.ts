@@ -11,7 +11,7 @@ import {
 import { initializeSessionBookkeeping, withBookkeepingRead } from "../../proxy/session/bookkeeping/database"
 import { snapshotForExport } from "../../proxy/session/bookkeeping/exportSnapshot"
 import { digestBytes, SOURCE_NAMES } from "../../proxy/session/bookkeeping/maintenanceJournal"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../../proxy/session/bookkeeping/nativeDatabase"
 import { pathToFileURL } from "node:url"
 import { fileIdentity } from "../../proxy/session/bookkeeping/exportJournal"
 import type { ExportJournal } from "../../proxy/session/bookkeeping/exportJournal"

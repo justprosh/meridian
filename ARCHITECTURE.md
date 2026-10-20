@@ -405,6 +405,19 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 
 ### SQLite bookkeeping boundary
 
+`bookkeeping/nativeDatabase.ts` owns all native main/guard opens. It uses
+`node:sqlite` under Node and `bun:sqlite` under Bun, without changing a host's
+global engine selection. Before any persistent native open it qualifies the
+runtime's version/source ID in memory and requires the upstream WAL-reset fix
+(3.51.3+, or the 3.44.6/3.50.7 backports). An unavailable or unpatched engine
+refuses SQLite initialization; it never falls back to libsql or JSON. The
+existing telemetry database continues to use its separate libsql boundary.
+URI read-only/immutable inspection is preserved. CAS uses SQLite's same-connection
+`changes()` count, excluding trigger side effects. Bun statements are finalized
+within each synchronous operation before strict native close; Node's numeric
+busy/locked results enter the existing asynchronous admission path. No SDK,
+filesystem or process probe is added to a row transaction.
+
 Maintenance correctness: published guard identity is permanent, and pending
 historical guard retirement refuses before native opens (explicit original-inode
 recovery only). Same-process inspection never opens auxiliary main/guard aliases

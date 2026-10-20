@@ -115,7 +115,7 @@ it("returns typed overload without sleeping when a real child holds BEGIN IMMEDI
   handles.push(handle)
   expect(Object.values(handle.reader.get("PRAGMA busy_timeout")!)).toEqual([0])
   const child = spawn("node", ["--input-type=module", "-e", `
-    import Database from 'libsql';
+    import { DatabaseSync as Database } from 'node:sqlite';
     const db = new Database(${JSON.stringify(handle.path)});
     db.exec('BEGIN IMMEDIATE');
     process.send('locked');

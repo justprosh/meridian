@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, spyOn } from "bun:test"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { spawnSync } from "node:child_process"
 import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"

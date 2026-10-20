@@ -1,12 +1,12 @@
-import Database from "libsql"
+import { NativeDatabase } from "./nativeDatabase"
 import { SessionLifecycleCorruptError } from "../lifecycleErrors"
 
 export const BOOKKEEPING_APPLICATION_ID = 0x4d53424b
 export const BOOKKEEPING_SCHEMA_VERSION = 1
 export const RESOURCE_STATES = ["prepared", "live", "retired", "deleting", "deleted"] as const
 
-/** libsql 0.5 get()/pluck() differs from better-sqlite3; use the row-array API. */
-export function pragmaValue(db: Database.Database, name: string): unknown {
+/** Read scalar pragmas through the shared row-array interface. */
+export function pragmaValue(db: NativeDatabase, name: string): unknown {
   const rows = db.pragma(name) as Array<Record<string, unknown>>
   return rows[0] && Object.values(rows[0])[0]
 }
@@ -137,7 +137,7 @@ for (const event of ["INSERT", "UPDATE", "DELETE"]) {
 }
 
 const schemaSql = statements.join(";\n") + ";"
-const schemaRows = (db: Database.Database) =>
+const schemaRows = (db: NativeDatabase) =>
   db
     .prepare(
       "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
@@ -146,9 +146,9 @@ const schemaRows = (db: Database.Database) =>
 let expectedSchema: string | undefined
 
 /** Validate the authored DDL, not just a version label on an arbitrary database. */
-export function validateBookkeepingSchema(db: Database.Database, phase = "READY", full = true): void {
+export function validateBookkeepingSchema(db: NativeDatabase, phase = "READY", full = true): void {
   if (expectedSchema === undefined) {
-    const reference = new Database(":memory:")
+    const reference = new NativeDatabase(":memory:")
     try {
       reference.exec(schemaSql)
       expectedSchema = JSON.stringify(schemaRows(reference))
@@ -177,7 +177,7 @@ export function validateBookkeepingSchema(db: Database.Database, phase = "READY"
   validateBookkeepingCounts(db)
 }
 
-export function validateBookkeepingCounts(db: Database.Database): void {
+export function validateBookkeepingCounts(db: NativeDatabase): void {
   const expected = [
     ...RESOURCE_STATES.map((state) => ({
       kind: `resources:${state}`,
@@ -194,7 +194,7 @@ export function validateBookkeepingCounts(db: Database.Database): void {
     throw new SessionLifecycleCorruptError("bookkeeping counters disagree with rows")
 }
 
-export function initializeBookkeepingSchema(db: Database.Database, allowCreate = false): void {
+export function initializeBookkeepingSchema(db: NativeDatabase, allowCreate = false): void {
   const empty = (db.prepare("SELECT count(*) AS n FROM sqlite_master").get() as { n: number }).n === 0
   if (
     empty &&
