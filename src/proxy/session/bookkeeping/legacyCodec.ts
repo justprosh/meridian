@@ -34,7 +34,11 @@ export function serializeLegacySidecar(sidecar: SessionGcSidecar): string {
 
 /** Exact legacy wire shape: metadata first, compact JSON, no trailing newline. */
 export function serializeLegacyStore(document: SessionStoreDocument): string {
-  return JSON.stringify({ [STORE_META_KEY]: document.meta, ...document.sessions })
+  // An object literal moves integer mapping keys ahead of metadata. Match the
+  // JSON writer's explicit field order without reordering entry payloads.
+  const fields = [`${JSON.stringify(STORE_META_KEY)}:${JSON.stringify(document.meta)}`]
+  for (const [key, entry] of Object.entries(document.sessions)) fields.push(`${JSON.stringify(key)}:${JSON.stringify(entry)}`)
+  return `{${fields.join(",")}}`
 }
 
 /** Maintenance refuses map keys that the historical plain-object decoder cannot faithfully represent. */

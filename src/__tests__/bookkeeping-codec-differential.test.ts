@@ -18,7 +18,12 @@ interface ContractCase extends CodecCase { error?: string }
 // Expected wire bytes follow the format contract, not the codec/exporter under test.
 function expectedBytes(row: CodecCase): string {
   const input = JSON.parse(row.raw)
-  if (row.kind === "store") return JSON.stringify({ [STORE_META_KEY]: { version: 1, slots: {} }, ...input })
+  if (row.kind === "store") {
+    const metadata = input[STORE_META_KEY] ?? { version: 1, slots: {} }
+    const records = Object.entries(input).filter(([key]) => key !== STORE_META_KEY)
+      .map(([key, value]) => `${JSON.stringify(key)}:${JSON.stringify(value)}`)
+    return `{${[`${JSON.stringify(STORE_META_KEY)}:${JSON.stringify(metadata)}`, ...records].join(",")}}`
+  }
   if (input.version === 2) return JSON.stringify(input) + "\n"
   const slots: Record<string, number> = {}
   const resources: Record<string, unknown> = {}
@@ -56,6 +61,8 @@ it("preserves the portable legacy codec corpus, wire bytes and malformed-record 
     cases.push({ kind: "store", raw: readFileSync(join(data, "sessions.json"), "utf8") })
     add("store", { [STORE_META_KEY]: { version: 1, slots: { abcd: 0, dcba: 7 } }, entry })
     add("store", { entry: Object.fromEntries(Object.entries(entry).reverse()) })
+    add("store", { "7": entry })
+    add("store", { [STORE_META_KEY]: { version: 3, slots: {}, priorityAssignments: {}, priorityAttempts: {}, priorityRollbackMappings: {} }, "0": entry, "4294967295": entry })
     add("sidecar", Object.fromEntries(Object.entries(sidecar).reverse()))
     for (const kind of ["sidecar", "store"] as const) {
       for (const raw of ["", "{", "null", "[]", "true", "1", '"text"', "{}"]) {
@@ -115,8 +122,8 @@ it("preserves the portable legacy codec corpus, wire bytes and malformed-record 
     const outcomes: Array<{ bytes?: string; error?: string }> =
       JSON.parse(result.stdout)
     expect(outcomes).toHaveLength(cases.length)
-    expect(cases).toHaveLength(70)
-    expect(outcomes.filter((row) => row.bytes !== undefined)).toHaveLength(17)
+    expect(cases).toHaveLength(72)
+    expect(outcomes.filter((row) => row.bytes !== undefined)).toHaveLength(19)
     expect(outcomes.filter((row) => row.error !== undefined)).toHaveLength(53)
     writeBenchArtifact("codec-differential-corpus.json", cases.map((row, index) => ({
       ...row, ...outcomes[index],
