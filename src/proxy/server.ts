@@ -9286,15 +9286,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // still reasoning has no response to judge by yet.
       const inflightEntry = inflight.begin("chatgpt")
       inflightEntry.setStream(requested.stream)
-      // Registered in the session tree like a Claude turn, so
-      // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
-      const session = await chatGptSessionKey(c)
-      const treeEntry = session ? processSessionTree.register({
-        requestId: `chatgpt-${randomUUID()}`,
-        sessionKey: session.key,
-        parentKey: session.parent,
-        abort: (reason) => controller.abort(reason),
-      }) : undefined
+      let treeEntry: SessionTreeRegistration | undefined
       const complete = () => {
         c.req.raw.signal.removeEventListener("abort", abort)
         upstreamSignals.delete(c)
@@ -9303,7 +9295,18 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         inflightEntry.end()
         uncount()
       }
+      // Everything after the registration above runs under this try, so a
+      // failure before the backend answers still releases what it registered.
       try {
+        // Registered in the session tree like a Claude turn, so
+        // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
+        const session = await chatGptSessionKey(c)
+        treeEntry = session ? processSessionTree.register({
+          requestId: `chatgpt-${randomUUID()}`,
+          sessionKey: session.key,
+          parentKey: session.parent,
+          abort: (reason) => controller.abort(reason),
+        }) : undefined
         const response = await backend.handle({ context: c, endpoint, route })
         return completeUpstreamResponse(response, controller.signal, complete)
       } catch (error) {
