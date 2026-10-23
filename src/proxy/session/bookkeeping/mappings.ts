@@ -40,6 +40,9 @@ function validateEntry(entry: StoredSession): void {
   }
   if (entry.clientLineageHash !== undefined && typeof entry.clientLineageHash !== "string")
     throw new TypeError("invalid clientLineageHash")
+  if (entry.resumeContextHash !== undefined && (
+    typeof entry.resumeContextHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.resumeContextHash)
+  )) throw new TypeError("invalid mapping resumeContextHash")
   for (const field of ["messageHashes", "passthroughToolCallIds"] as const) {
     if (
       entry[field] !== undefined &&
@@ -111,6 +114,7 @@ export function writeMappingRow(
     ? entry
     : {
         clientLineageHash: entry.clientLineageHash,
+        resumeContextHash: entry.resumeContextHash,
         messageHashes: entry.messageHashes,
         messageBlockHashes: entry.messageBlockHashes,
         sdkMessageUuids: entry.sdkMessageUuids,
@@ -174,7 +178,7 @@ export function readMapping(reader: BookkeepingReader, key: string): StoredSessi
   const payload = JSON.parse(String(history.history_json)) as Record<string, unknown>
   if (
     Object.keys(payload).some(
-      (key) => !["clientLineageHash", "messageHashes", "messageBlockHashes", "sdkMessageUuids",
+      (key) => !["clientLineageHash", "resumeContextHash", "messageHashes", "messageBlockHashes", "sdkMessageUuids",
         "passthroughResumeUuid"].includes(key),
     )
   )

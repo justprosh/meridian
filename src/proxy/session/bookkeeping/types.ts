@@ -51,6 +51,8 @@ export interface StoredSession {
   lineageHash?: string
   /** Raw client proof when lineageHash cannot certify the SDK execution prefix. */
   clientLineageHash?: string
+  /** Forward-compatible context witness (graph @aleksei/meridian-hub #290). */
+  resumeContextHash?: string
   /** Per-message content hashes for precise diff-based compaction detection. */
   messageHashes?: string[]
   /** Per-message hashes of individual content blocks for append-only tool results. */
