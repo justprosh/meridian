@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - maintenance/1.82
   push:
     branches:
       - main
