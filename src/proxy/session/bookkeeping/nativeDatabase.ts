@@ -91,6 +91,12 @@ class NativeStatement {
     }
   }
 
+  /** Compile retained SQL eagerly without retaining a native handle or executing it. */
+  validate(): this {
+    this.use(() => undefined)
+    return this
+  }
+
   private bind<T>(parameters: Parameters, positional: (values: SqlValue[]) => T, named: (values: NamedParameters) => T): T {
     const first = parameters[0]
     if (first !== null && typeof first === "object") {
