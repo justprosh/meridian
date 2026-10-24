@@ -63,6 +63,24 @@ jobs:
       - run: nix build --print-build-logs --no-update-lock-file .#meridian
       - run: nix build --print-build-logs --no-update-lock-file --no-link --rebuild .#meridian.node_modules
       - run: ./result/bin/meridian --version
+      - name: Qualify installed native SQLite engines in memory
+        run: |
+          set -euo pipefail
+          export QUALIFIED_PACKAGE_ROOT="$(realpath result)/lib/meridian"
+          export PROBE_SCRATCH_HOME="$(mktemp -d)"
+          trap 'rm -rf "$PROBE_SCRATCH_HOME"' EXIT
+          mkdir -p "$RUNNER_TEMP/native-engine"
+          NODE_OPTIONS="--import=$(pwd)/scripts/fixtures/native-memory-engine.mjs" \
+            ./result/bin/meridian-bookkeeping > "$RUNNER_TEMP/native-engine/report.json"
+          cat "$RUNNER_TEMP/native-engine/report.json"
+      - name: Upload installed native engine evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-engine-${{ runner.os }}
+          retention-days: 30
+          if-no-files-found: error
+          path: ${{ runner.temp }}/native-engine/report.json
       - name: Installed macOS SDK and native HTTP compatibility
         if: runner.os == 'macOS'
         env:
