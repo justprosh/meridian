@@ -19,12 +19,13 @@ import { describe, it, expect } from "bun:test"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 
 /** Load the telemetry module in a child process and capture its stderr. */
 async function bannerWith(envOverrides: Record<string, string>): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), "mquiet-"))
   const proc = Bun.spawn(
-    ["bun", "-e", 'await import("./src/telemetry/index.ts")'],
+    [process.execPath, ...bookkeepingBunPreloadArgs(), "-e", 'await import("./src/telemetry/index.ts")'],
     {
       cwd: process.cwd(),
       env: {
