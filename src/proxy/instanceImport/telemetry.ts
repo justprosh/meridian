@@ -18,10 +18,16 @@
 
 import { existsSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import Database from "libsql"
+import { NativeDatabase as Database, bookkeepingEngineInfo } from "../session/bookkeeping/nativeDatabase"
+import type { SqlValue } from "../session/bookkeeping/types"
 import { createSqliteStores } from "../../telemetry/sqlite"
 
 type Row = Record<string, unknown>
+
+function sqlValue(value: unknown): SqlValue {
+  if (value === null || typeof value === "string" || typeof value === "number") return value
+  throw new TypeError("telemetry row contains an unsupported SQLite value")
+}
 
 /** The source's telemetry, read once. */
 export interface TelemetrySnapshot {
@@ -42,7 +48,7 @@ export function rowsByProfile(snapshot: TelemetrySnapshot): Map<string, number> 
   return counts
 }
 
-function columnsOf(db: Database.Database, table: string): string[] {
+function columnsOf(db: Database, table: string): string[] {
   return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name)
 }
 
@@ -87,7 +93,7 @@ export interface TelemetryPresence {
   missingColumns: string[]
 }
 
-function presenceIn(db: Database.Database, snapshot: TelemetrySnapshot): TelemetryPresence {
+function presenceIn(db: Database, snapshot: TelemetrySnapshot): TelemetryPresence {
   const wanted = new Set(snapshot.rows.map(row => String(row.request_id)))
   const requests = new Set<string>()
   const span = timeSpan(snapshot.rows)
@@ -145,6 +151,7 @@ export async function copyTelemetry(options: TelemetryCopyOptions): Promise<{ re
   if (snapshot.rows.length === 0 && snapshot.logs.length === 0) return { requests: 0, logs: 0 }
   // Opened once through the server's own store, which creates the tables and
   // adds the columns this build knows, exactly as the destination would.
+  bookkeepingEngineInfo()
   mkdirSync(dirname(destinationPath), { recursive: true, mode: 0o700 })
   createSqliteStores(destinationPath, 3650).close()
   const db = new Database(destinationPath)
@@ -163,7 +170,7 @@ export async function copyTelemetry(options: TelemetryCopyOptions): Promise<{ re
       for (let start = 0; start < rows.length; start += batchSize) {
         db.exec("BEGIN IMMEDIATE")
         try {
-          for (const row of rows.slice(start, start + batchSize)) insert.run(...values(row))
+          for (const row of rows.slice(start, start + batchSize)) insert.run(...values(row).map(sqlValue))
           db.exec("COMMIT")
         } catch (error) {
           db.exec("ROLLBACK")
