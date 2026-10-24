@@ -163,12 +163,12 @@ class SqliteTelemetryStore implements ITelemetryStore {
         @routeKind, @routeGroupId, @routeAttempt, @routeRefusedBucket,
         @reasoningOutputTokens, @fallbackFromModel
       )
-    `)
+    `).validate()
 
-    this.countStmt = db.prepare("SELECT COUNT(*) as cnt FROM metrics")
+    this.countStmt = db.prepare("SELECT COUNT(*) as cnt FROM metrics").validate()
     // Served by idx_metrics_ts, so this stays a b-tree seek rather than the
     // table scan a MIN() over an unindexed column would be.
-    this.oldestStmt = db.prepare("SELECT MIN(timestamp) as oldest FROM metrics")
+    this.oldestStmt = db.prepare("SELECT MIN(timestamp) as oldest FROM metrics").validate()
   }
 
   record(metric: RequestMetric): void {
@@ -333,7 +333,7 @@ class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
     this.insertStmt = db.prepare(`
       INSERT INTO diagnostic_logs (timestamp, level, category, request_id, message)
       VALUES (@timestamp, @level, @category, @requestId, @message)
-    `)
+    `).validate()
   }
 
   log(entry: Omit<DiagnosticLog, "timestamp">): void {
@@ -459,9 +459,14 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
 
 export function createSqliteStores(dbPath: string, retentionDays: number) {
   const db = openDatabase(dbPath)
-  return {
-    telemetry: new SqliteTelemetryStore(db, retentionDays, dbPath) as ITelemetryStore,
-    diagnostics: new SqliteDiagnosticLogStore(db) as IDiagnosticLogStore,
-    close: () => { try { db.close() } catch { /* ignore */ } },
+  try {
+    return {
+      telemetry: new SqliteTelemetryStore(db, retentionDays, dbPath) as ITelemetryStore,
+      diagnostics: new SqliteDiagnosticLogStore(db) as IDiagnosticLogStore,
+      close: () => { try { db.close() } catch { /* ignore */ } },
+    }
+  } catch (error) {
+    db.close()
+    throw error
   }
 }
