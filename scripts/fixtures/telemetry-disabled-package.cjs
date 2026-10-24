@@ -83,8 +83,6 @@ async function main() {
         catch(error){if(error.code==='ENOENT')return false;throw error}
       }).length;
     }
-    const positive=await start('1'); const positiveFds=matchingFds(positive);
-    assert(positiveFds>0,'positive persistence control owns no telemetry inode FD');
     assert(fs.statSync(dbPath+'-wal').size>32);
     const before=fingerprint();
     const disabled=await start('0'); assert.equal(matchingFds(disabled),0);
@@ -97,11 +95,26 @@ async function main() {
       else assert.match(result.stderr,/no Meridian instance is listening/);
       assert.deepEqual(fingerprint(),before);cli.push({command,exit:result.status,dbWalPreserved:true});
     }
+    disabled.send('close');
+    const joinTimer=setTimeout(()=>disabled.kill('SIGKILL'),5000);
+    const disabledExit=await disabled.closed;clearTimeout(joinTimer);
+    assert.equal(disabledExit.code,0,JSON.stringify(disabledExit));assert.equal(disabledExit.signal,null);
+    assert.deepEqual(fingerprint(),before,'disabled runtime changed the pristine seed through shutdown');
     assert.deepEqual(fs.readdirSync(home),[]);assert.deepEqual(fs.readdirSync(config),['settings.json']);
-    const {DatabaseSync}=require('node:sqlite');const memory=new DatabaseSync(':memory:');
+    assert.equal(fs.readFileSync(path.join(config,'settings.json'),'utf8'),JSON.stringify({telemetryPersist:true}));
+    // Only now allow initialization of telemetry's schema on the same seed.
+    // An accidental transient persistence open in env0 would have left DDL in
+    // the DB/WAL above, even if it closed before the FD observation.
+    const positive=await start('1');const positiveFds=matchingFds(positive);
+    assert(positiveFds>0,'positive persistence control owns no telemetry inode FD');
+    assert.notDeepEqual(fingerprint(),before,'positive control left no persistence footprint');
+    const {DatabaseSync}=require('node:sqlite');
+    const reader=new DatabaseSync(dbPath,{readOnly:true});
+    try{assert.equal(reader.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE type='table' AND name IN ('metrics','diagnostic_logs')").get().n,2)}finally{reader.close()}
+    const memory=new DatabaseSync(':memory:');
     const engine=memory.prepare('SELECT sqlite_version() AS version,sqlite_source_id() AS sourceId').get();memory.close();
-    console.log(JSON.stringify({package:pkg.version,sha256,node:process.version,engine,settingsPersist:true,
-      positive:{persist:'1',kind:'sqlite',matchingFds:positiveFds},disabled:{persist:'0',kind:'memory',matchingFds:0,dbWalPreserved:true},cli,before,
+    console.log(JSON.stringify({package:pkg.version,sha256,fixtureSha256:crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'),node:process.version,engine,settingsPersist:true,
+      positive:{persist:'1',kind:'sqlite',matchingFds:positiveFds,schemaCreated:true},disabled:{persist:'0',kind:'memory',matchingFds:0,dbWalPreserved:true},cli,before,
       boundary:'createProxyServer + GET /telemetry/retention; no SDK/model calls',excluded:['instance-import','telemetry maintenance writers'],
       ceiling:'FD observation after initialization; CLI byte invariance does not claim zero transient reads'},null,2));
   } finally {
