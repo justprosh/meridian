@@ -43,6 +43,20 @@ it("returns primary mutation counts for CAS despite triggers and reuses statemen
   db.close()
 })
 
+it("binds telemetry names and bookkeeping positions without losing nulls or primary counts", () => {
+  const db = new NativeDatabase(":memory:")
+  try {
+    db.exec("CREATE TABLE entries(id INTEGER PRIMARY KEY, value TEXT)")
+    const insert = db.prepare("INSERT INTO entries VALUES(@id, @value)")
+    expect(insert.run({ id: 1, value: null }).changes).toBe(1)
+    expect(insert.run({ "@id": 2, "@value": "named" }).changes).toBe(1)
+    expect(db.prepare("SELECT value FROM entries WHERE id=@id").get({ id: 1 })).toEqual({ value: null })
+    expect(db.prepare("SELECT value FROM entries WHERE id>@id").all({ id: 1 })).toEqual([{ value: "named" }])
+    expect(db.prepare("UPDATE entries SET value=? WHERE id=?").run("positional", 1).changes).toBe(1)
+    expect(db.prepare("SELECT value FROM entries WHERE id=?").get(1)).toEqual({ value: "positional" })
+  } finally { db.close() }
+})
+
 it("keeps immutable inspection read-only without creating WAL/SHM or waiting for statement GC", () => {
   const dir = mkdtempSync(join(tmpdir(), "bookkeeping-native-engine-"))
   directories.push(dir)

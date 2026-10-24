@@ -1,8 +1,10 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, statSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
+import { bookkeepingBunPreloadArgs } from "./fixtures/bookkeeping-support"
 import { createSqliteStores } from "../telemetry/sqlite"
 import { collapseRouteChains, summarizeRoutes } from "../telemetry/routeChain"
 import type { ITelemetryStore, IDiagnosticLogStore, RequestMetric } from "../telemetry/types"
@@ -367,8 +369,8 @@ describe("SqliteTelemetryStore beside another writer", () => {
     const stores = createSqliteStores(dbPath, 7)
     // A second process takes the database's write lock, says so, holds it
     // for 150ms and commits - what an import or an operator's sqlite3 does.
-    const holder = Bun.spawn([process.execPath, "-e", `
-      const Database = require(${JSON.stringify(Bun.resolveSync("libsql", import.meta.dir))})
+    const holder = Bun.spawn([process.execPath, ...bookkeepingBunPreloadArgs(), "-e", `
+      const { NativeDatabase: Database } = require(${JSON.stringify(Bun.resolveSync("../proxy/session/bookkeeping/nativeDatabase.ts", import.meta.dir))})
       const db = new Database(process.env.HOLD_DB)
       db.exec("BEGIN IMMEDIATE")
       db.prepare("INSERT INTO diagnostic_logs (timestamp, level, category, message) VALUES (1, 'info', 'test', 'held')").run()
@@ -478,8 +480,12 @@ describe("SqliteTelemetryStore — memory-store parity for newer fields", () => 
     // create today's schema, so every ALTER TABLE could be deleted and the
     // test would still pass — it has to start from a table that really is
     // missing the columns.
-    const legacy = new Database(dbPath)
-    legacy.exec(`
+    const legacy = spawnSync("node", ["-e", `
+      const Database = require("libsql")
+      const db = new Database(process.argv[1])
+      db.pragma("journal_mode=WAL")
+      db.pragma("wal_autocheckpoint=0")
+      db.exec(${JSON.stringify(`
       CREATE TABLE metrics (
         id                   INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id           TEXT    NOT NULL,
@@ -513,24 +519,21 @@ describe("SqliteTelemetryStore — memory-store parity for newer fields", () => 
         cache_creation_input_tokens INTEGER,
         cache_hit_rate       REAL
       );
-    `)
-    const legacyColumns = (legacy.prepare("PRAGMA table_info(metrics)").all() as Array<{ name: string }>)
-      .map(c => c.name)
-    expect(legacyColumns).not.toContain("session_queue_wait_ms")
-    expect(legacyColumns).not.toContain("sdk_queue_wait_ms")
-    expect(legacyColumns).not.toContain("profile_id")
-    expect(legacyColumns).not.toContain("route_kind")
-    expect(legacyColumns).not.toContain("route_refused_bucket")
-    expect(legacyColumns).not.toContain("resolved_model")
-
-    legacy.exec(`
-      INSERT INTO metrics (
-        request_id, timestamp, model, mode, is_resume, is_passthrough, status,
-        queue_wait_ms, proxy_overhead_ms, ttfb_ms, upstream_duration_ms,
-        total_duration_ms, content_blocks, text_events
-      ) VALUES ('req-old', ${Date.now()}, 'sonnet', 'stream', 0, 0, 200, 5, 12, 120, 800, 850, 3, 10);
-    `)
-    legacy.close()
+    `)})
+      db.exec("INSERT INTO metrics (request_id,timestamp,model,mode,is_resume,is_passthrough,status,queue_wait_ms,proxy_overhead_ms,ttfb_ms,upstream_duration_ms,total_duration_ms,content_blocks,text_events) VALUES ('req-old'," + Date.now() + ",'sonnet','stream',0,0,200,5,12,120,800,850,3,10)")
+      console.log(JSON.stringify({ engine: db.prepare("SELECT sqlite_version() AS version, sqlite_source_id() AS sourceId").get(), columns: db.prepare("PRAGMA table_info(metrics)").all().map(c => c.name) }))
+      // Leave the committed WAL for the new driver to recover, not a clean
+      // close that checkpoints away the compatibility surface.
+      process.exit(0)
+    `, dbPath], { encoding: "utf8", timeout: 10000 })
+    expect(legacy.status, legacy.stderr).toBe(0)
+    const report = JSON.parse(legacy.stdout)
+    expect(report.engine.version).toBe("3.45.1")
+    expect(report.engine.sourceId.length).toBeGreaterThan(64)
+    expect(statSync(`${dbPath}-wal`).size).toBeGreaterThan(32)
+    for (const column of ["session_queue_wait_ms", "sdk_queue_wait_ms", "profile_id", "route_kind", "route_refused_bucket", "resolved_model"]) {
+      expect(report.columns).not.toContain(column)
+    }
 
     // Opening through the real entrypoint must run the ALTERs in place.
     const migrated = createSqliteStores(dbPath, 7)
