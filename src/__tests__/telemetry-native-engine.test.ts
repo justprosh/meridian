@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { buildNodeFixture, unexpectedNodeSqliteStderr } from "./fixtures/bookkeeping-support"
 
 it("uses qualified Node SQLite for telemetry and refuses unsafe engines before persistent open", async () => {
-  for (const mode of ["unsafe", "unsafe-import", "unsafe-fallback", "setup-failure", "native"]) {
+  for (const mode of ["unsafe", "unsafe-import", "unsafe-fallback", "setup-failure", "prepare-failure", "native"]) {
     const directory = mkdtempSync(join(tmpdir(), "telemetry-native-"))
     try {
       const build = await buildNodeFixture("telemetry-native-runtime.ts", "actor.mjs", directory)
@@ -18,7 +18,7 @@ it("uses qualified Node SQLite for telemetry and refuses unsafe engines before p
       else expect(stderr).toBe("")
       const report = JSON.parse(actor.stdout)
       if (mode.startsWith("unsafe")) expect(report).toEqual({ refused: true, files: [] })
-      else if (mode === "setup-failure") expect(report.closed).toBe(true)
+      else if (mode.endsWith("failure")) expect(report.closed).toBe(true)
       else {
         expect(report.namedBinding).toBe(true)
         expect(report.readonly).toBe(true)

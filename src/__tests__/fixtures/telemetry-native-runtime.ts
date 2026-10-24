@@ -49,6 +49,25 @@ if (mode === "unsafe" || mode === "unsafe-import" || mode === "unsafe-fallback")
   try { createSqliteStores(path, 7).close() } catch (failure) { error = String(failure) }
   if (!error.includes("WAL-reset fix") || existsSync(path)) throw new Error(`unsafe engine accepted: ${error}`)
   console.log(JSON.stringify({ refused: true, files: readdirSync(directory).filter(name => name.includes("sqlite")) }))
+} else if (mode === "prepare-failure") {
+  createSqliteStores(path, 7).close()
+  const sqlite = require("node:sqlite") as typeof import("node:sqlite")
+  const Original = sqlite.DatabaseSync
+  const legacy = new Original(path)
+  legacy.exec("ALTER TABLE metrics DROP COLUMN sdk_queue_wait_ms")
+  legacy.close()
+  let closed = false
+  sqlite.DatabaseSync = class extends Original {
+    override exec(sql: string) {
+      if (sql.startsWith("ALTER TABLE")) throw new Error("injected ALTER lock refusal")
+      super.exec(sql)
+    }
+    override close() { super.close(); closed = true }
+  }
+  let rejected = false
+  try { createSqliteStores(path, 7) } catch (error) { rejected = String(error).includes("sdk_queue_wait_ms") }
+  if (!rejected || !closed) throw new Error("legacy schema was accepted without compiling retained statements or closing its owner")
+  console.log(JSON.stringify({ closed: true }))
 } else if (mode === "setup-failure") {
   const sqlite = require("node:sqlite") as typeof import("node:sqlite")
   const Original = sqlite.DatabaseSync
