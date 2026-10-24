@@ -19,7 +19,7 @@
 import { randomUUID } from "node:crypto"
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, dirname, join, resolve } from "node:path"
-import Database from "libsql"
+import { NativeDatabase as Database, bookkeepingEngineInfo } from "../session/bookkeeping/nativeDatabase"
 import { ChatGptStoreCorruptError, createChatGptCredentialStore } from "../chatgpt/credentials"
 import { acquireWriterLease, WriterLeaseUnavailableError, type WriterLease } from "../chatgpt/lease"
 import { chatGptLockPath } from "../chatgpt/paths"
@@ -346,6 +346,8 @@ async function run(options: InstanceImportOptions): Promise<InstanceImportResult
     return { exitCode: planned.conflicts.length > 0 ? 1 : 0, plan: planned }
   }
 
+  try { bookkeepingEngineInfo() }
+  catch (error) { throw new InstanceImportError(String(error)) }
   const sourceLease = await takeLease(from.storePath, "The source's")
   try {
     const destinationLease = await takeLease(to.storePath, "The destination's")
