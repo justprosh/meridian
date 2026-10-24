@@ -1,4 +1,6 @@
-import Database from "libsql"
+// Shared qualified runtime engine: graph @aleksei/meridian-hub #304/#305.
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
+import type { SqlValue } from "../proxy/session/bookkeeping/types"
 import { statSync } from "node:fs"
 import type { RequestMetric, TelemetrySummary, ITelemetryStore, IDiagnosticLogStore, DiagnosticLog, TelemetryRetention } from "./types"
 import { CACHE_KEEPALIVE_REQUEST_SOURCE, computeSummary } from "./percentiles"
@@ -92,8 +94,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_cat ON diagnostic_logs(category);
 const CLEANUP_INTERVAL = 1000
 
 /**
- * How long a write waits for another connection's write lock. libsql's own
- * default is zero, so a row recorded while anything else writes the file - a
+ * How long a write waits for another connection's write lock. The old libsql
+ * default was zero, so a row recorded while anything else writes the file - a
  * second process importing history, an operator's sqlite3 - fails at once and
  * is dropped, and a migration below fails as if its column already existed.
  * The driver is synchronous, so the wait blocks the event loop: long enough
@@ -103,31 +105,36 @@ const CLEANUP_INTERVAL = 1000
  */
 const BUSY_TIMEOUT_MS = 1000
 
-function openDatabase(dbPath: string): Database.Database {
+function openDatabase(dbPath: string): Database {
   const db = new Database(dbPath)
-  db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`)
-  db.pragma("journal_mode = WAL")
-  db.pragma("synchronous = NORMAL")
-  db.exec(METRICS_SCHEMA)
-  db.exec(LOGS_SCHEMA)
-  // Additive schema migrations for existing DBs. Swallow "duplicate column"
-  // errors so this is safe to rerun on every boot.
-  for (const sql of METRICS_MIGRATIONS) {
-    try { db.exec(sql) } catch { /* column already exists */ }
+  try {
+    db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`)
+    db.pragma("journal_mode = WAL")
+    db.pragma("synchronous = NORMAL")
+    db.exec(METRICS_SCHEMA)
+    db.exec(LOGS_SCHEMA)
+    // Additive schema migrations for existing DBs. Swallow "duplicate column"
+    // errors so this is safe to rerun on every boot.
+    for (const sql of METRICS_MIGRATIONS) {
+      try { db.exec(sql) } catch { /* column already exists */ }
+    }
+    return db
+  } catch (error) {
+    db.close()
+    throw error
   }
-  return db
 }
 
 class SqliteTelemetryStore implements ITelemetryStore {
-  private db: Database.Database
+  private db: Database
   private retentionMs: number
   private retentionDays: number
   private insertCount = 0
-  private insertStmt: Database.Statement
-  private countStmt: Database.Statement
-  private oldestStmt: Database.Statement
+  private insertStmt: ReturnType<Database["prepare"]>
+  private countStmt: ReturnType<Database["prepare"]>
+  private oldestStmt: ReturnType<Database["prepare"]>
 
-  constructor(db: Database.Database, retentionDays: number, private readonly dbPath: string) {
+  constructor(db: Database, retentionDays: number, private readonly dbPath: string) {
     this.db = db
     this.retentionDays = retentionDays
     this.retentionMs = retentionDays * 24 * 60 * 60 * 1000
@@ -260,7 +267,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
   getRecent(options: { limit?: number; since?: number; until?: number; model?: string } = {}): RequestMetric[] {
     const { limit = 50, since, until, model } = options
     const conditions: string[] = []
-    const params: Record<string, unknown> = { limit }
+    const params: Record<string, SqlValue> = { limit }
 
     if (since !== undefined) {
       conditions.push("timestamp >= @since")
@@ -324,10 +331,10 @@ class SqliteTelemetryStore implements ITelemetryStore {
 }
 
 class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
-  private db: Database.Database
-  private insertStmt: Database.Statement
+  private db: Database
+  private insertStmt: ReturnType<Database["prepare"]>
 
-  constructor(db: Database.Database) {
+  constructor(db: Database) {
     this.db = db
     this.insertStmt = db.prepare(`
       INSERT INTO diagnostic_logs (timestamp, level, category, request_id, message)
@@ -364,7 +371,7 @@ class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
   getRecent(options: { limit?: number; since?: number; category?: string } = {}): DiagnosticLog[] {
     const { limit = 100, since, category } = options
     const conditions: string[] = []
-    const params: Record<string, unknown> = { limit }
+    const params: Record<string, SqlValue> = { limit }
 
     if (since !== undefined) {
       conditions.push("timestamp >= @since")

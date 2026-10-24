@@ -8,6 +8,8 @@ const nativeRequire = createRequire(import.meta.url)
 type EngineInfo = Readonly<{ version: string; sourceId: string }>
 type Statement = StatementSync | BunStatement
 type OpenOptions = { readonly?: boolean }
+type NamedParameters = Record<string, SqlValue>
+type Parameters = SqlValue[] | [NamedParameters]
 let qualifiedEngine: EngineInfo | undefined
 
 /** Versions containing the upstream WAL-reset fix, including its two backports. */
@@ -89,17 +91,39 @@ class NativeStatement {
     }
   }
 
-  get(...parameters: SqlValue[]): Record<string, unknown> | undefined {
-    const row = this.use(statement => statement.get(...parameters))
+  private bind<T>(parameters: Parameters, positional: (values: SqlValue[]) => T, named: (values: NamedParameters) => T): T {
+    const first = parameters[0]
+    if (first !== null && typeof first === "object") {
+      // Telemetry uses bare @parameter names. Explicit prefixes agree across
+      // Node and Bun without changing either driver's global binding options.
+      const values = Object.fromEntries(Object.entries(first).map(([key, value]) => [
+        /^[@:$]/.test(key) ? key : `@${key}`, value,
+      ]))
+      return named(values)
+    }
+    return positional(parameters as SqlValue[])
+  }
+
+  get(...parameters: SqlValue[]): Record<string, unknown> | undefined
+  get(parameters: NamedParameters): Record<string, unknown> | undefined
+  get(...parameters: Parameters): Record<string, unknown> | undefined {
+    const row = this.use(statement => this.bind(parameters,
+      values => statement.get(...values), values => statement.get(values)))
     return row === null || row === undefined ? undefined : copyRow(row)
   }
 
-  all(...parameters: SqlValue[]): Array<Record<string, unknown>> {
-    return this.use(statement => statement.all(...parameters)).map(copyRow)
+  all(...parameters: SqlValue[]): Array<Record<string, unknown>>
+  all(parameters: NamedParameters): Array<Record<string, unknown>>
+  all(...parameters: Parameters): Array<Record<string, unknown>> {
+    return this.use(statement => this.bind(parameters,
+      values => statement.all(...values), values => statement.all(values))).map(copyRow)
   }
 
-  run(...parameters: SqlValue[]): { changes: number; lastInsertRowid: number | bigint } {
-    const result = this.use(statement => statement.run(...parameters))
+  run(...parameters: SqlValue[]): { changes: number; lastInsertRowid: number | bigint }
+  run(parameters: NamedParameters): { changes: number; lastInsertRowid: number | bigint }
+  run(...parameters: Parameters): { changes: number; lastInsertRowid: number | bigint } {
+    const result = this.use(statement => this.bind(parameters,
+      values => statement.run(...values), values => statement.run(values)))
     // Runtime wrappers differ on whether `changes` includes trigger writes.
     // CAS requires SQLite's primary-statement count on this same connection.
     const row = new NativeStatement(this.driver, "SELECT changes() AS changes").get()

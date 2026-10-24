@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import Database from "libsql"
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
 import { createChatGptCredentialStore, type ChatGptAccount } from "../proxy/chatgpt/credentials"
 import { acquireWriterLease, type WriterLease } from "../proxy/chatgpt/lease"
 import { chatGptLockPath } from "../proxy/chatgpt/paths"
@@ -92,7 +92,13 @@ function fingerprint(dir: string): Record<string, string> {
       const path = join(at, entry.name)
       if (entry.isDirectory()) walk(path)
       // A WAL reader maps -shm; its bytes say nothing about the data.
-      else if (!entry.name.endsWith("-shm")) out[path] = createHash("sha256").update(readFileSync(path)).digest("hex")
+      else if (!entry.name.endsWith("-shm")) {
+        const bytes = readFileSync(path)
+        // Native readonly WAL connections may create an empty WAL. Retain
+        // hashes of every nonempty WAL, main DB and credential/config file.
+        if (entry.name.endsWith("-wal") && bytes.length === 0) continue
+        out[path] = createHash("sha256").update(bytes).digest("hex")
+      }
     }
   }
   walk(dir)
@@ -360,6 +366,20 @@ describe("meridian instance-import", () => {
     const result = await run(false)
 
     expect(result.plan?.conflicts).toContain("the source also has Claude profiles (work), and this command moves ChatGPT seats and their history only")
+  }, TIMEOUT)
+
+  it("copies telemetry while the destination keeps recording on its own connection", async () => {
+    const snapshot = readTelemetry(from.telemetryPath)!
+    const serving = createSqliteStores(to.telemetryPath, 3650)
+    try {
+      const copied = copyTelemetry({ snapshot, destinationPath: to.telemetryPath, renamed: new Map(), batchSize: 1, pauseMs: 10 })
+      const during = metric("personal", 0, 17)
+      during.requestId = "served-during-import"
+      serving.telemetry.record(during)
+      await copied
+      expect(serving.telemetry.getRecent({ limit: 1000 }).map(row => row.requestId)).toContain(during.requestId)
+      expect(verifyTelemetry({ snapshot, destinationPath: to.telemetryPath, renamed: new Map() })).toMatchObject({ missing: 0, differing: 0, logsMissing: 0 })
+    } finally { serving.close() }
   }, TIMEOUT)
 
   it("notices a copied request that differs from its source, or is missing", async () => {
