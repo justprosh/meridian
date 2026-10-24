@@ -12,13 +12,18 @@ const pkg = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
 const dist = join(packageRoot, 'dist');
 const chunks = readdirSync(dist).filter(name => name.endsWith('.js') && readFileSync(join(dist, name), 'utf8').includes('function createSqliteStores('));
 assert.equal(chunks.length, 1, 'bundle must expose exactly one telemetry implementation');
-const mod = await import(pathToFileURL(join(dist, chunks[0])).href);
-assert.equal(typeof mod.init_sqlite, 'function');
-assert.equal(typeof mod.createSqliteStores, 'function');
-mod.init_sqlite();
 const root = mkdtempSync(join(scratchParent, 'telemetry-benchmark-'));
 let stores;
 try {
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('MERIDIAN_') || key.startsWith('CLAUDE_PROXY_')) delete process.env[key];
+  }
+  process.env.HOME = join(root, 'home');
+  process.env.MERIDIAN_CONFIG_DIR = join(root, 'config');
+  const mod = await import(pathToFileURL(join(dist, chunks[0])).href);
+  assert.equal(typeof mod.init_sqlite, 'function');
+  assert.equal(typeof mod.createSqliteStores, 'function');
+  mod.init_sqlite();
   stores = mod.createSqliteStores(join(root, 'telemetry.db'), 7);
   const sample = { timestamp: Date.now(), model: 'sonnet', mode: 'stream', isResume: false, isPassthrough: false,
     status: 200, queueWaitMs: 0, proxyOverheadMs: 1, ttfbMs: 1, upstreamDurationMs: 2, totalDurationMs: 3,
