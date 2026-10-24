@@ -24,6 +24,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -92,7 +95,7 @@ const denyMsg = (ids: string[], sessionId: string) => {
 
 // CLI-faithful mock: per-block assistant messages, mid-stream hook dispatch,
 // CANCEL-ON-DENY when a deny resolves while generation is in flight.
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedController = opts?.options?.abortController
     capturedSessionId = opts?.options?.sessionId
@@ -163,13 +166,13 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
   tool: () => ({}),
-}))
+}), "proxy-stream-deny-hold.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: (event: string) => { timeline.push(`log:${event}`) },
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -208,7 +211,7 @@ describe("streaming deny-hold (#552 root cause v2)", () => {
   let origPassthrough: string | undefined
   let origEarlyStop: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     origPassthrough = process.env.MERIDIAN_PASSTHROUGH
     origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
@@ -222,7 +225,7 @@ describe("streaming deny-hold (#552 root cause v2)", () => {
     capturedForkSession = undefined
     denyUuids = []
     assistantToolUuids = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -247,8 +250,16 @@ describe("streaming deny-hold (#552 root cause v2)", () => {
     expect(dangling).toEqual([])
     // The client response ends at turn 1 while the digest drains invisibly to
     // the canonical durability boundary in the background.
-    const deadline = Date.now() + 1500
+    // Polls to a deadline and then asserts on what it polled for, which is the
+    // shape that turns a slow runner into a confusing "expected to contain"
+    // failure instead of a timeout (#917, #933). Budget raised to the suite's
+    // 5 s convention from 1.5 s, and the timeout now names itself. A longer
+    // wait cannot make a false condition true, so it hides nothing.
+    const deadline = Date.now() + 5_000
     while (!timeline.includes("canonical_result") && Date.now() < deadline) await sleep(10)
+    if (!timeline.includes("canonical_result")) {
+      throw new Error(`timed out after 5s waiting for canonical_result; timeline=[${timeline.join(", ")}]`)
+    }
     expect(capturedController!.signal.aborted).toBe(false)
     expect(timeline).toContain("turn2_consumed")
     expect(timeline).toContain("canonical_result")
@@ -291,4 +302,28 @@ describe("streaming deny-hold (#552 root cause v2)", () => {
     expect(denyUuids).not.toContain(capturedResumeSessionAt!)
     expect(capturedForkSession).toBe(true)
   })
+  it("RESUMES when the client returns the batch as one echo/result pair per call", async () => {
+    // A Responses-API client that records each output right after its own call
+    // arrives here as [assistant tb1, user tb1, assistant tg1, user tg1]. It
+    // settles the same checkpoint, so it must not cost a full uncached replay.
+    const app = createProxyServer({ port: 0, host: "127.0.0.1" }).app
+    await postStream(app, "hold-4", [{ role: "user", content: "test tools" }])
+    const initialSessionId = capturedSessionId
+    if (!initialSessionId) throw new Error("missing caller-selected session ID")
+    const deadline = Date.now() + 5_000
+    while (!timeline.includes("canonical_result") && Date.now() < deadline) await sleep(10)
+
+    capturedResume = undefined
+    await postStream(app, "hold-4", [
+      { role: "user", content: "test tools" },
+      { role: "assistant", content: [{ type: "tool_use", id: "tb1", name: "bash", input: { command: "ls /tmp" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tb1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "tg1", name: "glob", input: { pattern: "*.md" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tg1", content: "ok" }] },
+    ])
+    expect(capturedResume ?? "(fresh)").toBe(initialSessionId)
+    expect(capturedResumeSessionAt).toBe(assistantToolUuids[1])
+    expect(timeline).not.toContain("log:passthrough.checkpoint_replay")
+  })
 })
+

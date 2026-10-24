@@ -1,4 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
+import { legacyLifecycleOnly, sqliteLifecycleTest, setupLifecycleBackend, teardownLifecycleBackend } from "./fixtures/bookkeeping-lifecycle-backend"
+import { observeLifecycleState } from "./fixtures/bookkeeping-lifecycle-observer"
+import { injectDeletingResource } from "./fixtures/bookkeeping-lifecycle-injection"
+import type { TranscriptResource } from "../proxy/session/bookkeeping/types"
+import * as durableFileSystem from "../proxy/session/durableFileSystem"
 import {
   chmodSync,
   mkdirSync,
@@ -11,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { hostname, tmpdir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import {
   SessionLifecycleBacklogError,
   SessionLifecycleCorruptError,
@@ -20,15 +25,20 @@ import {
   acquireActiveTranscriptLease,
   attachActiveTranscriptExecutor,
   attachPinnedTranscript,
+  clipChildOutput,
   commitFork,
+  createInitializedSidecarLockCandidate,
   getSessionGcNodeExecutable,
   getTranscriptResourceKey,
   prepareFork,
+  prepareForkForPublication,
   publishPinnedTranscript,
   reconcile,
   registerLiveTranscript,
   releaseActiveTranscriptLease,
+  releaseJoinedTranscriptLease,
   runGc,
+  withLegacyLifecycleMaintenanceLock,
   type SessionLifecycleOptions,
   type TranscriptLocator,
 } from "../proxy/sessionLifecycle"
@@ -41,25 +51,9 @@ import {
   getRecoveryClaimTombstonePath,
 } from "../proxy/session/recoveryClaim"
 
-interface StoredResource {
-  key: string
-  generation: string
-  locator: TranscriptLocator
-  state: string
-  createdAt: number
-  updatedAt: number
-  attempts: number
-  nextAttemptAt?: number
-  lastError?: string
-  deletionToken?: string
-  deletionOwner?: ProcessIncarnation
-  deletionExecutor?: ProcessIncarnation
-  deletionProcessGroupId?: number
-}
-
 interface StoredSidecar {
-  version: number
-  resources: Record<string, StoredResource>
+  version?: number
+  resources: Record<string, TranscriptResource>
 }
 
 describe("session transcript lifecycle", () => {
@@ -69,21 +63,45 @@ describe("session transcript lifecycle", () => {
 
   beforeEach(() => {
     storeDir = mkdtempSync(join(tmpdir(), "meridian-session-lifecycle-"))
+    setupLifecycleBackend(storeDir)
     now = 10_000
     options = {
       storeDir,
       now: () => now,
       preparedGraceMs: 0,
       retiredGraceMs: 0,
-      lockWaitMs: 20,
+      // Positive recovery cases perform real fsyncs. Use the production wait
+      // budget; tests of contention and fail-closed deadlines override it.
+      lockWaitMs: 2_000,
       lockRetryMs: 1,
       lockStaleMs: 60_000,
     }
   })
 
   afterEach(() => {
+    teardownLifecycleBackend()
     rmSync(storeDir, { recursive: true, force: true })
   })
+
+  async function withSlowRecoverySync(operation: () => Promise<void>): Promise<void> {
+    const sync = durableFileSystem.syncDirectoryDurably
+    let delayed = 0
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      if (path.startsWith(storeDir) && path.includes(".recover-")) {
+        // Successful recovery must tolerate storage latency greater than the
+        // former 20 ms test deadline, while still performing real fsyncs.
+        await new Promise(resolve => setTimeout(resolve, 30))
+        delayed++
+      }
+      await sync(path)
+    })
+    try {
+      await operation()
+      expect(delayed).toBeGreaterThan(0)
+    } finally {
+      syncSpy.mockRestore()
+    }
+  }
 
   it("keys ownership by config directory and session id", () => {
     const first = locator("same-id", "profile-a")
@@ -100,7 +118,7 @@ describe("session transcript lifecycle", () => {
     )
   })
 
-  it("persists a prepared intent before commit with private atomic storage", async () => {
+  legacyLifecycleOnly("reads JSON bytes and file permissions", "persists a prepared intent before commit with private atomic storage", async () => {
     const fork = locator("fork-1")
     const key = getTranscriptResourceKey(await prepareFork(fork, options))
 
@@ -116,7 +134,7 @@ describe("session transcript lifecycle", () => {
     expect(sidecar.resources[key]?.state).toBe("live")
   })
 
-  it("validates and upgrades a legacy v1 resource without unsafe shape coercion", async () => {
+  legacyLifecycleOnly("injects v1 JSON bytes", "validates and upgrades a legacy v1 resource without unsafe shape coercion", async () => {
     const legacy = locator("legacy-v1-sidecar")
     const key = getTranscriptResourceKey(legacy)
     writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify({
@@ -171,7 +189,7 @@ describe("session transcript lifecycle", () => {
     const inFlightKey = getTranscriptResourceKey(await registerLiveTranscript(inFlight, options))
     const sidecar = readSidecar(storeDir)
     sidecar.resources[inFlightKey]!.state = "deleting"
-    writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify(sidecar), { mode: 0o600 })
+    injectDeletingResource(storeDir, sidecar.resources[inFlightKey]!)
     await expect(registerLiveTranscript(inFlight, options)).rejects.toThrow("from state deleting")
   })
 
@@ -199,6 +217,7 @@ describe("session transcript lifecycle", () => {
     const saved = process.env.MERIDIAN_MAX_STORED_SESSIONS
     process.env.MERIDIAN_MAX_STORED_SESSIONS = "2"
     const derived = { ...options, storeDir: join(storeDir, "derived-capacity"), maxPending: 1 }
+    setupLifecycleBackend(derived.storeDir)
     try {
       // Two durable mappings can each pin current + predecessor. The smaller
       // pending budget must not deadlock those four healthy live resources.
@@ -217,6 +236,7 @@ describe("session transcript lifecycle", () => {
 
   it("never exceeds the pending bound when many live resources become unpinned", async () => {
     const bounded = { ...options, storeDir: join(storeDir, "bounded-reconcile"), maxPending: 1 }
+    setupLifecycleBackend(bounded.storeDir)
     const first = locator("unpin-first")
     const second = locator("unpin-second")
     const third = locator("unpin-third")
@@ -234,6 +254,116 @@ describe("session transcript lifecycle", () => {
       SessionLifecycleBacklogError,
     )
     expect(readSidecar(bounded.storeDir).resources[getTranscriptResourceKey(stillLive)]?.state).toBe("live")
+  })
+
+  it("leaves admission capacity while retiring live resources after a profile switch", async () => {
+    const bounded = { ...options, storeDir: join(storeDir, "retirement-headroom"), maxPending: 2 }
+    setupLifecycleBackend(bounded.storeDir)
+    const firstStale = locator("first-stale-after-profile-switch")
+    const secondStale = locator("second-stale-after-profile-switch")
+    const fresh = locator("fresh-after-profile-switch")
+    await registerLiveTranscript(firstStale, bounded)
+    await registerLiveTranscript(secondStale, bounded)
+
+    expect((await reconcile([], bounded)).liveRetired).toBe(1)
+    await prepareFork(fresh, bounded)
+
+    const resources = readSidecar(bounded.storeDir).resources
+    expect(resources[getTranscriptResourceKey(fresh)]?.state).toBe("prepared")
+    expect(Object.values(resources).filter((resource) => resource.state === "retired")).toHaveLength(1)
+    expect(Object.values(resources).filter((resource) => resource.state === "live")).toHaveLength(1)
+  })
+
+  for (const maxPending of [2, 4]) {
+  it(
+    `continues bounded passive cleanup with a reserved admission slot (limit=${maxPending})`, async () => {
+    const deleted: string[] = []
+    const bounded = { ...options, maxPending, maxDeletesPerRun: 1,
+      deleter: async (resource: TranscriptLocator) => { deleted.push(resource.sessionId) } }
+    const stale = Array.from({ length: 5 }, (_, index) => locator(`passive-${index}`))
+    for (const resource of stale) await registerLiveTranscript(resource, bounded)
+    const active = await prepareForkForPublication(locator("active-publication"), bounded)
+    await reconcile([], bounded)
+    // At limit two an in-flight publication occupies the passive budget.
+    // Cleanup must resume after it publishes, while keeping its mapping pinned.
+    expect(readSidecar(storeDir).resources[getTranscriptResourceKey(active)]?.state).toBe("prepared")
+    await commitFork(active, bounded)
+    for (let iteration = 0; iteration < stale.length; iteration++) {
+      const result = await runGc([active], bounded)
+      expect(result.deleted).toBe(1)
+      const resources = Object.values(readSidecar(storeDir).resources)
+      expect(resources.filter(resource => ["prepared", "retired", "deleting"].includes(resource.state)).length)
+        .toBeLessThanOrEqual(maxPending)
+      expect(readSidecar(storeDir).resources[getTranscriptResourceKey(active)]?.state).toBe("live")
+    }
+    expect(new Set(deleted)).toEqual(new Set(stale.map(resource => resource.sessionId)))
+    expect(deleted).not.toContain(active.sessionId)
+  })
+  }
+
+  it("defers retirement instead of refusing racing publications, without overbooking", async () => {
+    const bounded = { ...options, maxPending: 2 }
+    for (const id of ["stale-a", "stale-b"]) await registerLiveTranscript(locator(id), bounded)
+    await reconcile([], bounded)
+    const attempts = await Promise.allSettled([
+      prepareForkForPublication(locator("racing-a"), bounded),
+      prepareForkForPublication(locator("racing-b"), bounded),
+    ])
+    expect(attempts.filter(result => result.status === "fulfilled")).toHaveLength(2)
+    const resources = Object.values(readSidecar(storeDir).resources)
+    expect(resources.filter(resource => resource.state === "prepared")).toHaveLength(2)
+    expect(resources.filter(resource => ["retired", "deleting"].includes(resource.state))).toHaveLength(0)
+    expect(resources.filter(resource => resource.state === "live")).toHaveLength(2)
+  })
+
+  it("still refuses a publication when the whole backlog is in-flight work", async () => {
+    const bounded = { ...options, maxPending: 2 }
+    await prepareForkForPublication(locator("in-flight-a"), bounded)
+    const attempts = await Promise.allSettled([
+      prepareForkForPublication(locator("in-flight-b"), bounded),
+      prepareForkForPublication(locator("in-flight-c"), bounded),
+    ])
+    expect(attempts.filter(result => result.status === "fulfilled")).toHaveLength(1)
+    const failures = attempts.filter(result => result.status === "rejected")
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.reason).toBeInstanceOf(SessionLifecycleBacklogError)
+    const resources = Object.values(readSidecar(storeDir).resources)
+    expect(resources.filter(resource => resource.state === "prepared")).toHaveLength(2)
+  })
+
+  it("defers the newest retirement so the deletion queue keeps its oldest head", async () => {
+    const deleted: string[] = []
+    const bounded = { ...options, maxPending: 3, maxDeletesPerRun: 1,
+      deleter: async (resource: TranscriptLocator) => { deleted.push(resource.sessionId) } }
+    await registerLiveTranscript(locator("retired-oldest"), bounded)
+    await reconcile([], bounded)
+    now += 1_000
+    await registerLiveTranscript(locator("retired-newest"), bounded)
+    await reconcile([], bounded)
+    await prepareForkForPublication(locator("admitted-a"), bounded)
+    await prepareForkForPublication(locator("admitted-b"), bounded)
+
+    const resources = readSidecar(storeDir).resources
+    expect(resources[getTranscriptResourceKey(locator("retired-oldest"))]?.state).toBe("retired")
+    expect(resources[getTranscriptResourceKey(locator("retired-newest"))]?.state).toBe("live")
+    expect(Object.values(resources).filter(resource =>
+      ["prepared", "retired", "deleting"].includes(resource.state))).toHaveLength(3)
+
+    await runGc([], bounded)
+    expect(deleted).toEqual([locator("retired-oldest").sessionId])
+  })
+
+  it("still enforces total ownership when passive retirement leaves pending capacity", async () => {
+    const bounded = { ...options, maxPending: 2, maxOwned: 3 }
+    for (const id of ["owned-a", "owned-b"]) await registerLiveTranscript(locator(id), bounded)
+    await reconcile([], bounded)
+    const active = await prepareForkForPublication(locator("owned-new"), bounded)
+    await commitFork(active, bounded)
+    await expect(prepareForkForPublication(locator("owned-overflow"), bounded))
+      .rejects.toBeInstanceOf(SessionLifecycleBacklogError)
+    const resources = Object.values(readSidecar(storeDir).resources)
+    expect(resources).toHaveLength(3)
+    expect(resources.filter(resource => resource.state === "retired")).toHaveLength(1)
   })
 
   it("never lets a delayed publisher recreate a deleted locator after tombstone pruning", async () => {
@@ -273,6 +403,8 @@ describe("session transcript lifecycle", () => {
     await commitFork(oldRef, bounded)
     await abandonFork(oldRef, bounded)
     await runGc([], bounded)
+    // Make replacement recency explicit so tombstone eviction does not depend on path key order
+    now += 1
     const other = locator("lifecycle-aba-pruner")
     await prepareFork(other, bounded)
     await abandonFork(other, bounded)
@@ -343,6 +475,103 @@ describe("session transcript lifecycle", () => {
     await releaseActiveTranscriptLease(second, options)
   })
 
+  it("expires an unarmed writer lease older than its TTL, independently of the prepared grace", async () => {
+    const graceOptions = { ...options, unarmedLeaseTtlMs: 100, preparedGraceMs: 10_000 }
+    const fork = locator("stale-unarmed-writer")
+    await prepareFork(fork, graceOptions)
+    const first = await acquireActiveTranscriptLease([fork], graceOptions)
+    await expect(acquireActiveTranscriptLease([fork], graceOptions)).rejects.toThrow("active SDK writer")
+
+    now += 101
+    const second = await acquireActiveTranscriptLease([fork], graceOptions)
+    expect(second.token).not.toBe(first.token)
+    await releaseActiveTranscriptLease(second, graceOptions)
+  })
+
+  it("keeps a fresh unarmed writer lease exclusive", async () => {
+    const graceOptions = { ...options, unarmedLeaseTtlMs: 100 }
+    const fork = locator("fresh-unarmed-writer")
+    await prepareFork(fork, graceOptions)
+    await acquireActiveTranscriptLease([fork], graceOptions)
+    now += 50
+    await expect(acquireActiveTranscriptLease([fork], graceOptions)).rejects.toThrow("active SDK writer")
+  })
+
+  legacyLifecycleOnly("injects JSON lock file", "releases a joined writer's lease on the next sweep when its lock is busy", async () => {
+    const fork = locator("joined-writer-busy-lock")
+    await prepareFork(fork, options)
+    const lease = await acquireActiveTranscriptLease([fork], options)
+    await abandonFork(fork, options)
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+
+    await releaseJoinedTranscriptLease(lease, { ...options, lockWaitMs: 3 })
+    rmSync(lock)
+    expect(readSidecar(storeDir).resources[getTranscriptResourceKey(fork)]?.activeLeases?.[lease.token])
+      .toBeDefined()
+
+    const deleted: string[] = []
+    await runGc([], { ...options, deleter: async (item) => { deleted.push(item.sessionId) } })
+    expect(deleted).toEqual(["joined-writer-busy-lock"])
+  })
+
+  legacyLifecycleOnly("corrupts JSON bytes", "still surfaces a joined writer's release failure that retrying cannot fix", async () => {
+    const fork = locator("joined-writer-corrupt")
+    await prepareFork(fork, options)
+    const lease = await acquireActiveTranscriptLease([fork], options)
+    writeFileSync(join(storeDir, "session-gc.json"), "{", { mode: 0o600 })
+
+    await expect(releaseJoinedTranscriptLease(lease, options))
+      .rejects.toBeInstanceOf(SessionLifecycleCorruptError)
+  })
+
+  it("keeps a non-recoverable writer lease fenced until the host reboots", async () => {
+    const current = captureProcessIncarnation()
+    if (!current) throw new Error("test process incarnation unavailable")
+    // Neither executor is running. Only the earlier boot proves that no
+    // descendant of the exited executor can still be writing its transcript.
+    const writers: Array<[TranscriptLocator, ProcessIncarnation]> = [
+      [locator("exited-writer-this-boot"), { ...current, pid: 999_999 }],
+      [locator("exited-writer-earlier-boot"), deadProcessIncarnation(999_998)],
+    ]
+    for (const [fork, executor] of writers) {
+      await prepareFork(fork, options)
+      const lease = await acquireActiveTranscriptLease([fork], options)
+      await attachActiveTranscriptExecutor(lease, executor, options, false)
+      await abandonFork(fork, options)
+    }
+
+    const deleted: string[] = []
+    const result = await runGc([], { ...options, deleter: async (item) => { deleted.push(item.sessionId) } })
+    expect(deleted).toEqual(["exited-writer-earlier-boot"])
+    expect(result.deferred).toBe(1)
+  })
+
+  it("pins a resource by its exact generation or by a generation-less legacy pin", async () => {
+    const target = locator("generation-pin")
+    await prepareFork(target, options)
+    await commitFork(target, options)
+    const stale = { ...target, lifecycleGeneration: `r:${getTranscriptResourceKey(target)}:999` }
+    const legacy = { ...target, lifecycleGeneration: undefined }
+
+    // The stale pin comes last so that it cannot shadow the other pin of its key.
+    expect((await reconcile([legacy, stale], options)).liveRetired).toBe(0)
+    expect((await reconcile([target, stale], options)).liveRetired).toBe(0)
+    expect((await reconcile([stale], options)).liveRetired).toBe(1)
+  })
+
+  it("retires an unpinned live resource once its stale publication lease expires", async () => {
+    const graceOptions = { ...options, unarmedLeaseTtlMs: 100 }
+    const fork = locator("stale-publication-lease")
+    await prepareForkForPublication(fork, graceOptions)
+    await commitFork(fork, graceOptions)
+    expect((await reconcile([], graceOptions)).liveRetired).toBe(0)
+
+    now += 101
+    expect((await reconcile([], graceOptions)).liveRetired).toBe(1)
+    expect(readSidecar(storeDir).resources[getTranscriptResourceKey(fork)]?.state).toBe("retired")
+  })
+
   it("keeps current and previous pins and deletes only retired forks", async () => {
     const current = locator("current")
     const previous = locator("previous")
@@ -406,7 +635,39 @@ describe("session transcript lifecycle", () => {
 
   it("uses a real Node executable when tests run under Bun", () => {
     expect(process.versions.bun).toBeDefined()
-    expect(getSessionGcNodeExecutable()).toBe("node")
+    expect(isAbsolute(getSessionGcNodeExecutable())).toBe(true)
+  })
+
+  it("clips child output keeping both ends within the budget", () => {
+    const head = "h".repeat(2_000)
+    const tail = "t".repeat(2_000)
+    const clipped = clipChildOutput(`${head}${"m".repeat(3_000)}${tail}`)
+
+    expect(clipped.startsWith(head)).toBe(true)
+    expect(clipped.endsWith(tail)).toBe(true)
+    expect(clipped).toContain("3000 chars elided")
+    expect(clipChildOutput("short child output")).toBe("short child output")
+  })
+
+  it("keeps a verdict that the old tail-only clip would have lost (#1030)", () => {
+    // The reported failure, stated as a test. The child writes its verdict
+    // first and a Node crash report follows it. The previous
+    // `output.slice(-4_000)` kept only the crash report, so the parent's string
+    // match never fired, the resource stayed `retired` and was retried forever
+    // — 254 attempts on the reporting deployment — until `pending` reached
+    // `maxPending` and every NEW conversation failed with "ownership backlog is
+    // full".
+    //
+    // Worth pinning separately from the mechanics above: the end-to-end
+    // deletion test passes on the pre-fix tree too, because its fixture's
+    // output is short enough that the old tail match still found the verdict.
+    // Only an output larger than the budget distinguishes them.
+    const verdict = "Error: Session 0e0f7a11-0000-4000-8000-000000000000 not found"
+    const crashReport = "#".repeat(9_000)
+    const output = `${verdict}\n${crashReport}`
+
+    expect(output.slice(-4_000)).not.toContain(verdict)
+    expect(clipChildOutput(output)).toContain(verdict)
   })
 
   it("defers retired deletion through the reader-drain grace period", async () => {
@@ -466,7 +727,7 @@ describe("session transcript lifecycle", () => {
     const sidecar = readSidecar(storeDir)
     sidecar.resources[key]!.state = "deleting"
     sidecar.resources[key]!.updatedAt = now - 1_000
-    writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify(sidecar), { mode: 0o600 })
+    injectDeletingResource(storeDir, sidecar.resources[key]!)
 
     const result = await reconcile([], { ...options, deletingLeaseMs: 100 })
     expect(result.deletingRecovered).toBe(0)
@@ -483,12 +744,32 @@ describe("session transcript lifecycle", () => {
     sidecar.resources[key]!.deletionOwner = deadProcessIncarnation(999_999_998)
     sidecar.resources[key]!.deletionExecutor = deadProcessIncarnation(999_999_999)
     sidecar.resources[key]!.deletionProcessGroupId = 999_999_999
-    writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify(sidecar), { mode: 0o600 })
+    injectDeletingResource(storeDir, sidecar.resources[key]!)
 
     const recovered = await reconcile([], options)
     expect(recovered.deletingRecovered).toBe(1)
     expect(readSidecar(storeDir).resources[key]?.state).toBe("retired")
     expect((await runGc([], { ...options, deleter: async () => undefined })).deleted).toBe(1)
+  })
+
+  it.each(["live", "indeterminate"] as const)("keeps a dead executor fenced while its deletion owner is %s", async ownerState => {
+    const current = captureProcessIncarnation()
+    if (!current) throw new Error("test process incarnation unavailable")
+    const fork = locator(`unjoined-owner-${ownerState}`)
+    const exact = await prepareFork(fork, options)
+    await abandonFork(exact, options)
+    const resource = readSidecar(storeDir).resources[getTranscriptResourceKey(exact)]!
+    resource.state = "deleting"
+    resource.deletionToken = "unjoined-owner-token"
+    if (ownerState === "live") resource.deletionOwner = current
+    else if (ownerState === "indeterminate") resource.deletionOwner = {
+      ...current, hostId: current.hostId === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64),
+    }
+    resource.deletionExecutor = deadProcessIncarnation(999_999_999)
+    resource.deletionProcessGroupId = 999_999_999
+    injectDeletingResource(storeDir, resource)
+    expect((await reconcile([], options)).deletingRecovered).toBe(0)
+    expect(readSidecar(storeDir).resources[resource.key]?.deletionToken).toBe("unjoined-owner-token")
   })
 
   it("keeps a deleting orphan fenced while its exact executor may be alive", async () => {
@@ -503,7 +784,7 @@ describe("session transcript lifecycle", () => {
     sidecar.resources[key]!.deletionOwner = current
     sidecar.resources[key]!.deletionExecutor = current
     sidecar.resources[key]!.deletionProcessGroupId = current.pid
-    writeFileSync(join(storeDir, "session-gc.json"), JSON.stringify(sidecar), { mode: 0o600 })
+    injectDeletingResource(storeDir, sidecar.resources[key]!)
 
     expect((await reconcile([], options)).deletingRecovered).toBe(0)
     const gc = await runGc([], { ...options, deleter: async () => undefined })
@@ -511,7 +792,7 @@ describe("session transcript lifecycle", () => {
     expect(readSidecar(storeDir).resources[key]?.state).toBe("deleting")
   })
 
-  it("fails closed on a corrupt sidecar without calling the deleter", async () => {
+  legacyLifecycleOnly("corrupts JSON bytes", "fails closed on a corrupt sidecar without calling the deleter", async () => {
     const path = join(storeDir, "session-gc.json")
     writeFileSync(path, "{broken", { mode: 0o600 })
     let called = false
@@ -524,21 +805,53 @@ describe("session transcript lifecycle", () => {
     expect(readFileSync(path, "utf8")).toBe("{broken")
   })
 
-  it("recovers an abandoned stale lock without unlinking a successor", async () => {
+  legacyLifecycleOnly("injects JSON lock and recovery files", "recovers an abandoned stale lock without unlinking a successor", async () => {
     const lock = join(storeDir, "session-gc.json.lock")
     writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "stale", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
     const stale = (Date.now() - 1_000) / 1_000
     utimesSync(lock, stale, stale)
 
-    await prepareFork(locator("after-crash"), {
+    await withSlowRecoverySync(() => prepareFork(locator("after-crash"), {
       ...options,
       lockStaleMs: 10,
-    })
+    }).then(() => undefined))
 
     expect(readdirSync(storeDir)).toEqual(["session-gc.json"])
   })
 
-  it("repeatedly adopts dead lifecycle recovery claims and cleans resolved tombstones", async () => {
+  legacyLifecycleOnly("injects JSON lock and recovery files", "acquires a recovered maintenance lock after durable recovery exceeds its wait budget", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "slow-recovery", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
+    const stale = (Date.now() - 1_000) / 1_000
+    utimesSync(lock, stale, stale)
+    const sync = durableFileSystem.syncDirectoryDurably
+    let recoveries = 0
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      if (path.startsWith(`${lock}.recover-`) && path.includes(".candidate-")) {
+        // A real recovery fsync may outlast maintenance's 100 ms contention
+        // budget. Once it retires the dead owner, try the exclusive link before
+        // timing out; no additional waiting budget is needed.
+        await new Promise(resolve => setTimeout(resolve, 150))
+        recoveries++
+      }
+      await sync(path)
+    })
+    let entered = false
+    try {
+      await withLegacyLifecycleMaintenanceLock(storeDir, async () => {
+        const owner = JSON.parse(readFileSync(lock, "utf8").split("\n")[0]!)
+        expect(owner.pid).toBe(process.pid)
+        entered = true
+      })
+      expect(entered).toBe(true)
+      expect(recoveries).toBe(1)
+      expect(readdirSync(storeDir)).toEqual([])
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
+  legacyLifecycleOnly("injects JSON lock and recovery files", "repeatedly adopts dead lifecycle recovery claims and cleans resolved tombstones", async () => {
     const lock = join(storeDir, "session-gc.json.lock")
     const contents = `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "stale-claim-generation", incarnation: deadProcessIncarnation(999_999_999) })}
 `
@@ -556,16 +869,68 @@ describe("session transcript lifecycle", () => {
     )
     writeLifecycleRecoveryClaim(claim, contents, "second-dead-lifecycle-recoverer", 999_999_999)
 
-    await prepareFork(locator("after-orphaned-lifecycle-recovery"), {
+    await withSlowRecoverySync(() => prepareFork(locator("after-orphaned-lifecycle-recovery"), {
       ...options,
       lockStaleMs: 10,
-    })
+    }).then(() => undefined))
 
     expect(readSidecar(storeDir).resources).toBeDefined()
     expect(readdirSync(storeDir).some((name) => name.includes(".recover-"))).toBe(false)
   })
 
-  it("fails closed for live and remote lifecycle recovery owners", async () => {
+  legacyLifecycleOnly("injects JSON lock and recovery files", "does not acquire over a successor published during stale recovery at the deadline", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "old-generation", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
+    const stale = (Date.now() - 1_000) / 1_000
+    utimesSync(lock, stale, stale)
+    const incarnation = captureProcessIncarnation()
+    if (!incarnation) throw new Error("test process incarnation unavailable")
+    const successor = `${JSON.stringify({ pid: process.pid, hostname: hostname(), token: "live-successor", incarnation })}\n`
+    const sync = durableFileSystem.syncDirectoryDurably
+    let published = false
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      await sync(path)
+      if (path === storeDir && !published) {
+        writeFileSync(lock, successor, { mode: 0o600 })
+        published = true
+      }
+    })
+    try {
+      await expect(prepareFork(locator("blocked-by-successor"), {
+        ...options, lockWaitMs: 0, lockStaleMs: 1,
+      })).rejects.toBeInstanceOf(SessionLifecycleLockError)
+      expect(published).toBe(true)
+      expect(readFileSync(lock, "utf8")).toBe(successor)
+      expect(readdirSync(storeDir)).toEqual(["session-gc.json.lock"])
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
+  legacyLifecycleOnly("injects JSON lock and recovery files", "honors cancelled admission before acquiring a just-recovered lock", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "cancel-during-recovery", incarnation: deadProcessIncarnation(999_999_999) })}\n`, { mode: 0o600 })
+    const stale = (Date.now() - 1_000) / 1_000
+    utimesSync(lock, stale, stale)
+    const controller = new AbortController()
+    const cancelled = new Error("cancelled during stale recovery")
+    const sync = durableFileSystem.syncDirectoryDurably
+    const syncSpy = spyOn(durableFileSystem, "syncDirectoryDurably").mockImplementation(async path => {
+      await sync(path)
+      if (path.startsWith(`${lock}.recover-`)) controller.abort(cancelled)
+    })
+    try {
+      await expect(prepareFork(locator("cancelled-recovery"), {
+        ...options, admissionSignal: controller.signal, lockStaleMs: 1,
+      })).rejects.toBe(cancelled)
+      expect(controller.signal.aborted).toBe(true)
+      expect(readdirSync(storeDir)).toEqual([])
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
+  legacyLifecycleOnly("injects JSON lock and recovery files", "fails closed for live and remote lifecycle recovery owners", async () => {
     const lock = join(storeDir, "session-gc.json.lock")
     const contents = `${JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "blocked-claim-generation", incarnation: deadProcessIncarnation(999_999_999) })}
 `
@@ -590,7 +955,7 @@ describe("session transcript lifecycle", () => {
     }
   })
 
-  it("times out under lock contention and never proceeds unlocked", async () => {
+  legacyLifecycleOnly("injects JSON lock file", "times out under lock contention and never proceeds unlocked", async () => {
     const lock = join(storeDir, "session-gc.json.lock")
     writeFileSync(lock, "another-owner\n", { mode: 0o600 })
     chmodSync(lock, 0o600)
@@ -602,6 +967,65 @@ describe("session transcript lifecycle", () => {
     })).rejects.toBeInstanceOf(SessionLifecycleLockError)
     expect(readdirSync(storeDir)).not.toContain("session-gc.json")
   })
+
+  legacyLifecycleOnly("observes JSON lock candidates", "initialises one lock candidate per acquisition, not one per retry", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+    const candidates = (): string[] =>
+      readdirSync(storeDir).filter((name) => name.includes(".candidate-"))
+    const candidate = await createInitializedSidecarLockCandidate(lock, "this-owner\n")
+    const [staging] = candidates()
+    if (!staging) throw new Error("lock candidate was not created")
+    // Failed publication keeps the same synced inode ready for the next link.
+    expect(await candidate.publish()).toBe(false)
+    expect(candidates()).toEqual([staging])
+    rmSync(lock)
+    expect(await candidate.publish()).toBe(true)
+    expect(candidates()).toEqual([staging])
+    expect(readFileSync(lock, "utf8")).toBe("this-owner\n")
+    await candidate.discard()
+    expect(candidates()).toEqual([])
+    expect(readFileSync(lock, "utf8")).toBe("this-owner\n")
+  })
+
+  legacyLifecycleOnly("observes JSON lock protocol", "grants the lock to one process's callers in arrival order", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+    chmodSync(lock, 0o600)
+    const order: string[] = []
+
+    // The earlier caller is asleep in a long retry interval when the holder
+    // leaves; a later caller polling fast would win a poll-only race.
+    const early = prepareFork(locator("early"), { ...options, lockRetryMs: 400 })
+      .then(() => { order.push("early") })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const late = prepareFork(locator("late"), { ...options, lockRetryMs: 5 })
+      .then(() => { order.push("late") })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    rmSync(lock, { force: true })
+
+    await Promise.all([early, late])
+    expect(order).toEqual(["early", "late"])
+  })
+
+  legacyLifecycleOnly("observes JSON lock protocol", "hands the turn on when a queued caller cancels admission", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+    chmodSync(lock, 0o600)
+
+    const first = prepareFork(locator("first"), options)
+    const controller = new AbortController()
+    const impatient = prepareFork(locator("impatient"), { ...options, admissionSignal: controller.signal })
+      .catch((error: unknown) => error)
+    const last = prepareFork(locator("last"), options)
+
+    controller.abort(new Error("queued admission cancelled"))
+    expect(await impatient).toEqual(new Error("queued admission cancelled"))
+    rmSync(lock, { force: true })
+    await Promise.all([first, last])
+    expect(Object.keys(readSidecar(storeDir).resources)).toHaveLength(2)
+  })
+
   it("never overlaps a second physical deleter with an uncertain first", async () => {
     const target = locator("lease-token")
     let now = 1_000
@@ -719,5 +1143,6 @@ function locator(sessionId: string, profile = "profile"): TranscriptLocator {
 }
 
 function readSidecar(storeDir: string): StoredSidecar {
+  if (sqliteLifecycleTest) return observeLifecycleState(storeDir)
   return JSON.parse(readFileSync(join(storeDir, "session-gc.json"), "utf8")) as StoredSidecar
 }

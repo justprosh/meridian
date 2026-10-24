@@ -9,9 +9,11 @@ import {
   translateOpenAiToAnthropic,
   translateAnthropicToOpenAi,
   translateAnthropicSseEvent,
+  translateAnthropicSseError,
   createSseTranslator,
   buildModelList,
 } from "../proxy/openai"
+import type { AnthropicSseEvent } from "../proxy/openai"
 
 // ---------------------------------------------------------------------------
 // extractOpenAiContent
@@ -133,7 +135,7 @@ describe("translateOpenAiToAnthropic", () => {
     const result = translateOpenAiToAnthropic({
       messages: [{ role: "user", content: "Hi" }],
     })
-    expect(result!.model).toBe("claude-sonnet-5")
+    expect(result!.model).toBe("claude-sonnet-5-5")
   })
 
   it("passes through specified model", () => {
@@ -380,6 +382,42 @@ describe("translateOpenAiToAnthropic", () => {
       ],
     })
     expect(result).not.toBeNull()
+  })
+
+  it("coalesces consecutive tool results of one assistant turn into a single user message", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [
+        { role: "user", content: "call both" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            { type: "function", id: "tu_a", function: { name: "fn", arguments: "{}" } },
+            { type: "function", id: "tu_b", function: { name: "fn", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "tu_a", content: "A" },
+        { role: "tool", tool_call_id: "tu_b", content: "B" },
+      ],
+    }, { preserveConversationHistory: true })
+    expect(result!.messages).toHaveLength(3)
+    const results = result!.messages[2]!
+    expect(results.role).toBe("user")
+    expect((results.content as any[]).map(b => [b.type, b.tool_use_id]))
+      .toEqual([["tool_result", "tu_a"], ["tool_result", "tu_b"]])
+  })
+
+  it("does not merge a tool result into a preceding plain user message", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "tool", tool_call_id: "tu_x", content: "X" },
+      ],
+    }, { preserveConversationHistory: true })
+    expect(result!.messages).toHaveLength(2)
+    expect(result!.messages[0]!.role).toBe("user")
+    expect(result!.messages[1]!.role).toBe("user")
+    expect((result!.messages[1]!.content as any[])[0].type).toBe("tool_result")
   })
 
   // --- assistant message with tool_calls ---
@@ -731,6 +769,99 @@ describe("translateOpenAiToAnthropic", () => {
     })
     expect(result!.tools).toHaveLength(1)
     expect(result!.tools![0]!.description).toBe("")
+  })
+
+  // --- structured output ---
+
+  const personSchema = {
+    type: "object",
+    properties: { name: { type: "string" } },
+    required: ["name"],
+  }
+
+  it("maps response_format json_schema to output_config.format", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "person", schema: personSchema, strict: true },
+      },
+    })
+    // `name` and `strict` have no Anthropic equivalent and are dropped: the
+    // SDK always validates, which is never weaker than strict asked for.
+    expect(result!.output_config).toEqual({
+      format: { type: "json_schema", schema: personSchema },
+    })
+  })
+
+  it("keeps response_format alongside output_config.effort", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      output_config: { effort: "high" },
+      response_format: { type: "json_schema", json_schema: { schema: personSchema } },
+    })
+    expect(result!.output_config).toEqual({
+      effort: "high",
+      format: { type: "json_schema", schema: personSchema },
+    })
+  })
+
+  it("passes through an Anthropic-shaped output_config.format unchanged", () => {
+    const format = { type: "json_schema", schema: personSchema }
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      output_config: { format },
+    })
+    expect(result!.output_config).toEqual({ format })
+  })
+
+  it("forwards json_object intact so the boundary can reject it", () => {
+    // Not widened into a permissive schema: Anthropic has no schema-less JSON
+    // mode, and accepting it here would promise an enforcement never applied.
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      response_format: { type: "json_object" },
+    })
+    expect(result!.output_config).toEqual({ format: { type: "json_object" } })
+  })
+
+  it("treats response_format text as no constraint", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      response_format: { type: "text" },
+    })
+    expect(result!.output_config).toBeUndefined()
+  })
+
+  // Clients that serialize an unset optional as JSON null rather than omitting
+  // the key must behave as if it were absent. This threw a TypeError out of the
+  // /v1/chat/completions handler, which has no try/catch — a 500 on a request
+  // that worked fine before structured output landed.
+  it("treats an explicit null response_format as omission", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      response_format: null,
+    } as unknown as Parameters<typeof translateOpenAiToAnthropic>[0])
+    expect(result!.output_config).toBeUndefined()
+  })
+
+  it("keeps output_config.effort when response_format is null", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      response_format: null,
+      output_config: { effort: "high" },
+    } as unknown as Parameters<typeof translateOpenAiToAnthropic>[0])
+    expect(result!.output_config).toEqual({ effort: "high" })
+  })
+
+  // Forwarded rather than dropped, so the boundary check rejects it with a 400
+  // naming the client's own field instead of silently ignoring the request.
+  it("forwards a non-object response_format for rejection downstream", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{ role: "user", content: "hi" }],
+      response_format: "json_schema",
+    } as unknown as Parameters<typeof translateOpenAiToAnthropic>[0])
+    expect(result!.output_config?.format).toBe("json_schema")
   })
 })
 
@@ -1230,6 +1361,84 @@ describe("createSseTranslator", () => {
     expect(chunks[5]!.choices[0]!.finish_reason).toBe("tool_calls")
   })
 
+  /** Reassemble per-call arguments the way an OpenAI client does: by tool_calls[].index. */
+  function assembleToolCalls(chunks: Array<ReturnType<ReturnType<typeof createSseTranslator>>>) {
+    const calls = new Map<number, { id?: string; name?: string; arguments: string }>()
+    for (const chunk of chunks) {
+      for (const tc of chunk?.choices[0]?.delta.tool_calls ?? []) {
+        const call = calls.get(tc.index) ?? { arguments: "" }
+        if (tc.id) call.id = tc.id
+        if (tc.function?.name) call.name = tc.function.name
+        call.arguments += tc.function?.arguments ?? ""
+        calls.set(tc.index, call)
+      }
+    }
+    return [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call)
+  }
+
+  it("routes a tool's arguments to its own call when they arrive after a later tool starts", () => {
+    const translate = createSseTranslator(CTX)
+    const events: AnthropicSseEvent[] = [
+      { type: "message_start" },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "tu_a", name: "read", input: {} } },
+      { type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "tu_b", name: "read", input: {} } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path":' } },
+      { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"path":"b.txt"}' } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '"a.txt"}' } },
+      { type: "content_block_stop", index: 1 },
+      { type: "content_block_stop", index: 2 },
+      { type: "message_delta", delta: { stop_reason: "tool_use" } },
+    ]
+    const chunks = events.map(event => translate(event))
+
+    expect(assembleToolCalls(chunks)).toEqual([
+      { id: "tu_a", name: "read", arguments: '{"path":"a.txt"}' },
+      { id: "tu_b", name: "read", arguments: '{"path":"b.txt"}' },
+    ])
+  })
+
+  it("keeps per-block routing when text and thinking blocks interleave with tools", () => {
+    const translate = createSseTranslator(CTX)
+    const events: AnthropicSseEvent[] = [
+      { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "tu_a", name: "fn", input: {} } },
+      { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "note" } },
+      { type: "content_block_start", index: 3, content_block: { type: "tool_use", id: "tu_b", name: "fn", input: {} } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"a":1}' } },
+      { type: "content_block_delta", index: 3, delta: { type: "input_json_delta", partial_json: '{"b":2}' } },
+    ]
+    const chunks = events.map(event => translate(event))
+
+    expect(assembleToolCalls(chunks)).toEqual([
+      { id: "tu_a", name: "fn", arguments: '{"a":1}' },
+      { id: "tu_b", name: "fn", arguments: '{"b":2}' },
+    ])
+  })
+
+  it("drops an indexed argument delta whose block never started as a tool", () => {
+    const translate = createSseTranslator(CTX)
+    translate({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tu_a", name: "fn", input: {} } })
+    expect(translate({
+      type: "content_block_delta",
+      index: 7,
+      delta: { type: "input_json_delta", partial_json: '{"orphan":true}' },
+    })).toBeNull()
+  })
+
+  it("stops routing to a tool once its block index is reused by a non-tool block", () => {
+    const translate = createSseTranslator(CTX)
+    translate({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tu_a", name: "fn", input: {} } })
+    translate({ type: "content_block_stop", index: 0 })
+    translate({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+    expect(translate({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"stale":true}' },
+    })).toBeNull()
+  })
+
   it("buildUsageChunk returns null when includeUsage was not requested", () => {
     const translate = createSseTranslator(CTX)
     translate({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 5 } })
@@ -1320,26 +1529,71 @@ describe("createSseTranslator", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildModelList", () => {
-  it("returns 8 models", () => {
-    expect(buildModelList(true).length).toBe(8)
-    expect(buildModelList(false).length).toBe(8)
+  it("honors the SDK 1M disable switch for both included and native windows", () => {
+    for (const extended of [false, true]) {
+      const models = buildModelList(extended, 123, true)
+      expect(models.every(model => model.context_window === 200_000)).toBe(true)
+      expect(models.every(model => model.created === 123)).toBe(true)
+    }
   })
 
-  it("includes sonnet-5, fable-5, opus-5, opus-4-6, opus-4-7, and opus-4-8 for UI pickers", () => {
+  it("advertises Haiku 5.5 native 1M context and adaptive-only thinking on every plan", () => {
+    for (const extended of [false, true]) {
+      const models = buildModelList(extended)
+      const model = models.find(m => m.id === "claude-haiku-5-5")
+      expect(model?.display_name).toBe("Claude Haiku 5.5")
+      expect(model?.context_window).toBe(1_000_000)
+      expect(model?.capabilities?.thinking.types.adaptive.supported).toBe(true)
+      expect(model?.capabilities?.thinking.types.enabled.supported).toBe(false)
+      expect(model?.capabilities?.effort.xhigh.supported).toBe(true)
+      expect(model?.capabilities?.effort.max.supported).toBe(true)
+      expect(models.filter(m => m.id === "claude-haiku-5-5")).toHaveLength(1)
+    }
+  })
+  it("advertises Opus 5.5 adaptive thinking and native 1M context", () => {
+    for (const extended of [false, true]) {
+      const model = buildModelList(extended).find(m => m.id === "claude-opus-5-5")!
+      expect(model.display_name).toBe("Claude Opus 5.5")
+      expect(model.context_window).toBe(1_000_000)
+      expect(model.capabilities!.thinking.types.adaptive.supported).toBe(true)
+      expect(model.capabilities!.thinking.types.enabled.supported).toBe(false)
+    }
+  })
+  it("advertises Sonnet 5.5 with its native 1M context on every plan (#1212)", () => {
+    for (const extended of [false, true]) {
+      const model = buildModelList(extended).find(m => m.id === "claude-sonnet-5-5")!
+      expect(model.display_name).toBe("Claude Sonnet 5.5")
+      expect(model.context_window).toBe(1_000_000)
+      expect(buildModelList(extended).find(m => m.id === "claude-sonnet-5")!.context_window).toBe(1_000_000)
+      expect(model.capabilities!.thinking.types.adaptive.supported).toBe(true)
+      expect(model.capabilities!.thinking.types.enabled.supported).toBe(true)
+    }
+  })
+  it("returns 12 models", () => {
+    expect(buildModelList(true).length).toBe(12)
+    expect(buildModelList(false).length).toBe(12)
+  })
+
+  it("includes current and legacy Fable plus the supported Sonnet and Opus models for UI pickers", () => {
     const ids = buildModelList(true).map(m => m.id)
+    expect(ids).toContain("claude-sonnet-5-5")
     expect(ids).toContain("claude-sonnet-5")
+    expect(ids).toContain("claude-fable-5-1")
     expect(ids).toContain("claude-fable-5")
+    expect(ids).toContain("claude-opus-5-5")
     expect(ids).toContain("claude-opus-5")
     expect(ids).toContain("claude-opus-4-6")
     expect(ids).toContain("claude-opus-4-7")
     expect(ids).toContain("claude-opus-4-8")
   })
 
-  it("Max subscription gets 1M context for fable, 200k otherwise", () => {
-    const fableMax = buildModelList(true).find(m => m.id === "claude-fable-5")!
-    const fableFree = buildModelList(false).find(m => m.id === "claude-fable-5")!
-    expect(fableMax.context_window).toBe(1_000_000)
-    expect(fableFree.context_window).toBe(200_000)
+  it("every subscription gets the native 1M window for both Fable versions", () => {
+    for (const id of ["claude-fable-5-1", "claude-fable-5"]) {
+      const fableMax = buildModelList(true).find(m => m.id === id)!
+      const fableFree = buildModelList(false).find(m => m.id === id)!
+      expect(fableMax.context_window).toBe(1_000_000)
+      expect(fableFree.context_window).toBe(1_000_000)
+    }
   })
 
   it("Max subscription gets 1M context for all opus variants, 200k for sonnet", () => {
@@ -1356,7 +1610,7 @@ describe("buildModelList", () => {
     expect(opus48.context_window).toBe(1_000_000)
   })
 
-  it("non-Max gets 200k context for sonnet and all opus variants", () => {
+  it("non-Max keeps legacy Opus 4.6 at 200k and gives newer Opus its native 1M window", () => {
     const models = buildModelList(false)
     const sonnet = models.find(m => m.id === "claude-sonnet-4-6")!
     const opus5 = models.find(m => m.id === "claude-opus-5")!
@@ -1364,10 +1618,10 @@ describe("buildModelList", () => {
     const opus47 = models.find(m => m.id === "claude-opus-4-7")!
     const opus48 = models.find(m => m.id === "claude-opus-4-8")!
     expect(sonnet.context_window).toBe(200_000)
-    expect(opus5.context_window).toBe(200_000)
+    expect(opus5.context_window).toBe(1_000_000)
     expect(opus46.context_window).toBe(200_000)
-    expect(opus47.context_window).toBe(200_000)
-    expect(opus48.context_window).toBe(200_000)
+    expect(opus47.context_window).toBe(1_000_000)
+    expect(opus48.context_window).toBe(1_000_000)
   })
 
   // #498: Home Assistant 2026.5's Anthropic integration reads
@@ -1398,7 +1652,7 @@ describe("buildModelList", () => {
     expect(caps.thinking.types.enabled.supported).toBe(true)
   })
 
-  it("haiku is always 200k regardless of subscription", () => {
+  it("legacy Haiku 4.5 is always 200k regardless of subscription", () => {
     expect(buildModelList(true).find(m => m.id === "claude-haiku-4-5")!.context_window).toBe(200_000)
     expect(buildModelList(false).find(m => m.id === "claude-haiku-4-5")!.context_window).toBe(200_000)
   })
@@ -1410,5 +1664,41 @@ describe("buildModelList", () => {
   it("uses provided timestamp", () => {
     const ts = 9999999
     buildModelList(true, ts).forEach(m => expect(m.created).toBe(ts))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// translateAnthropicSseError
+// ---------------------------------------------------------------------------
+
+describe("translateAnthropicSseError", () => {
+  it("returns null for non-error events", () => {
+    expect(translateAnthropicSseError({ type: "message_delta" })).toBeNull()
+    expect(translateAnthropicSseError({ type: "ping" })).toBeNull()
+  })
+
+  it("maps an Anthropic error event to an OpenAI in-band error", () => {
+    expect(translateAnthropicSseError({
+      type: "error",
+      error: { type: "overloaded_error", message: "Overloaded" },
+    })).toEqual({ error: { type: "overloaded_error", code: "overloaded_error", message: "Overloaded" } })
+  })
+
+  it("preserves extra upstream fields such as retry hints", () => {
+    expect(translateAnthropicSseError({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Slow down", retry_after: 12 },
+    })).toEqual({
+      error: { type: "rate_limit_error", code: "rate_limit_error", message: "Slow down", retry_after: 12 },
+    })
+  })
+
+  it("fills defaults when the upstream error is missing or malformed", () => {
+    expect(translateAnthropicSseError({ type: "error" })).toEqual({
+      error: { type: "api_error", code: "api_error", message: "Upstream stream error" },
+    })
+    expect(translateAnthropicSseError({ type: "error", error: "boom" })).toEqual({
+      error: { type: "api_error", code: "api_error", message: "Upstream stream error" },
+    })
   })
 })

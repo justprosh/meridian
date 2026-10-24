@@ -16,20 +16,31 @@ if (args.includes("--version") || args.includes("-v")) {
   process.exit(0)
 }
 
-if (args.includes("--help") || args.includes("-h")) {
+if ((args.includes("--help") || args.includes("-h")) && args[0] !== "chatgpt-migrate" && args[0] !== "instance-import") {
   console.log(`meridian v${version}
 
-Local Anthropic API powered by your Claude Max subscription.
+Local API bridge for Claude and Antigravity subscriptions.
 
 Usage: meridian [command] [options]
 
 Commands:
   (default)        Start the proxy server
-  setup            Configure the OpenCode plugin (run once after install)
-  profile          Manage Claude account profiles (add, list, switch, remove)
+  status           Show what a running instance is doing (the / page, in the terminal)
+  setup            Configure client integrations (run once after install)
+  profile          Manage Claude account profiles and ChatGPT seats (add, list, switch, remove)
   refresh-token    Refresh the Claude Code OAuth token
+  chatgpt-migrate  Move ChatGPT accounts from oc-codex-multi-auth into Meridian, or back with --reverse (--help)
+  instance-import  Move one Meridian instance's ChatGPT seats and their history into another (--help)
+  test-error-report  Crash with a test error to check error reporting reaches the collector
 
 Setup options:
+  --antigravity                Configure Pi or OpenCode V1 for Antigravity
+  --client <pi|opencode>       Client to configure with --antigravity
+  --url <base URL>             Antigravity URL (include /antigravity in combined mode)
+  --model <account slug>      Account model to add
+  --config-dir <directory>    Optional client configuration directory
+  --api-key-env <variable>    Reference a local Meridian API key from the environment
+  --set-default              Also select Antigravity for the client
   --v1                         Install the OpenCode V1 plugin
   --v2                         Install the pinned OpenCode V2 beta plugin
   --opencode-bin <executable>  Probe this OpenCode executable
@@ -41,20 +52,36 @@ Options:
 Environment variables:
   MERIDIAN_PORT                     Port to listen on (default: 3456)
   MERIDIAN_HOST                     Host to bind to (default: 127.0.0.1)
+  MERIDIAN_BACKEND                  claude (default), antigravity, or combined
+  MERIDIAN_AGY_STATE_PATH           Optional bounded persistent state file
+  MERIDIAN_AGY_TURN_TIMEOUT_MS      Active CLI turn deadline (default: 300000)
+  MERIDIAN_AGY_TOOL_TIMEOUT_MS      Idle client-tool wait (default: 60000)
+  MERIDIAN_AGY_MAX_CONCURRENT       Maximum CLI processes (default: 4)
+  MERIDIAN_AGY_PLUGIN_PATHS         JSON array of Antigravity plugin modules
+  MERIDIAN_AGY_GRAMMAR_PYTHON       Local Python with Lark for custom grammars
+  MERIDIAN_AGY_PATH                 Official agy executable (default: agy)
+  MERIDIAN_AGY_ALLOW_TOOL_BRIDGE     Opt into Antigravity client-owned tools (1)
+  MERIDIAN_AGY_ADAPT_THINKING_BUDGETS Map numeric budgets to Gemini effort (1)
+  MERIDIAN_AGY_ALLOW_NATIVE_BROWSER  Opt into native browser actions (1)
+  MERIDIAN_AGY_BROWSER_MCP_PATH    Installed chrome-devtools-mcp 1.9.0 executable
+  MERIDIAN_AGY_ALLOW_NATIVE_SUBAGENTS Opt into native subagents (1)
   MERIDIAN_PASSTHROUGH              Enable passthrough mode (tools forwarded to client)
   MERIDIAN_IDLE_TIMEOUT_SECONDS     Idle timeout in seconds (default: 120)
-  MERIDIAN_PLUGIN_DIR               Plugin auto-discovery directory (default: ~/.config/meridian/plugins)
-  MERIDIAN_PLUGIN_CONFIG            Plugin manifest path (default: ~/.config/meridian/plugins.json)
+  MERIDIAN_IDLE_EXIT_SECONDS        Exit after this many seconds without a model request (opt-in)
+  MERIDIAN_PLUGIN_DIR               Plugin auto-discovery directory (default: <config dir>/plugins)
+  MERIDIAN_PLUGIN_CONFIG            Plugin manifest path (default: <config dir>/plugins.json)
+  MERIDIAN_ERROR_REPORTING_DSN      Report Meridian's own crashes to this GlitchTip/Sentry DSN (off when unset)
 
 See https://github.com/rynfar/meridian for full documentation.`)
   process.exit(0)
 }
 
 if (args[0] === "profile") {
-  const { profileAdd, profileAddOauthToken, profileList, profileRemove, profileSwitch, profileLogin, profileHelp } = await import("../src/proxy/profileCli")
+  const { profileAdd, profileAddOauthToken, profileList, profileRemove, profileRename, profileSwitch, profileLogin, profileHelp } = await import("../src/proxy/profileCli")
   const subcommand = args[1]
   const profileId = args[2]
   const headless = args.includes("--headless")
+  const chatgpt = args.includes("--chatgpt")
 
   if (subcommand === "add" && profileId) {
     const oauthFlagIdx = args.indexOf("--oauth-token", 3)
@@ -62,15 +89,32 @@ if (args[0] === "profile") {
       const tokenArg = args[oauthFlagIdx + 1]
       await profileAddOauthToken(profileId, tokenArg?.startsWith("--") ? undefined : tokenArg)
     } else {
-      await profileAdd(profileId, { headless })
+      await profileAdd(profileId, { headless, chatgpt })
     }
   }
-  else if (subcommand === "list" || subcommand === "ls") profileList()
-  else if (subcommand === "remove" && profileId) profileRemove(profileId)
+  else if (subcommand === "list" || subcommand === "ls") await profileList()
+  else if (subcommand === "remove" && profileId) await profileRemove(profileId)
+  else if (subcommand === "rename" && profileId && args[3]) await profileRename(profileId, args[3])
   else if (subcommand === "switch" && profileId) await profileSwitch(profileId)
-  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless })
+  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless, chatgpt })
   else profileHelp()
   process.exit(0)
+}
+
+if (args[0] === "setup" && args.includes("--antigravity")) {
+  const { parseAntigravitySetupArgs, setupAntigravityClient } = await import("../src/proxy/antigravitySetup")
+  try {
+    const result = setupAntigravityClient(parseAntigravitySetupArgs(args.slice(1)), import.meta.url)
+    console.log(`${result.changed.length ? "Configured" : "Already configured"} ${result.client} for Antigravity`)
+    console.log(`  Config: ${result.configPath}`)
+    console.log(`  Integration: ${result.integrationPath}`)
+    for (const backup of result.backups) console.log(`  Backup: ${backup}`)
+    console.log(`Restart ${result.client}, then select meridian-agy/${result.model}. Tool permissions remain in the client.`)
+    process.exit(0)
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  }
 }
 
 if (args[0] === "setup") {
@@ -80,7 +124,7 @@ if (args[0] === "setup") {
     MissingV2PluginError,
     pluginPathForGeneration,
     runSetup,
-    SUPPORTED_OPENCODE_V2_VERSION,
+    SUPPORTED_OPENCODE_V2_VERSIONS,
     UnparseableConfigError,
   } = await import("../src/proxy/setup")
 
@@ -112,12 +156,12 @@ if (args[0] === "setup") {
     process.exit(1)
   }
   if (forceV2 && detected.generation !== "v2") {
-    console.error("Could not find an OpenCode V2 beta. Install the pinned beta or pass --opencode-bin <path>.")
+    console.error("Could not find a qualified OpenCode V2 host. Install a supported version or pass --opencode-bin <path>.")
     process.exit(1)
   }
-  if (detected.generation === "v2" && detected.version !== SUPPORTED_OPENCODE_V2_VERSION) {
+  if (detected.generation === "v2" && !SUPPORTED_OPENCODE_V2_VERSIONS.has(detected.version ?? "")) {
     console.error(`OpenCode V2 ${detected.version ?? "unknown"} is not supported by this Meridian build.`)
-    console.error(`Install @opencode-ai/cli@${SUPPORTED_OPENCODE_V2_VERSION}, then re-run meridian setup --v2.`)
+    console.error(`Install a qualified OpenCode V2 host (${[...SUPPORTED_OPENCODE_V2_VERSIONS].join(", ")}), then re-run meridian setup --v2.`)
     process.exit(1)
   }
 
@@ -172,6 +216,16 @@ if (args[0] === "setup") {
   process.exit(0)
 }
 
+if (args[0] === "chatgpt-migrate") {
+  const { runMigrateCli } = await import("../src/proxy/chatgpt/migrate/cli")
+  process.exit(await runMigrateCli(args.slice(1)))
+}
+
+if (args[0] === "instance-import") {
+  const { runInstanceImportCli } = await import("../src/proxy/instanceImport/cli")
+  process.exit(await runInstanceImportCli(args.slice(1)))
+}
+
 if (args[0] === "refresh-token") {
   const { refreshOAuthToken } = await import("../src/proxy/tokenRefresh")
   const success = await refreshOAuthToken()
@@ -182,6 +236,19 @@ if (args[0] === "refresh-token") {
     console.error("Token refresh failed. If the problem persists, run: claude login")
     process.exit(1)
   }
+}
+
+if (args[0] === "test-error-report") {
+  const { installErrorReporter } = await import("../src/errorReporting")
+  if (!installErrorReporter({ version })) {
+    console.error("Error reporting is off. Set MERIDIAN_ERROR_REPORTING_DSN, or errorReportingDsn in settings.json.")
+    process.exit(1)
+  }
+  console.error("Crashing on purpose with a test error; the configured collector receives it within seconds.")
+  // Thrown at top level rather than from a timer held open by a pending
+  // top-level await: Bun does not exit on an uncaught timer exception while a
+  // top-level await is outstanding, so that form would hang instead of crash.
+  throw new Error("Meridian error-reporting test (meridian test-error-report)")
 }
 
 const exec = promisify(execCallback)
@@ -197,6 +264,32 @@ const host = process.env.MERIDIAN_HOST ?? process.env.CLAUDE_PROXY_HOST ?? "127.
 const idleTimeoutSeconds = parseInt(process.env.MERIDIAN_IDLE_TIMEOUT_SECONDS ?? process.env.CLAUDE_PROXY_IDLE_TIMEOUT_SECONDS ?? "120", 10)
 const pluginDir = process.env.MERIDIAN_PLUGIN_DIR
 const pluginConfigPath = process.env.MERIDIAN_PLUGIN_CONFIG
+
+/**
+ * Print the dashboard for the instance on `host:port`, if that is what is
+ * there. Returns the probe result so each caller can decide what a
+ * non-Meridian answer means — a bad `status` invocation, or a genuine
+ * port conflict.
+ */
+async function printRunningInstance() {
+  const { probeMeridian } = await import("../src/proxy/statusProbe")
+  const result = await probeMeridian(host, port, { apiKey: process.env.MERIDIAN_API_KEY })
+  if (result.kind === "meridian") {
+    const { renderCliDashboard } = await import("../src/telemetry/cliDashboard")
+    process.stdout.write(
+      renderCliDashboard({ host, port, ...result.snapshot }, { color: process.stdout.isTTY === true }),
+    )
+  }
+  return result
+}
+
+if (args[0] === "status") {
+  const result = await printRunningInstance()
+  if (result.kind === "meridian") process.exit(0)
+  const { formatStatusMessage } = await import("../src/proxy/statusProbe")
+  console.error(formatStatusMessage(result, host, port))
+  process.exit(1)
+}
 
 // Load profile configuration:
 //   1. MERIDIAN_PROFILES env var (JSON array) — takes precedence
@@ -237,42 +330,52 @@ export async function runCli(
     return execFile(claudePath, ["auth", "status"], { timeout: 5000 })
   }
 ) {
-  // Plugin check — warn if OpenCode config exists but meridian plugin is missing
-  try {
-    const { findOpencodeConfigPath, checkPluginConfigured, findPluginPath } = await import("../src/proxy/setup")
-    const configPath = findOpencodeConfigPath()
-    const { existsSync } = await import("fs")
-    if (existsSync(configPath) && !checkPluginConfigured(configPath)) {
-      const pluginPath = findPluginPath(import.meta.url)
-      console.error("\x1b[33m⚠ Meridian plugin not found in OpenCode config.\x1b[0m")
-      console.error("  Session tracking and subagent model selection won\'t work.")
-      console.error(`  Fix: meridian setup`)
-      console.error("")
-    }
-  } catch { /* non-fatal */ }
+  // First, so a failure anywhere in startup is reported too. Off unless an
+  // error-reporting DSN is configured; see src/errorReporting/index.ts.
+  const { installErrorReporter } = await import("../src/errorReporting")
+  installErrorReporter({ version })
 
-  // Pre-flight auth check — runs the resolved Claude binary's auth-status
-  // subcommand. Independent of whether `claude` is on PATH (#478).
-  try {
-    const { stdout } = await runAuthCheck()
-    const auth = JSON.parse(stdout)
-    if (!auth.loggedIn) {
-      console.error("\x1b[31m✗ Not logged in to Claude.\x1b[0m Run: claude login")
-      process.exit(1)
+  if (process.env.MERIDIAN_BACKEND !== "antigravity") {
+    // Plugin check — warn if OpenCode config exists but meridian plugin is missing
+    try {
+      const { findOpencodeConfigPath, checkPluginConfigured, findPluginPath } = await import("../src/proxy/setup")
+      const configPath = findOpencodeConfigPath()
+      const { existsSync } = await import("fs")
+      if (existsSync(configPath) && !checkPluginConfigured(configPath)) {
+        const pluginPath = findPluginPath(import.meta.url)
+        console.error("\x1b[33m⚠ Meridian plugin not found in OpenCode config.\x1b[0m")
+        console.error("  Session tracking and subagent model selection won\'t work.")
+        console.error(`  Fix: meridian setup`)
+        console.error("")
+      }
+    } catch { /* non-fatal */ }
+
+    // Pre-flight auth check — runs the resolved Claude binary's auth-status
+    // subcommand. Independent of whether `claude` is on PATH (#478).
+    try {
+      const { stdout } = await runAuthCheck()
+      const auth = JSON.parse(stdout)
+      if (!auth.loggedIn) {
+        console.error("\x1b[31m✗ Not logged in to Claude.\x1b[0m Run: claude login")
+        process.exit(1)
+      }
+      if (auth.subscriptionType !== "max") {
+        console.error(`\x1b[33m⚠ Claude subscription: ${auth.subscriptionType || "unknown"} (Max recommended)\x1b[0m`)
+      }
+    } catch {
+      console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
     }
-    if (auth.subscriptionType !== "max") {
-      console.error(`\x1b[33m⚠ Claude subscription: ${auth.subscriptionType || "unknown"} (Max recommended)\x1b[0m`)
+
+    // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
+    // This lets `meridian profile add` work without restarting the server.
+    if (!profiles) {
+      const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
+      enableDiskProfileDiscovery()
     }
-  } catch {
-    console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
   }
 
-  // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
-  // This lets `meridian profile add` work without restarting the server.
-  if (!profiles) {
-    const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
-    enableDiskProfileDiscovery()
-  }
+  const { enableOrganizationLookup } = await import("../src/proxy/organizationName")
+  enableOrganizationLookup()
 
   const proxy = await start({ port, host, idleTimeoutSeconds, pluginDir, pluginConfigPath, profiles, defaultProfile, version, installProcessErrorHandlers: true })
 
@@ -312,5 +415,24 @@ export async function runCli(
 }
 
 if (import.meta.main) {
+  // Ask before starting, because the answer changes what "port in use" means.
+  // The port that Meridian wants is usually held by Meridian, and being told
+  // so is not an error — it is the question `meridian status` answers, asked
+  // by accident. Checking here rather than from the EADDRINUSE handler keeps
+  // the dashboard as the whole output: by the time a bind fails, the
+  // pre-flight auth check and the plugin loader have already printed.
+  // Under systemd socket activation the port is intentionally held by the
+  // .socket unit's inherited fd — the proxy adopts it instead of binding, so
+  // the availability probe is meaningless (and self-deadlocking: probing the
+  // port is what triggers the activation in the first place). Skip it.
+  const { socketActivationFd } = await import("../src/proxy/socketActivation")
+  const { isPortAvailable } = await import("../src/proxy/statusProbe")
+  if (socketActivationFd() === undefined && !(await isPortAvailable(host, port))) {
+    const result = await printRunningInstance()
+    if (result.kind === "meridian") process.exit(0)
+    const { formatConflictMessage } = await import("../src/proxy/statusProbe")
+    console.error(formatConflictMessage(result, host, port))
+    process.exit(1)
+  }
   await runCli()
 }

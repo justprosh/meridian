@@ -1,0 +1,256 @@
+/**
+ * The request line names why a turn did not resume (#820).
+ *
+ * `lineage=` collapses every divergence without a cached session into the
+ * literal `new`, so the reporter's log held 6,514 of them and not one line
+ * saying why. The most expensive of those — the headerless tool-result bypass
+ * — is assigned before `classifyLineage` runs, so it emitted nothing at all;
+ * it was identified only by reading `server.ts`.
+ *
+ * Two reporters measured the cost first: ~280k cache-write tokens per turn
+ * against ~214 with a session key, and a drained Max window. Every request
+ * returns 200 throughout, which is why nothing in the proxy's own success
+ * metrics moved.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
+
+let mockMessages: unknown[] = []
+
+installSdkMock(() => ({
+  query: (params: any) => {
+    const options = params.options || {}
+    const sessionId = resolveMockSdkSessionId(options, "divergence-log-session")
+    return (async function* () {
+      for (const msg of mockMessages) yield { ...(msg as object), session_id: sessionId }
+    })()
+  },
+  createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
+  tool: () => ({}),
+}), "proxy-divergence-reason-log.test.ts")
+
+installLoggerMock(() => ({
+  claudeLog: () => {},
+  withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
+}))
+
+installMcpToolsMock(() => ({
+  createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
+}))
+
+const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { resetHeaderlessToolLoopWarningForTests } = await import("../proxy/session/cache")
+
+function createTestApp() {
+  const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+  return app
+}
+
+async function post(app: any, body: any, headers: Record<string, string> = {}) {
+  return app.fetch(new Request("http://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  }))
+}
+
+const TURN_1 = {
+  model: "claude-sonnet-4-5",
+  max_tokens: 1024,
+  stream: false,
+  messages: [{ role: "user", content: "read the config and summarise it" }],
+}
+
+/** Ends in user[tool_result] — the shape that triggers the bypass. */
+const TOOL_TURN = {
+  ...TURN_1,
+  messages: [
+    ...TURN_1.messages,
+    { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "read", input: { path: "a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "file contents" }] },
+  ],
+}
+
+describe("divergence reason on the request line", () => {
+  let errSpy: ReturnType<typeof spyOn>
+  let warnSpy: ReturnType<typeof spyOn>
+
+  beforeEach(async () => {
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    await clearSessionCache()
+    resetHeaderlessToolLoopWarningForTests()
+    errSpy = spyOn(console, "error")
+    warnSpy = spyOn(console, "warn")
+  })
+
+  afterEach(async () => {
+    errSpy.mockRestore()
+    warnSpy.mockRestore()
+    await clearSessionCache()
+  })
+
+  const requestLines = (): string[] => errSpy.mock.calls
+    .map((c: any) => String(c[0]))
+    .filter((l: string) => l.includes("[PROXY]") && l.includes("adapter=") && l.includes("msgCount="))
+
+  const lastRequestLine = (): string => {
+    const all = requestLines()
+    expect(all.length).toBeGreaterThan(0)
+    const last = all.at(-1)
+    if (last === undefined) throw new Error("no [PROXY] request line was logged")
+    return last
+  }
+
+  const warnings = (): string[] => warnSpy.mock.calls.map((c: any) => String(c[0]))
+    .filter((l: string) => l.includes("Client-driven tool loop with no session identity"))
+
+  const CLASSIFIER = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 64,
+    stream: false,
+    stop_sequences: ["</severity>"],
+    messages: [
+      { role: "user", content: "<transcript>User: deploy</transcript>" },
+      { role: "user", content: "Grade the action." },
+    ],
+    metadata: { user_id: JSON.stringify({ session_id: "aux-log-session" }) },
+  }
+
+  it("names an auto-mode classifier request as auxiliary", async () => {
+    const app = createTestApp()
+    await (await post(app, CLASSIFIER, { "user-agent": "claude-cli/2.1.286" })).json()
+    expect(lastRequestLine()).toContain("diverged=independent-request:auxiliary-request")
+  })
+
+  it("names an interactive session-title request and a first-turn subagent progress caption with trailing system context as auxiliary", async () => {
+    const app = createTestApp()
+    const titleRes = await post(app, {
+      model: "claude-sonnet-4-6",
+      max_tokens: 32000,
+      stream: true,
+      tools: [],
+      system: [
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        {
+          type: "text",
+          text: "You are naming a coding session so the user can pick it out of a long list of sessions. The title is a name for what the session is about, not a sentence describing the task.\n\nReturn JSON with a single \"title\" field. Capitalize the first letter of the title.",
+        },
+      ],
+      messages: [{
+        role: "user",
+        content: "<session>\nUse the Agent tool to launch two subagents\n</session>\n\nWrite the title in the predominant language of the session — a stray word or code token in another language doesn't change it, and neither does the English of these instructions.",
+      }],
+      metadata: { user_id: JSON.stringify({ session_id: "aux-interactive-session" }) },
+    }, {
+      "user-agent": "claude-cli/2.1.299",
+      "x-claude-code-session-id": "b2004dfc-6042-48d9-9c23-b4475f64b6f5",
+    })
+    await titleRes.text()
+    expect(lastRequestLine()).toContain("diverged=independent-request:auxiliary-request")
+
+    const captionRes = await post(app, {
+      model: "claude-sonnet-4-6",
+      max_tokens: 32000,
+      stream: true,
+      tools: [{ name: "Bash", description: "Run bash", input_schema: { type: "object", properties: {} } }],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Run `sleep 40` three times." },
+            {
+              type: "text",
+              text: "Describe your most recent action in 3-5 words using present tense (-ing). Name the file or function, not the branch. Do not use tools.\n\nGood: \"Reading runAgent.ts\"\nGood: \"Fixing null check in validate.ts\"\nGood: \"Running auth module tests\"\nGood: \"Adding retry logic to fetchUser\"\n\nBad (past tense): \"Analyzed the branch diff\"\nBad (too vague): \"Investigating the issue\"\nBad (too long): \"Reviewing full branch diff and AgentTool.tsx integration\"\nBad (branch name): \"Analyzed adam/background-summary branch diff\"",
+            },
+          ],
+        },
+        {
+          role: "system",
+          content: "The following deferred tools are now available via ToolSearch.\n\nToday's date is 2026-10-14.",
+        },
+      ],
+      metadata: { user_id: JSON.stringify({ session_id: "aux-interactive-session" }) },
+    }, {
+      "user-agent": "claude-cli/2.1.299",
+      "x-claude-code-agent-id": "a2656b86bfcb5c8cb",
+    })
+    await captionRes.text()
+    expect(lastRequestLine()).toContain("diverged=independent-request:auxiliary-request")
+  })
+
+  it("names it from the request-class header too", async () => {
+    const app = createTestApp()
+    const { stop_sequences: _omitted, ...unshaped } = CLASSIFIER
+    await (await post(app, unshaped, {
+      "user-agent": "claude-cli/2.1.286",
+      "x-claude-code-request-class": "auxiliary",
+    })).json()
+    expect(lastRequestLine()).toContain("diverged=independent-request:auxiliary-request")
+  })
+
+  // THE REPORTED CASE. pi sends no session header, and every agentic turn ends
+  // in a tool_result, so this fires on every round of every conversation.
+  it("names the headerless tool-result bypass", async () => {
+    const app = createTestApp()
+    expect((await post(app, TOOL_TURN, { "x-meridian-agent": "pi" })).status).toBe(200)
+    expect(lastRequestLine()).toContain("diverged=independent-request:headerless-tool-result")
+  })
+
+  it("says once per process that the conversation is not resuming", async () => {
+    const app = createTestApp()
+    await post(app, TOOL_TURN, { "x-meridian-agent": "pi" })
+    expect(warnings()).toHaveLength(1)
+    expect(warnings()[0]).toContain("adapter=pi")
+    expect(warnings()[0]).toContain("does not resume")
+
+    // A per-round line would bury itself: the reporter's log had 6,019 of these
+    // in a single conversation.
+    await post(app, TOOL_TURN, { "x-meridian-agent": "pi" })
+    await post(app, TOOL_TURN, { "x-meridian-agent": "pi" })
+    expect(warnings()).toHaveLength(1)
+    expect(requestLines().filter(l => l.includes("headerless-tool-result"))).toHaveLength(3)
+  })
+
+  // connor-grady's distinction: "the key never resolved" and "the key resolved
+  // and the history did not match" are different bugs with the same symptom.
+  it("separates a key that never resolved from the bypass", async () => {
+    const app = createTestApp()
+    await post(app, TURN_1, { "x-meridian-agent": "pi", "x-session-affinity": "pi-run-1" })
+    expect(lastRequestLine()).toContain("diverged=not-found")
+    expect(lastRequestLine()).not.toContain("independent-request")
+    expect(warnings()).toHaveLength(0)
+  })
+
+  it("says nothing at all once the turn actually resumes", async () => {
+    const app = createTestApp()
+    const headers = { "x-meridian-agent": "pi", "x-session-affinity": "pi-run-2" }
+    await post(app, TURN_1, headers)
+    await post(app, TOOL_TURN, headers)
+    expect(lastRequestLine()).toContain("lineage=continuation")
+    expect(lastRequestLine()).not.toContain("diverged=")
+    expect(warnings()).toHaveLength(0)
+  })
+
+  it("names a headerless fork source, which is a different bypass", async () => {
+    const app = createTestApp()
+    await post(app, TURN_1, { "x-meridian-source": "fork-memory-extract" })
+    expect(lastRequestLine()).toContain("diverged=independent-request:fork-source")
+    // The fork guard is deliberate and correct; the tool-loop advice must not
+    // fire for it.
+    expect(warnings()).toHaveLength(0)
+  })
+
+  // REGRESSION GUARD. `lineage=<value> session=<value>` is matched as one unit
+  // by e2e-passthrough-turns.mjs and by field log analysis. The reason is a
+  // separate field precisely so that pairing survives.
+  it("leaves lineage= adjacent to session=", async () => {
+    const app = createTestApp()
+    await post(app, TOOL_TURN, { "x-meridian-agent": "pi" })
+    expect(lastRequestLine()).toMatch(/lineage=\S+ session=\S+/)
+    expect(lastRequestLine()).toContain("lineage=new session=")
+  })
+})

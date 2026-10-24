@@ -11,6 +11,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   assistantMessage,
   messageStart,
@@ -28,7 +31,7 @@ let capturedQueryParams: any = null
 let queryCallCount = 0
 let firstCallerSelectedSessionId: string | undefined
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     queryCallCount++
@@ -48,14 +51,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     instance: {},
   }),
   tool: () => ({}),
-}))
+}), "proxy-session-resume.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -120,11 +123,11 @@ function buildStaleSessionFixture() {
 // ============================================================
 
 describe("Session resume: session ID tracking", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [
       assistantMessage([{ type: "text", text: "Hello" }]),
     ]
-    clearSessionCache()
+    await clearSessionCache()
     capturedQueryParams = null
     queryCallCount = 0
     firstCallerSelectedSessionId = undefined
@@ -277,11 +280,11 @@ describe("Session resume: session ID tracking", () => {
 // ============================================================
 
 describe("Session resume: fingerprint fallback", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [
       assistantMessage([{ type: "text", text: "Hello" }]),
     ]
-    clearSessionCache()
+    await clearSessionCache()
     capturedQueryParams = null
     queryCallCount = 0
     firstCallerSelectedSessionId = undefined
@@ -380,11 +383,11 @@ describe("Session resume: fingerprint fallback", () => {
 // ============================================================
 
 describe("Session resume: only send last user message on resume", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [
       assistantMessage([{ type: "text", text: "Hello" }]),
     ]
-    clearSessionCache()
+    await clearSessionCache()
     capturedQueryParams = null
     queryCallCount = 0
     firstCallerSelectedSessionId = undefined
@@ -482,9 +485,9 @@ describe("Session resume: only send last user message on resume", () => {
 })
 
 describe("Session resume: stale cross-node history", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Recovered" }])]
-    clearSessionCache()
+    await clearSessionCache()
     capturedQueryParams = null
     queryCallCount = 0
     firstCallerSelectedSessionId = undefined

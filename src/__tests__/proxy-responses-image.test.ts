@@ -7,6 +7,9 @@
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 // A real, valid 1x1 red PNG (69 bytes).
 const RED_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
@@ -17,7 +20,7 @@ let capturedPrompt: any = null
 
 import { resolveMockSdkSessionId } from "./helpers"
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedPrompt = opts.prompt
     return (async function* () {
@@ -39,14 +42,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
   tool: () => ({}),
-}))
+}), "proxy-responses-image.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -90,8 +93,8 @@ function expectImageDelivered(content: any[]) {
 }
 
 describe("/v1/responses image input reaches the SDK", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedPrompt = null
   })
 
@@ -108,5 +111,41 @@ describe("/v1/responses image input reaches the SDK", () => {
     expect(res.status).toBe(200)
     await res.text() // drain SSE so the route fully runs
     expectImageDelivered(await sdkUserContent())
+  })
+})
+
+describe("/v1/responses PDF input reaches the SDK", () => {
+  beforeEach(async () => {
+    await clearSessionCache()
+    capturedPrompt = null
+  })
+
+  it("delivers an input_file PDF as a document block", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          input: [{
+            type: "message",
+            role: "user",
+            content: [
+              { type: "input_text", text: "Summarize this PDF." },
+              { type: "input_file", file_data: "data:application/pdf;base64,JVBERi0xLjQK", filename: "report.pdf" },
+            ],
+          }],
+          stream: false,
+        }),
+      })
+    )
+    expect(res.status).toBe(200)
+    const content = await sdkUserContent()
+    expect(content.find((b) => b?.type === "document")).toEqual({
+      type: "document",
+      title: "report.pdf",
+      source: { type: "base64", media_type: "application/pdf", data: "JVBERi0xLjQK" },
+    })
   })
 })

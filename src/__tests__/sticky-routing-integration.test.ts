@@ -4,12 +4,15 @@
  * SDK subprocess env (CLAUDE_CONFIG_DIR carries the profile's config dir).
  */
 import { describe, it, expect, mock, beforeAll, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { assistantMessage, withMockSdkSessionId } from "./helpers"
 
 let mockMessages: any[] = []
 let capturedEnvs: Array<Record<string, string | undefined>> = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedEnvs.push(params.options?.env ?? {})
     return (async function* () {
@@ -20,19 +23,21 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
   tool: () => ({}),
-}))
+}), "sticky-routing-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: { tool: () => {}, registerTool: () => ({}) } }),
 }))
 
 const { createProxyServer } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
+const { pickStickyProfile } = await import("../proxy/routing")
+const { claudeCodeSessionKey } = await import("../proxy/adapters/claudecode")
 
 const PROFILES = [
   { id: "personal", type: "claude-max" as const, claudeConfigDir: "/cfg/personal" },
@@ -60,6 +65,26 @@ async function post(app: any, session: string, extraHeaders: Record<string, stri
       max_tokens: 64,
       stream: false,
       messages: [{ role: "user", content: `hello from ${session}` }],
+    }),
+  }))
+  await r.json()
+  return servedProfile(capturedEnvs[capturedEnvs.length - 1]!)
+}
+
+async function postClaudeCode(app: any, session: string, agentId?: string) {
+  const r = await app.fetch(new Request("http://localhost/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "user-agent": "claude-cli/2.1.287",
+      ...(agentId ? { "x-claude-code-agent-id": agentId } : {}),
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      max_tokens: 64,
+      stream: false,
+      messages: [{ role: "user", content: `hello from ${session}${agentId ? ` agent ${agentId}` : ""}` }],
+      metadata: { user_id: JSON.stringify({ session_id: session }) },
     }),
   }))
   await r.json()
@@ -123,6 +148,24 @@ describe("Integration: sticky profile routing (#383)", () => {
     process.env.MERIDIAN_ROUTING = "sticky"
     const main = await post(app, "sess-a")
     const subagent = await post(app, "sess-a", { "x-meridian-source": "subagent-scout" })
+    expect(subagent).toBe(main)
+  })
+
+  it("sticky: a Claude Code subagent keyed apart from its parent shares the parent's arm", async () => {
+    process.env.MERIDIAN_ROUTING = "sticky"
+    const ids = PROFILES.map(p => p.id)
+    const session = "cc-sticky-root"
+    const metadata = { metadata: { user_id: JSON.stringify({ session_id: session }) } }
+    // An agent id whose OWN key hashes to the other arm, so this cannot pass by luck.
+    const agentId = Array.from({ length: 64 }, (_, i) => `agent${i}`).find(id => {
+      const own = claudeCodeSessionKey(id, metadata)
+      return own !== undefined && pickStickyProfile(own, ids) !== pickStickyProfile(session, ids)
+    })
+    expect(agentId).toBeDefined()
+
+    const main = await postClaudeCode(app, session)
+    const subagent = await postClaudeCode(app, session, agentId)
+    expect(main).toBe(pickStickyProfile(session, ids)!)
     expect(subagent).toBe(main)
   })
 })

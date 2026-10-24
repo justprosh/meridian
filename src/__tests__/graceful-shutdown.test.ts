@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
@@ -31,7 +34,7 @@ function deferredAttempt(): AttemptControl & { wait: Promise<void>; markStarted:
   return { release, started, wait, markStarted }
 }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     queryCalls++
     const control = deferredAttempt()
@@ -52,14 +55,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "graceful-shutdown.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -112,12 +115,12 @@ async function waitForControl(index: number, timeoutMs = 3000): Promise<AttemptC
 describe("graceful shutdown", () => {
   let isolatedSessionDir = ""
 
-  beforeEach(() => {
+  beforeEach(async () => {
     isolatedSessionDir = mkdtempSync(join(tmpdir(), "meridian-shutdown-test-"))
     setSessionStoreDir(isolatedSessionDir)
     queryCalls = 0
     controls = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(async () => {
@@ -212,8 +215,12 @@ describe("graceful shutdown", () => {
 
     const response = await responseP
     await response.text()
-    for (let index = 0; index < 100 && server.getInFlightCount!() !== 0; index++) {
-      await Bun.sleep(1)
+    // Streaming cancellation returns before asynchronous teardown finishes.
+    // CI can take longer than 100 one-millisecond polls; this test checks
+    // eventual cleanup and revoked publication, not a 100 ms latency contract.
+    const deadline = Date.now() + 2_000
+    while (server.getInFlightCount!() !== 0 && Date.now() < deadline) {
+      await Bun.sleep(10)
     }
     expect(server.getInFlightCount!()).toBe(0)
     expect(lookupSharedSession("forced-shutdown")).toBeUndefined()

@@ -23,19 +23,99 @@
  */
 
 import { createHash } from "node:crypto"
+import type { RouteKind } from "../telemetry/types"
 
-export type RoutingMode = "active" | "sticky" | "priority"
+export type RoutingMode = "active" | "sticky" | "priority" | "active+priority"
+
+export const ACTIVE_PRIORITY = "active+priority" as const
+
+/**
+ * Every selectable mode, in the order the settings UI offers them. Single
+ * source of truth: the mode list was previously written out again inside the
+ * settings route's validator and a third time in the page's `<select>`, so a
+ * new mode parsed correctly and still could not be selected.
+ */
+export const ROUTING_MODES: readonly RoutingMode[] = ["active", "sticky", "priority", ACTIVE_PRIORITY]
+
+export type PriorityFailbackPolicy = "new-conversation" | "next-user-turn"
+
+export type PriorityAssignment = {
+  readonly profileId: string
+  readonly requestId: string | undefined
+}
+
+export type PriorityPromotionInput = {
+  readonly policy: PriorityFailbackPolicy
+  readonly assignment: PriorityAssignment
+  readonly requestId: string | undefined
+  readonly requestKind: string | undefined
+}
 
 /**
  * Parse a routing mode string (from settings or MERIDIAN_ROUTING).
  * Unknown values fall back to "active" — a typo must never change
  * routing behavior into something surprising.
+ *
+ * The three original branches stay exact-match, so every value that falls back
+ * to "active" today still does. Only the new mode accepts separator variants
+ * ("active-priority", "active_priority", "active priority"): its canonical
+ * spelling carries a `+`, which a query string decodes to a space, and being
+ * strict there would turn one plausible transport detail into silently routing
+ * all traffic to the active profile with no failover.
  */
 export function getRoutingMode(raw: string | undefined): RoutingMode {
   const lower = raw?.toLowerCase()
   if (lower === "sticky") return "sticky"
   if (lower === "priority") return "priority"
+  if (lower && lower.replace(/[\s+_-]/g, "") === "activepriority") return ACTIVE_PRIORITY
   return "active"
+}
+
+export function isPoolRouting(mode: RoutingMode): boolean {
+  return mode === "priority" || mode === ACTIVE_PRIORITY
+}
+
+export function getPriorityFailbackPolicy(raw: string | undefined): PriorityFailbackPolicy {
+  return raw?.toLowerCase() === "next-user-turn" ? "next-user-turn" : "new-conversation"
+}
+
+export function shouldPromotePriorityAssignment(input: PriorityPromotionInput): boolean {
+  // Request ID equality, not kind alone, keeps same-turn tool continuations on fallback.
+  return input.policy === "next-user-turn"
+    && input.requestKind === "human"
+    && input.requestId !== undefined
+    && input.requestId !== input.assignment.requestId
+}
+
+/**
+ * Classify how the serving profile was chosen, from values the caller already
+ * holds. Runs per request, so it may never do I/O or read settings of its own.
+ *
+ * Undefined when the routing mode isn't known (the outer catch records before
+ * routing resolves): the pin and the hop flag still prove
+ * `pinned`/`priority-hop`, but "active" would be a guess, and a guess on an
+ * attribution dashboard is worse than a blank.
+ */
+export function classifyRouteKind(input: {
+  pinnedProfileHeader?: string | undefined
+  /**
+   * One internal hop of a pool dispatch. A flag rather than a header because
+   * the failover re-enters the handler directly, so there is no second HTTP
+   * request for a header to travel on.
+   */
+  priorityHop?: boolean | undefined
+  routingMode?: RoutingMode | undefined
+}): RouteKind | undefined {
+  // Checked before the pin, even though every hop carries one: a hop IS pinned,
+  // so testing the header first would report the mechanism instead of the
+  // reason and make every failover attempt read as a deliberate pin.
+  if (input.priorityHop) return input.routingMode === ACTIVE_PRIORITY ? "active+priority-hop" : "priority-hop"
+  if (input.pinnedProfileHeader) return "pinned"
+  if (input.routingMode === "sticky") return "sticky"
+  if (input.routingMode === "priority") return "priority"
+  if (input.routingMode === ACTIVE_PRIORITY) return ACTIVE_PRIORITY
+  if (input.routingMode === "active") return "active"
+  return undefined
 }
 
 /**
@@ -120,11 +200,53 @@ export function choosePriorityProfile(
   order: readonly string[],
   isExhausted: (id: string) => boolean,
 ): { id: string; allExhausted: boolean } | undefined {
-  if (order.length === 0) return undefined
+  const preferred = order[0]
+  if (preferred === undefined) return undefined
   for (const id of order) {
     if (!isExhausted(id)) return { id, allExhausted: false }
   }
-  return { id: order[0]!, allExhausted: true }
+  return { id: preferred, allExhausted: true }
+}
+
+/**
+ * Candidate order for `active+priority`: the active profile first, then the
+ * priority order behind it as fallbacks.
+ *
+ * The active profile OUTRANKS an existing session assignment, which is the one
+ * place this mode deliberately disagrees with `priority`. In `priority` the
+ * pool head moves on its own (a cooldown expires) and affinity protects a
+ * conversation from being dragged along - worth protecting, since a live
+ * request here showed a 441k-token cache read at a 99.8% hit rate, all of which
+ * is thrown away by a move. In `active+priority` the head only ever moves
+ * because a human or a supervisor moved it, and moving running conversations is
+ * precisely what they moved it FOR. Honouring the old assignment would mean
+ * switching the active profile changed nothing for any conversation already
+ * under way, which is every conversation that matters and leaves the mode
+ * indistinguishable from plain `priority`.
+ *
+ * Affinity still applies BELOW the active profile: while the active profile is
+ * refusing, a session returns to the same fallback it used last time rather
+ * than being re-picked each turn, so an outage costs one cold cache instead of
+ * one per turn.
+ */
+export function chooseActivePriorityCandidates(
+  activeId: string,
+  order: readonly string[],
+  isExhausted: (id: string) => boolean,
+  assigned?: string,
+): string[] {
+  // Deduped because a repeated id would make the dispatcher attempt the same
+  // account twice, breaking its "each profile at most once per request" rule.
+  const pool = [...new Set(order.includes(activeId) ? order : [activeId, ...order])]
+  let first: string
+  if (!isExhausted(activeId)) {
+    first = activeId
+  } else if (assigned && assigned !== activeId && pool.includes(assigned) && !isExhausted(assigned)) {
+    first = assigned
+  } else {
+    first = pool.find(id => !isExhausted(id)) ?? activeId
+  }
+  return [first, ...pool.filter(id => id !== first && !isExhausted(id))]
 }
 
 export interface ExhaustionEntry {
@@ -160,6 +282,10 @@ export class ProfileExhaustion {
     return true
   }
 
+  forget(id: string): void {
+    this.marks.delete(id)
+  }
+
   /** Live entries only — expired marks are dropped on read. */
   snapshot(): ExhaustionEntry[] {
     const out: ExhaustionEntry[] = []
@@ -183,12 +309,12 @@ export class ProfileExhaustion {
  * After a restart the next request re-establishes the assignment.
  */
 export class AssignmentStore {
-  private readonly entries = new Map<string, string>()
+  private readonly entries = new Map<string, PriorityAssignment>()
 
   constructor(private readonly max: number) {}
 
   /** Read an assignment, marking it most-recently-used. */
-  get(key: string): string | undefined {
+  get(key: string): PriorityAssignment | undefined {
     const value = this.entries.get(key)
     if (value === undefined) return undefined
     this.entries.delete(key)
@@ -197,13 +323,23 @@ export class AssignmentStore {
   }
 
   /** Write an assignment, marking it most-recently-used and evicting if over capacity. */
-  set(key: string, value: string): void {
+  set(key: string, value: PriorityAssignment): void {
     this.entries.delete(key)
     this.entries.set(key, value)
     if (this.entries.size > this.max) {
       const oldest = this.entries.keys().next().value
       if (oldest !== undefined) this.entries.delete(oldest)
     }
+  }
+
+  compareAndSet(
+    key: string,
+    expected: PriorityAssignment | undefined,
+    value: PriorityAssignment,
+  ): boolean {
+    if (this.entries.get(key) !== expected) return false
+    this.set(key, value)
+    return true
   }
 
   get size(): number {
@@ -280,11 +416,28 @@ export function resolveCooldownUntil(
   now: number,
   defaultMs: number,
 ): number {
+  return findCooldownReset(windows, now) ?? now + defaultMs
+}
+
+/**
+ * The capped reset of the longest genuinely exhausted window, or null when
+ * nothing here proves a window is spent.
+ *
+ * Split out of `resolveCooldownUntil` so a caller can tell "the account told us
+ * when it frees up" from "we invented a conservative default" — a distinction
+ * `resolveCooldownUntil` erases by design. `Retry-After` needs it (#901): a
+ * real reset is worth sending, a fabricated one dressed as an observation is
+ * not.
+ */
+export function findCooldownReset(
+  windows: readonly CooldownWindow[],
+  now: number,
+): number | null {
   for (const type of COOLDOWN_WINDOWS) {
     const match = windows.find(w => w.type === type && w.exhausted && (w.resetsAt ?? 0) > now)
     if (match?.resetsAt) {
       return Math.min(match.resetsAt, now + cooldownCapMs(type))
     }
   }
-  return now + defaultMs
+  return null
 }

@@ -1,10 +1,11 @@
 import { describe, expect, it, mock, beforeEach, afterEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
 // Provide a minimal SDK mock so createPassthroughMcpServer can register tools
 // without hitting the real SDK (which may not be available in CI or may have
 // been mocked differently by a sibling test file).
 let registeredTools: Array<{ name: string; config: any }> = []
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   createSdkMcpServer: (options: {
     tools?: Array<{
       name: string
@@ -29,7 +30,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
       instance: { tool: () => {}, registerTool: () => ({}) },
     }
   },
-}))
+}), "passthrough-tool-sort.test.ts")
 
 import { createPassthroughMcpServer, getAutoDeferThreshold } from "../proxy/passthroughTools"
 
@@ -104,6 +105,8 @@ describe("auto-defer: threshold-based tool deferral", () => {
     const tools = makeTools(15) // exactly at default threshold
     const result = createPassthroughMcpServer(tools, CORE_TOOLS)
     expect(result.hasDeferredTools).toBe(false)
+    result.createServer()
+    expect(registeredTools).toHaveLength(15)
     // No tool should have alwaysLoad
     for (const t of registeredTools) {
       expect(t.config._meta).toBeUndefined()
@@ -118,6 +121,7 @@ describe("auto-defer: threshold-based tool deferral", () => {
     ]
     const result = createPassthroughMcpServer(tools, CORE_TOOLS)
     expect(result.hasDeferredTools).toBe(true)
+    result.createServer()
 
     // Core tools should have alwaysLoad
     for (const name of CORE_TOOLS) {
@@ -163,7 +167,7 @@ describe("auto-defer: threshold-based tool deferral", () => {
       { name: "WRITE", description: "Write a file" },
       ...makeTools(20),
     ]
-    createPassthroughMcpServer(tools, CORE_TOOLS)
+    createPassthroughMcpServer(tools, CORE_TOOLS).createServer()
 
     const readReg = registeredTools.find(t => t.name === "Read")
     const writeReg = registeredTools.find(t => t.name === "WRITE")
@@ -178,6 +182,7 @@ describe("auto-defer: threshold-based tool deferral", () => {
     ]
     const result = createPassthroughMcpServer(tools, CORE_TOOLS)
     expect(result.hasDeferredTools).toBe(true)
+    result.createServer()
 
     const readReg = registeredTools.find(t => t.name === "read")
     // defer_loading=true should override core status — NOT alwaysLoad

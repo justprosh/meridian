@@ -12,6 +12,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   textBlockStart,
@@ -29,7 +32,7 @@ import {
 
 let mockMessages: any[] = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     return (async function* () {
       for (const msg of mockMessages) {
@@ -39,14 +42,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-streaming-message.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -83,9 +86,9 @@ async function postStream(app: any, content: string) {
 describe("Streaming: single message per response", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -192,6 +195,54 @@ describe("Streaming: single message per response", () => {
     )
     expect(textDeltas.length).toBe(1)
     expect((textDeltas[0]?.data as any).delta.text).toBe("Hello!")
+  })
+
+  it("opens and closes an SSE envelope when the SDK only yields a complete assistant message", async () => {
+    // Claude Code falls back to a non-streaming upstream request after an
+    // early streaming refusal. The SDK still yields the completed assistant
+    // turn, but no stream_event messages (#1098).
+    mockMessages = [assistantMessage([{ type: "text", text: "MOCK_FALLBACK_TEXT" }])]
+
+    const events = await postStream(createTestApp(), "hello")
+    expect(events.filter(event => event.event === "error")).toHaveLength(0)
+    expect(events.filter(event => event.event === "message_start")).toHaveLength(1)
+    expect(events.filter(event => event.event === "message_stop")).toHaveLength(1)
+    expect(events.filter(event => event.event === "content_block_delta")
+      .map(event => (event.data.delta as { text?: string }).text).join(""))
+      .toBe("MOCK_FALLBACK_TEXT")
+    expect(events.filter(event => event.event === "message_delta")
+      .map(event => (event.data.delta as { stop_reason?: string }).stop_reason))
+      .toEqual(["end_turn"])
+  })
+
+  it("keeps all visible text from assistant-only internal turns", async () => {
+    mockMessages = [
+      assistantMessage([{ type: "text", text: "Checking. " }]),
+      assistantMessage([{ type: "text", text: "Done." }]),
+    ]
+
+    const events = await postStream(createTestApp(), "check")
+    expect(events.filter(event => event.event === "message_start")).toHaveLength(1)
+    expect(events.filter(event => event.event === "message_stop")).toHaveLength(1)
+    expect(events.filter(event => event.event === "content_block_delta")
+      .map(event => (event.data.delta as { text?: string }).text).join(""))
+      .toBe("Checking. Done.")
+  })
+
+  it("preserves thinking blocks when the client supports thinking", async () => {
+    mockMessages = [assistantMessage([
+      { type: "thinking", thinking: "Consider the input.", signature: "signed" },
+      { type: "text", text: "Ready." },
+    ])]
+
+    const events = await postStream(createTestApp(), "think")
+    const starts = events.filter(event => event.event === "content_block_start")
+    expect(starts.map(event => (event.data.content_block as { type: string }).type))
+      .toEqual(["thinking", "text"])
+    expect(events.filter(event => event.event === "content_block_delta")
+      .map(event => (event.data.delta as { type: string }).type))
+      .toEqual(["thinking_delta", "signature_delta", "text_delta"])
+    expect(events.filter(event => event.event === "message_stop")).toHaveLength(1)
   })
 
   it("should remap block indices to be monotonic across turns", async () => {
@@ -305,9 +356,9 @@ describe("Streaming: single message per response", () => {
 describe("Default streaming behavior", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -369,5 +420,18 @@ describe("Default streaming behavior", () => {
     const contentType = response.headers.get("content-type") || ""
 
     expect(contentType).toContain("text/event-stream")
+    // Drain the body and pin the terminal envelope. Returning without
+    // consuming the response leaves the streaming producer (SDK query,
+    // semaphore, session bookkeeping) running past this file's teardown;
+    // sdkMock resolves implementations at call time, so the orphaned
+    // producer then invokes a LATER file's mock and pollutes that file's
+    // captured query list (observed as proxy-block-continuations' first
+    // captured query carrying resume=undefined). Fully settling the
+    // stream while this file's mock is active removes the leak.
+    const body = await response.text()
+    const events = parseSSE(body)
+    expect(events.filter((event) => event.event === "message_start")).toHaveLength(1)
+    expect(events.filter((event) => event.event === "message_stop")).toHaveLength(1)
+    expect(events.filter((event) => event.event === "error")).toHaveLength(0)
   })
 })

@@ -7,16 +7,56 @@
  * transcript (self-play / confabulated tool output). Resume deltas stay bare.
  */
 
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, spyOn, beforeEach, afterEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { estimateTokens, replayBudgetFor } from "../proxy/replayBudget"
+import { resetExtendedContextUnavailable } from "../proxy/models"
+import * as models from "../proxy/models"
 let capturedPrompts: any[] = []
+let overflowFailures = 0
+let overflowMessage = "Claude Code returned an error result: Prompt is too long"
+let capturedPromptTexts: string[] = []
+let capturedOptions: any[] = []
+
+// Match the fixed Max/model fixtures in proxy-subagent-model-selection and
+// proxy-extra-usage-fallback. Auth on this machine is not part of replay, and
+// another file's process-global model mock can otherwise silently select sonnet.
+// Scope the overrides to each test and restore them, rather than leaking a
+// second mock.module into whichever suite Bun loads next.
+let modelOverrides: Array<{ mockRestore(): void }> = []
+beforeEach(() => {
+  modelOverrides = [
+    spyOn(models, "mapModelToClaudeModel").mockImplementation(model => model.includes("opus") ? "opus[1m]" : "sonnet"),
+    spyOn(models, "getClaudeAuthStatusAsync").mockResolvedValue({ loggedIn: true, subscriptionType: "max" }),
+    spyOn(models, "resolveClaudeExecutableAsync").mockResolvedValue("claude"),
+    spyOn(models, "hasExtendedContext").mockImplementation(model => model.endsWith("[1m]")),
+    spyOn(models, "stripExtendedContext").mockImplementation(model => model.replace("[1m]", "") as models.ClaudeModel),
+  ]
+})
+afterEach(() => {
+  for (const override of modelOverrides) override.mockRestore()
+})
 
 import { resolveMockSdkSessionId } from "./helpers"
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedPrompts.push(opts.prompt)
+    capturedOptions.push(opts.options)
     return (async function* () {
+      if (typeof opts.prompt === "string") capturedPromptTexts.push(opts.prompt)
+      else {
+        const inputs = []
+        for await (const input of opts.prompt) inputs.push(input)
+        capturedPromptTexts.push(JSON.stringify(inputs))
+      }
+      if (overflowFailures > 0) {
+        overflowFailures--
+        throw new Error(overflowMessage)
+      }
       yield {
         type: "assistant",
         uuid: "uuid-1",
@@ -35,33 +75,230 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-replay-envelope.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { storeSession } = await import("../proxy/session/cache")
+const { diagnosticLog } = await import("../telemetry")
 
-function post(app: any, messages: any[], headers: Record<string, string> = {}) {
+// Sonnet 4.6 keeps the 200k window these budgets exercise; the canonical
+// Sonnet 5+ pin is 1M (#1212).
+function post(app: any, messages: any[], headers: Record<string, string> = {}, stream = false, model = "claude-sonnet-4-6") {
   return app.fetch(
     new Request("http://localhost/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
-      body: JSON.stringify({ model: "sonnet", stream: false, messages }),
+      body: JSON.stringify({ model, stream, messages }),
     })
   )
 }
 
+describe("bounded fresh replay", () => {
+  const envKeys = ["ANTHROPIC_DEFAULT_SONNET_MODEL", "MERIDIAN_DEFAULT_SONNET_MODEL", "MERIDIAN_REPLAY_BUDGET_TOKENS"]
+  let savedEnv: Array<string | undefined> = []
+  beforeEach(async () => {
+    savedEnv = envKeys.map(key => process.env[key])
+    for (const key of envKeys) delete process.env[key]
+    await clearSessionCache()
+    capturedPrompts = []
+    overflowFailures = 0
+    overflowMessage = "Claude Code returned an error result: Prompt is too long"
+    capturedPromptTexts = []
+    capturedOptions = []
+    resetExtendedContextUnavailable()
+  })
+  afterEach(() => {
+    envKeys.forEach((key, index) => {
+      if (savedEnv[index] === undefined) delete process.env[key]
+      else process.env[key] = savedEnv[index]
+    })
+    overflowFailures = 0
+    resetExtendedContextUnavailable()
+  })
+
+  const history = () => [
+    { role: "user", content: "objective" },
+    ...Array.from({ length: 6 }, (_, i) => [
+      { role: "user", content: `question ${i}` },
+      { role: "assistant", content: "я".repeat(60_000) },
+    ]).flat(),
+    { role: "user", content: "live question" },
+  ]
+
+  it("trims a long fresh history before the SDK call", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, history())
+    expect(res.status).toBe(200)
+    expect(capturedPrompts).toHaveLength(1)
+    expect(capturedPrompts[0]).toContain("were omitted from this replay")
+    expect(capturedPrompts[0]).toContain("objective")
+    expect(capturedPrompts[0]).toEndWith("live question")
+  })
+
+  it("does not trim plain sonnet at 200k when it resolves to Sonnet 5+ (#1212)", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, history(), {}, false, "sonnet")
+    expect(res.status).toBe(200)
+    expect(capturedOptions[0].model).toBe("sonnet")
+    expect(capturedPrompts[0]).not.toContain("were omitted from this replay")
+  })
+
+  for (const streaming of [false, true]) {
+    for (const fixture of [
+      { request: "sonnet", inherited: "claude-sonnet-4-6", trimmed: true, resolved: "claude-sonnet-4-6" },
+      { request: "claude-sonnet-5-5", inherited: "claude-sonnet-4-6", trimmed: false, resolved: "claude-sonnet-5-5" },
+      { request: "claude-sonnet-4-6", inherited: "claude-sonnet-5-5", trimmed: true, resolved: "claude-sonnet-4-6" },
+    ]) {
+      it(`budgets from the Sonnet pin the SDK actually serves for ${JSON.stringify(fixture)} (stream=${streaming})`, async () => {
+        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = fixture.inherited
+        const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+        const response = await post(app, history(), {}, streaming, fixture.request)
+        await response.text()
+        expect(response.status).toBe(200)
+        expect(capturedOptions[0].env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(fixture.resolved)
+        expect(String(capturedPrompts[0]).includes("were omitted from this replay")).toBe(fixture.trimmed)
+      })
+    }
+  }
+
+  for (const streaming of [false, true]) {
+    for (const error of ["rate limit exceeded", "extra usage required for 1m"]) {
+      it(`rebudgets fresh replay after ${error} (stream=${streaming})`, async () => {
+        overflowFailures = 1
+        overflowMessage = error
+        const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+        const res = await post(app, history(), {}, streaming, "opus[1m]")
+        await res.text()
+        expect(res.status).toBe(200)
+        expect(capturedPrompts).toHaveLength(2)
+        expect(capturedOptions[0].model).toBe("opus[1m]")
+        expect(capturedOptions[1].model).toBe("opus")
+        expect(estimateTokens(capturedPromptTexts[0])).toBeGreaterThan(replayBudgetFor("opus"))
+        expect(estimateTokens(capturedPromptTexts[1])).toBeLessThanOrEqual(replayBudgetFor("opus"))
+        expect(capturedPromptTexts[1]).toContain("were omitted from this replay")
+      })
+    }
+
+    it(`does not retry an overflowing indivisible live tail (stream=${streaming})`, async () => {
+      overflowFailures = 3
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      // Derive the tail from the budget instead of a literal: the estimator bills
+      // non-ASCII at 1.5 chars per token, so a fixed 200_000 stopped overflowing
+      // the moment the budget rose and the case quietly tested nothing.
+      const indivisible = "я".repeat(Math.ceil(replayBudgetFor("sonnet") * 1.5) + 1_000)
+      expect(estimateTokens(indivisible)).toBeGreaterThan(replayBudgetFor("sonnet"))
+      const res = await post(app, [...history(), { role: "user", content: indivisible }], {}, streaming)
+      const body = await res.text()
+      expect(capturedPrompts).toHaveLength(1)
+      if (!streaming) expect(res.status).toBe(400)
+      else expect(body).toContain("error")
+    })
+
+    it(`budgets the fresh fallback after a refused resume (stream=${streaming})`, async () => {
+      const prior = [...history(), { role: "assistant", content: "prior answer" }]
+      storeSession("sess-budget-refusal", prior, "sdk-budget-refusal", "/tmp/test", prior.map(() => null))
+      overflowFailures = 1
+      overflowMessage = "No message found with message.uuid of: 6f1c0f4e-0a1e-4d61-9a2f-7b0c1d2e3f40"
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await post(app, [...prior, { role: "user", content: "continue" }], { "x-opencode-session": "sess-budget-refusal" }, streaming)
+      await res.text()
+      expect(res.status).toBe(200)
+      expect(capturedPrompts).toHaveLength(2)
+      expect(capturedOptions[0].resume).toBe("sdk-budget-refusal")
+      expect(capturedOptions[1].resume).toBeUndefined()
+      expect(capturedPrompts[1]).toContain("were omitted from this replay")
+      expect(estimateTokens(capturedPromptTexts[1])).toBeLessThanOrEqual(replayBudgetFor("sonnet"))
+    })
+
+    it(`budgets undo without a rollback point (stream=${streaming})`, async () => {
+      const prior = [...history(), { role: "assistant", content: "prior answer" }, { role: "user", content: "later" }]
+      storeSession("sess-budget-undo", prior, "sdk-budget-undo", "/tmp/test", prior.map(() => null))
+      diagnosticLog.clear()
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await post(app, [...prior.slice(0, -3), { role: "user", content: "replacement question" }], { "x-opencode-session": "sess-budget-undo" }, streaming)
+      await res.text()
+      expect(res.status).toBe(200)
+      expect(capturedPrompts).toHaveLength(1)
+      expect(capturedOptions[0].resume).toBeUndefined()
+      expect(capturedOptions[0].resumeSessionAt).toBeUndefined()
+      expect(capturedPrompts[0]).toContain("were omitted from this replay")
+      expect(capturedPrompts[0]).toEndWith("replacement question")
+      expect(diagnosticLog.getRecent().some(entry => entry.message.includes("lineage=undo"))).toBe(true)
+    })
+
+    it(`retries fresh overflow with a smaller prompt (stream=${streaming})`, async () => {
+      overflowFailures = 1
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await post(app, history(), {}, streaming)
+      await res.text()
+      expect(res.status).toBe(200)
+      expect(capturedPrompts).toHaveLength(2)
+      expect(capturedPrompts[1].length).toBeLessThan(capturedPrompts[0].length)
+      expect(capturedOptions[1].sessionId).not.toBe(capturedOptions[0].sessionId)
+    })
+
+    it(`does not retry resumed overflow (stream=${streaming})`, async () => {
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const prior = [{ role: "user", content: "hello" }, { role: "assistant", content: "hi there" }]
+      storeSession("sess-overflow", prior, "sdk-overflow", "/tmp/test", [null, "uuid-1"])
+      overflowFailures = 1
+      const res = await post(app, [...prior, { role: "user", content: "follow up" }], { "x-opencode-session": "sess-overflow" }, streaming)
+      const body = await res.text()
+      expect(capturedPrompts).toHaveLength(1)
+      expect(capturedPrompts[0]).toBe("follow up")
+      if (!streaming) expect(res.status).toBe(400)
+      else expect(body).toContain("error")
+    })
+  }
+
+  it("renders the string omission marker in structured replays and rebuilds them on overflow", async () => {
+    overflowFailures = 1
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const messages = [...history().slice(0, -1), { role: "user", content: [
+      { type: "text", text: "live image" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+    ] }]
+    const res = await post(app, messages)
+    expect(res.status).toBe(200)
+    expect(capturedPromptTexts).toHaveLength(2)
+    expect(capturedPromptTexts[0]).toContain("were omitted from this replay")
+    expect(capturedPromptTexts[1]).toContain("were omitted from this replay")
+    expect(capturedPromptTexts[1]).toContain("aGVsbG8=")
+    expect(capturedPromptTexts[1]!.length).toBeLessThan(capturedPromptTexts[0]!.length)
+  })
+
+  it("uses token counts in an overflow error to reduce the retry budget", async () => {
+    overflowFailures = 1
+    overflowMessage = "Prompt is too long: 400000 tokens > 200000 maximum"
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, history())
+    expect(res.status).toBe(200)
+    expect(capturedPrompts).toHaveLength(2)
+    expect(capturedPrompts[1].length).toBeLessThan(capturedPrompts[0].length)
+  })
+
+  it("returns the existing context error after at most two retries", async () => {
+    overflowFailures = 3
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, history())
+    expect(res.status).toBe(400)
+    expect(capturedPrompts).toHaveLength(3)
+    expect(await res.text()).toContain("context")
+  })
+})
+
 describe("fresh-session replay envelope (#619)", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedPrompts = []
   })
 
@@ -138,8 +375,8 @@ describe("stateless client with a trailing injected block (#712)", () => {
   const INJECTED_ASSISTANT = { role: "assistant", content: "[post-history instructions]" }
   const PREFILL = { role: "user", content: "思考已结束。" }
 
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedPrompts = []
   })
 
@@ -191,8 +428,8 @@ describe("stateless client with a trailing injected block (#712)", () => {
  * to user content, which is why this went unnoticed.
  */
 describe("user-authored <thinking> survives (#720)", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedPrompts = []
   })
 
@@ -246,8 +483,8 @@ describe("user-authored <thinking> survives (#720)", () => {
 })
 
 describe("assistant content: Meridian's own markers stripped on replay (#724)", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedPrompts = []
   })
 
@@ -310,8 +547,8 @@ describe("MERIDIAN_STRIP_THINKING env escape hatch", () => {
   const priorMeridian = process.env.MERIDIAN_STRIP_THINKING
   const priorClaudeProxy = process.env.CLAUDE_PROXY_STRIP_THINKING
 
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedPrompts = []
   })
 

@@ -10,6 +10,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -38,7 +41,7 @@ let mockMessages: any[] = []
 let capturedQueryParams: any = null
 let savedPassthrough: string | undefined
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
@@ -56,14 +59,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     instance: { tool: () => {}, registerTool: () => ({}) },
   }),
   tool: () => ({}),
-}))
+}), "proxy-droid-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -145,12 +148,12 @@ Available agent types and the tools they have access to:
 }
 
 describe("Droid adapter: MCP server name", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -178,12 +181,12 @@ describe("Droid adapter: MCP server name", () => {
 })
 
 describe("Droid adapter: allowed tools", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -213,12 +216,12 @@ describe("Droid adapter: allowed tools", () => {
 })
 
 describe("Droid adapter: no subagent routing", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -263,12 +266,12 @@ describe("Droid adapter: no subagent routing", () => {
 })
 
 describe("Droid adapter: CWD extraction from system-reminder", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -291,12 +294,12 @@ describe("Droid adapter: CWD extraction from system-reminder", () => {
 })
 
 describe("Droid adapter: session management via fingerprint", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -342,12 +345,12 @@ describe("Droid adapter: session management via fingerprint", () => {
 })
 
 describe("Droid adapter: response format", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Droid response" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -376,12 +379,12 @@ describe("Droid adapter: response format", () => {
 })
 
 describe("Droid adapter: passthrough is env-controlled, defaults off", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     delete process.env.MERIDIAN_PASSTHROUGH
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -438,12 +441,12 @@ describe("Droid adapter: passthrough is env-controlled, defaults off", () => {
 })
 
 describe("Backward compatibility: OpenCode unaffected", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "OpenCode response" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {

@@ -8,6 +8,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -33,7 +36,7 @@ mkdirSync(FORGECODE_PROJECT_DIR, { recursive: true })
 let mockMessages: any[] = []
 let capturedQueryParams: any = null
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
@@ -44,14 +47,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-forgecode-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -110,10 +113,10 @@ async function post(app: any, body: any, headers: Record<string, string> = {}) {
 describe("ForgeCode adapter: detection via x-meridian-agent", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -150,10 +153,10 @@ describe("ForgeCode adapter: detection via x-meridian-agent", () => {
 describe("ForgeCode adapter: MCP server name", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -202,10 +205,10 @@ describe("ForgeCode adapter: MCP server name", () => {
 describe("ForgeCode adapter: no session header", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -234,10 +237,10 @@ describe("ForgeCode adapter: no session header", () => {
 describe("ForgeCode adapter: fingerprint session resume", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -298,10 +301,10 @@ describe("ForgeCode adapter: fingerprint session resume", () => {
 describe("ForgeCode adapter: no subagent routing", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -334,10 +337,10 @@ describe("ForgeCode adapter: no subagent routing", () => {
 describe("ForgeCode adapter: response format", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Here are the files: ..." }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -370,7 +373,7 @@ describe("ForgeCode adapter: response format", () => {
 describe("ForgeCode adapter: streaming", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [
       messageStart(),
       textBlockStart(0),
@@ -381,7 +384,7 @@ describe("ForgeCode adapter: streaming", () => {
       messageStop(),
     ]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -411,10 +414,10 @@ describe("ForgeCode adapter: streaming", () => {
 describe("ForgeCode adapter: CWD extraction through proxy", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -437,10 +440,10 @@ describe("ForgeCode adapter: CWD extraction through proxy", () => {
 describe("Backward compatibility: OpenCode unaffected by ForgeCode adapter", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "OpenCode response" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })

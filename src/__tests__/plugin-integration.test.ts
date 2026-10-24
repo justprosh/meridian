@@ -12,6 +12,8 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
@@ -28,7 +30,7 @@ interface CapturedParams {
 let capturedParams: CapturedParams | null = null
 function getCaptured(): CapturedParams | null { return capturedParams }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: unknown) => {
     capturedParams = params as CapturedParams
     return (async function* () {
@@ -42,9 +44,9 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "plugin-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => Promise<Response> | Response) => fn(),
 }))
@@ -72,10 +74,10 @@ describe("Plugin integration — end-to-end via HTTP", () => {
   let externalPluginDir: string
   let pluginConfigPath: string
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
     capturedParams = null
-    clearSessionCache()
+    await clearSessionCache()
     clearSharedSessions()
 
     pluginDir = mkdtempSync(join(tmpdir(), "plugin-integ-dir-"))
@@ -90,6 +92,57 @@ describe("Plugin integration — end-to-end via HTTP", () => {
       body: JSON.stringify(body),
     }))
   }
+
+  it("reads plugins.json from MERIDIAN_CONFIG_DIR when no plugin path is given", async () => {
+    const configDir = mkdtempSync(join(tmpdir(), "plugin-integ-config-"))
+    const pluginPath = join(externalPluginDir, "instance.js")
+    writeFileSync(pluginPath, `export default { name: "instance-plugin", version: "1.0.0", onRequest(ctx) { return ctx } }`)
+    writeFileSync(join(configDir, "plugins.json"), JSON.stringify({ plugins: [{ path: pluginPath, enabled: true }] }))
+    const saved = process.env.MERIDIAN_CONFIG_DIR
+    process.env.MERIDIAN_CONFIG_DIR = configDir
+    try {
+      const { app, initPlugins } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      if (initPlugins) await initPlugins()
+      const list = await (await app.fetch(new Request("http://localhost/plugins/list"))).json() as { plugins: Array<{ name: string; status: string }> }
+      expect(list.plugins.find(p => p.name === "instance-plugin")?.status).toBe("active")
+    } finally {
+      if (saved === undefined) delete process.env.MERIDIAN_CONFIG_DIR
+      else process.env.MERIDIAN_CONFIG_DIR = saved
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  it("discovers only the selected config directory and honors explicit plugin paths", async () => {
+    const roots = [mkdtempSync(join(tmpdir(), "plugin-config-a-")), mkdtempSync(join(tmpdir(), "plugin-config-b-"))]
+    const saved = process.env.MERIDIAN_CONFIG_DIR
+    try {
+      for (const [index, root] of roots.entries()) {
+        const discovery = join(root, "plugins")
+        mkdirSync(discovery)
+        writeFileSync(join(discovery, "marker.js"), `export default { name: "config-${index}", version: "1.0.0", onRequest(ctx) { return ctx } }`)
+      }
+      process.env.MERIDIAN_CONFIG_DIR = roots[0]
+      const first = createProxyServer({ port: 0, host: "127.0.0.1" })
+      await first.initPlugins?.()
+      process.env.MERIDIAN_CONFIG_DIR = roots[1]
+      const second = createProxyServer({ port: 0, host: "127.0.0.1" })
+      await second.initPlugins?.()
+      const explicitManifest = join(roots[0]!, "override.json")
+      writeFileSync(explicitManifest, JSON.stringify({ plugins: [{ path: "marker.js", enabled: false }] }))
+      const overridden = createProxyServer({ port: 0, host: "127.0.0.1", pluginDir: join(roots[0]!, "plugins"), pluginConfigPath: explicitManifest })
+      await overridden.initPlugins?.()
+      async function listed(app: typeof first.app) {
+        return await (await app.fetch(new Request("http://localhost/plugins/list"))).json() as { plugins: Array<{ name: string; status: string }> }
+      }
+      expect((await listed(first.app)).plugins.map(plugin => plugin.name)).toEqual(["config-0"])
+      expect((await listed(second.app)).plugins.map(plugin => plugin.name)).toEqual(["config-1"])
+      expect((await listed(overridden.app)).plugins.map(plugin => plugin.status)).toEqual(["disabled"])
+    } finally {
+      if (saved === undefined) delete process.env.MERIDIAN_CONFIG_DIR
+      else process.env.MERIDIAN_CONFIG_DIR = saved
+      for (const root of roots) rmSync(root, { recursive: true, force: true })
+    }
+  })
 
   it("loads an absolute-path plugin and applies its onRequest hook to a live request", async () => {
     // External plugin lives outside ~/.config/meridian/plugins/ — simulates

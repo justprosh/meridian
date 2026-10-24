@@ -10,6 +10,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   textBlockStart,
@@ -24,11 +27,13 @@ import {
 
 // ─── captured query params ────────────────────────────────────────────────────
 let capturedOptions: Record<string, unknown> = {}
+let capturedPrompt: string | AsyncIterable<unknown> | undefined
 let mockMessages: unknown[] = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
-  query: (params: { prompt: unknown; options: Record<string, unknown> }) => {
+installSdkMock(() => ({
+  query: (params: { prompt: string | AsyncIterable<unknown>; options: Record<string, unknown> }) => {
     capturedOptions = params.options ?? {}
+    capturedPrompt = params.prompt
     const sessionId = resolveMockSdkSessionId(params.options)
     return (async function* () {
       for (const msg of mockMessages) {
@@ -42,14 +47,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-sdk-params.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -79,13 +84,104 @@ const BASE_BODY = {
   messages: [{ role: "user", content: "hi" }],
 }
 
+describe("Claude Code live prompt with trailing system metadata", () => {
+  beforeEach(async () => {
+    capturedPrompt = undefined
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    await clearSessionCache()
+  })
+
+  it("keeps the first real user request outside a history envelope", async () => {
+    const response = await post(createTestApp(), { ...BASE_BODY, messages: [
+      { role: "user", content: "CURRENT_RECEIPT" },
+      { role: "system", content: "<system-reminder>CLIENT_METADATA</system-reminder>" },
+    ] }, { "user-agent": "claude-cli/2.1.287" })
+    expect(response.status).toBe(200)
+    expect(capturedPrompt).toBe("CURRENT_RECEIPT\n\n<system-reminder>CLIENT_METADATA</system-reminder>")
+  })
+
+  it("preserves current media as live input while keeping earlier text in history", async () => {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "CURRENT_IMAGE" } }
+    const response = await post(createTestApp(), { ...BASE_BODY, messages: [
+      { role: "user", content: "EARLIER_USER" },
+      { role: "assistant", content: "EARLIER_ANSWER" },
+      { role: "user", content: [{ type: "text", text: "CURRENT_RECEIPT" }, image] },
+      { role: "system", content: "CURRENT_METADATA" },
+    ] }, { "user-agent": "claude-cli/2.1.287" })
+    expect(response.status).toBe(200)
+    if (!capturedPrompt || typeof capturedPrompt === "string") throw new Error("Expected structured SDK input")
+    const messages: unknown[] = []
+    for await (const message of capturedPrompt) messages.push(message)
+    expect(messages).toHaveLength(1)
+    const serialized = JSON.stringify(messages)
+    expect(serialized.indexOf("</conversation_history>")).toBeLessThan(serialized.indexOf("CURRENT_RECEIPT"))
+    expect(serialized).toContain(JSON.stringify(image))
+    expect(serialized).not.toContain("Historical image")
+    expect(serialized).toContain("CURRENT_METADATA")
+  })
+
+  it.each([false, true])("deduplicates historical image read-back at the SDK boundary (stream=%s)", async (stream) => {
+    const image = {type:"image",source:{type:"base64",media_type:"image/png",data:"aGlzdG9yaWNhbA=="}}
+    const response = await post(createTestApp(), {...BASE_BODY,stream,messages:[
+      {role:"user",content:[{type:"text",text:"original attachment"},image]},
+      {role:"assistant",content:[{type:"tool_use",id:"read-back-id",name:"read",input:{path:"prior.png"}}]},
+      {role:"user",content:[{type:"tool_result",tool_use_id:"read-back-id",content:[{type:"text",text:"read receipt"},image]}]},
+      {role:"assistant",content:"previous answer"},
+      {role:"user",content:"current text request"},
+    ]})
+    expect(response.status).toBe(200)
+    await response.text()
+    if (!capturedPrompt || typeof capturedPrompt === "string") throw new Error("Expected structured SDK input")
+    const inputs: unknown[]=[]
+    for await (const message of capturedPrompt) inputs.push(message)
+    const serialized=JSON.stringify(inputs)
+    expect(inputs).toHaveLength(1)
+    expect(serialized.split(JSON.stringify(image)).length-1).toBe(1)
+    expect(serialized).toContain("read-back-id")
+    expect(serialized).toContain("read receipt")
+    expect(serialized).toContain("original attachment")
+    expect(serialized).toContain("current text request")
+  })
+
+  it("retains the reminder on a resumed user turn without replaying earlier input", async () => {
+    const app = createTestApp()
+    const headers = { "user-agent": "claude-cli/2.1.287", "x-opencode-session": "owned-reminder-resume" }
+    const first = await post(app, { ...BASE_BODY, messages: [{ role: "user", content: "EARLIER_USER" }] }, headers)
+    await first.json()
+    const sessionId = capturedOptions.sessionId
+    expect(typeof sessionId).toBe("string")
+    const response = await post(app, { ...BASE_BODY, messages: [
+      { role: "user", content: "EARLIER_USER" },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: "CURRENT_RECEIPT" },
+      { role: "system", content: "CURRENT_METADATA" },
+    ] }, headers)
+    expect(response.status).toBe(200)
+    expect(capturedOptions.resume).toBe(sessionId)
+    expect(capturedPrompt).toBe("CURRENT_RECEIPT\n\nCURRENT_METADATA")
+  })
+
+  it("separates the current request and its reminder from older conversation turns", async () => {
+    await post(createTestApp(), { ...BASE_BODY, messages: [
+      { role: "user", content: "EARLIER_USER" },
+      { role: "assistant", content: "EARLIER_ANSWER" },
+      { role: "user", content: "CURRENT_RECEIPT" },
+      { role: "system", content: "CURRENT_METADATA" },
+    ] }, { "user-agent": "claude-cli/2.1.287" })
+    expect(typeof capturedPrompt).toBe("string")
+    if (typeof capturedPrompt !== "string") throw new Error("Expected text SDK input")
+    expect(capturedPrompt.indexOf("</conversation_history>")).toBeLessThan(capturedPrompt.indexOf("CURRENT_RECEIPT"))
+    expect(capturedPrompt).toEndWith("CURRENT_RECEIPT\n\nCURRENT_METADATA")
+  })
+})
+
 // ─── body field passthrough ───────────────────────────────────────────────────
 
 describe("SDK param passthrough — body fields", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedOptions = {}
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("forwards effort from body", async () => {
@@ -99,6 +195,20 @@ describe("SDK param passthrough — body fields", () => {
     const app = createTestApp()
     await post(app, { ...BASE_BODY, thinking })
     expect(capturedOptions.thinking).toEqual(thinking)
+  })
+
+  it("drops a body thinking display the SDK subprocess would reject", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASE_BODY, thinking: { type: "adaptive", display: "updates" } })
+    expect(capturedOptions.thinking).toEqual({ type: "adaptive" })
+  })
+
+  it("drops a header thinking display the SDK subprocess would reject", async () => {
+    const app = createTestApp()
+    await post(app, BASE_BODY, {
+      "x-opencode-thinking": JSON.stringify({ type: "adaptive", display: "updates" }),
+    })
+    expect(capturedOptions.thinking).toEqual({ type: "adaptive" })
   })
 
   it("forwards task_budget from body as taskBudget object", async () => {
@@ -144,10 +254,10 @@ describe("SDK param passthrough — body fields", () => {
 // ─── header overrides ─────────────────────────────────────────────────────────
 
 describe("SDK param passthrough — header overrides", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedOptions = {}
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("x-opencode-effort overrides body effort", async () => {
@@ -284,10 +394,10 @@ describe("SDK param passthrough — header overrides", () => {
 describe("strip-all policy disables thinking when thinking beta is stripped", () => {
   let savedPolicy: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedOptions = {}
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
-    clearSessionCache()
+    await clearSessionCache()
     savedPolicy = process.env.MERIDIAN_BETA_POLICY
     process.env.MERIDIAN_BETA_POLICY = "strip-all"
   })
@@ -348,9 +458,9 @@ describe("strip-all policy disables thinking when thinking beta is stripped", ()
 // ─── usage logging ────────────────────────────────────────────────────────────
 
 describe("Usage logging", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedOptions = {}
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("logs usage line after non-streaming response", async () => {
@@ -432,9 +542,9 @@ describe("Usage logging", () => {
 // ─── GET /v1/sessions/:claudeSessionId/context-usage ─────────────────────────
 
 describe("GET /v1/sessions/:claudeSessionId/context-usage", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("returns 404 for unknown session ID", async () => {

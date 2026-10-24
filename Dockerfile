@@ -17,9 +17,15 @@ COPY tsconfig.json* ./
 COPY bin/ ./bin/
 COPY plugin/ ./plugin/
 COPY src/ ./src/
+COPY examples/pi-extension/antigravity-retry.js ./antigravity-clients/pi.js
+COPY examples/opencode-plugin/antigravity-retry.js ./antigravity-clients/opencode.js
 # Run bun build directly (not "bun run build") to skip postbuild hook,
 # which calls "node --check" — unavailable in oven/bun image
-RUN rm -rf dist && bun build bin/cli.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external libsql --external jsonc-parser --entry-naming '[name].js'
+RUN rm -rf dist \
+    && bun build bin/cli.ts bin/session-bookkeeping.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external libsql --external jsonc-parser --entry-naming '[name].js' \
+    && bun build plugin/meridian-v2/index.js --outdir dist/meridian-v2 --target node --splitting --external @anthropic-ai/claude-agent-sdk --external libsql --external jsonc-parser --entry-naming '[name].js' \
+    && cp plugin/meridian-v2/package.json dist/meridian-v2/package.json \
+    && cp -r antigravity-clients dist/antigravity-clients
 
 # ---- Runtime stage ----
 FROM node:22-alpine
@@ -28,6 +34,12 @@ RUN deluser --remove-home node 2>/dev/null; \
     adduser -D -u 1000 claude \
     && mkdir -p /home/claude/.claude \
     && chown -R claude:claude /home/claude
+
+# Alpine does not provide /etc/machine-id. Durable process-owner fencing needs
+# one to distinguish lock owners safely, so create it once in the image layer.
+RUN node -e "process.stdout.write(require('node:crypto').randomBytes(16).toString('hex') + '\n')" > /etc/machine-id \
+    && grep -Eq '^[0-9a-f]{32}$' /etc/machine-id \
+    && chmod 0444 /etc/machine-id
 
 USER claude
 WORKDIR /app

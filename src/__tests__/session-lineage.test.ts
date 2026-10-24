@@ -11,6 +11,9 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -36,7 +39,7 @@ function getCallerSelectedSessionId(label: string): string {
   return sessionId
 }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: unknown) => {
     capturedQueryParams = params as CapturedQueryParams
     const sessionLabel = queuedSessionLabels.shift()
@@ -54,14 +57,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "session-lineage.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => Promise<Response> | Response) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -111,12 +114,12 @@ async function post(
   await response.json()
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
   capturedQueryParams = null
   queuedSessionLabels = []
   callerSelectedSessionIds = new Map()
-  clearSessionCache()
+  await clearSessionCache()
   clearSharedSessions()
 })
 
@@ -304,10 +307,10 @@ describe("Session lineage: undo detection", () => {
       { role: "user", content: "Do you remember the word?" },
     ], "sdk-new")
 
-    // No durable rollback UUID is available, so replay from fresh state.
-    expect(getCaptured()?.options?.resume).toBeUndefined()
-    expect(getCaptured()?.options?.forkSession).toBeUndefined()
-    expect(getCaptured()?.options?.resumeSessionAt).toBeUndefined()
+    // Inherited rollback UUID survives the managed fork (#1371), so undo forks at the checkpoint.
+    expect(getCaptured()?.options?.resume).toBeDefined()
+    expect(getCaptured()?.options?.forkSession).toBe(true)
+    expect(getCaptured()?.options?.resumeSessionAt).toBeDefined()
   })
 
   it("forks session on multi-undo (fewer messages)", async () => {
@@ -331,15 +334,16 @@ describe("Session lineage: undo detection", () => {
       { role: "user", content: "step 3" },
     ], "sdk-1")
 
-    // Multi-undo back to turn 1 → fork
+    // Multi-undo back to turn 1 → fork at turn 1 assistant UUID (#1371)
     await post(app, "sess-1", [
       { role: "user", content: "hello" },
       { role: "assistant", content: "hi" },
       { role: "user", content: "completely different" },
     ], "sdk-new")
 
-    expect(getCaptured()?.options?.resume).toBeUndefined()
-    expect(getCaptured()?.options?.forkSession).toBeUndefined()
+    expect(getCaptured()?.options?.resume).toBeDefined()
+    expect(getCaptured()?.options?.forkSession).toBe(true)
+    expect(getCaptured()?.options?.resumeSessionAt).toBeDefined()
   })
 
   it("does NOT resume when earlier message is edited", async () => {
@@ -387,9 +391,10 @@ describe("Session lineage: undo detection", () => {
       { role: "user", content: "forget about X" },
     ], "ignored-managed-fork-id")
 
-    // Should fork from original session using the durable journaled target.
-    expect(getCaptured()?.options?.resume).toBeUndefined()
-    expect(getCaptured()?.options?.forkSession).toBeUndefined()
+    // Should fork from the previous managed fork using the durable journaled target (#1371).
+    expect(getCaptured()?.options?.resume).toBeDefined()
+    expect(getCaptured()?.options?.forkSession).toBe(true)
+    expect(getCaptured()?.options?.resumeSessionAt).toBeDefined()
     const forkSessionId = getCaptured()?.options?.sessionId
     expect(forkSessionId).toMatch(/^[0-9a-f-]{36}$/)
 
@@ -412,8 +417,8 @@ describe("Session lineage: undo detection", () => {
 // Scenarios 5-7: Compaction
 // ---------------------------------------------------------------------------
 
-describe("Session lineage: compaction survival", () => {
-  it("resumes after compaction rewrites older messages (suffix preserved)", async () => {
+describe("Session lineage: compaction replay", () => {
+  it("replays a shortened summary head with its preserved suffix and new turns", async () => {
     const app = createTestApp()
 
     // Build a 9-message conversation
@@ -468,12 +473,13 @@ describe("Session lineage: compaction survival", () => {
       { role: "user", content: "topic E" },
     ], "sdk-c")
 
-    expect(getCaptured()?.options?.resume).toBeDefined()
+    expect(getCaptured()?.options?.resume).toBeUndefined()
+    expect(getCaptured()?.prompt).toContain("[Summary: A, B and C discussed]")
     expect(getCaptured()?.prompt).toContain("INTERMEDIATE COMPACTION SENTINEL")
     expect(getCaptured()?.prompt).toContain("topic E")
   })
 
-  it("resumes after compaction reduces message count", async () => {
+  it("allows the legacy resume with MERIDIAN_COMPACTION_SURVIVAL=1", async () => {
     const app = createTestApp()
 
     // Build to 9 messages
@@ -486,17 +492,22 @@ describe("Session lineage: compaction survival", () => {
 
     // Compaction: 9 msgs → 7 (summary + preserved tail + new)
     capturedQueryParams = null
-    await post(app, "sess-s", [
-      { role: "user", content: "[Summary: steps 1-3]" },
-      { role: "assistant", content: "done 3" },
-      { role: "user", content: "step 4" },
-      { role: "assistant", content: "done 4" },
-      { role: "user", content: "step 5" },
-      { role: "assistant", content: "done 5" },
-      { role: "user", content: "step 6" },
-    ], "sdk-s")
+    process.env.MERIDIAN_COMPACTION_SURVIVAL = "1"
+    try {
+      await post(app, "sess-s", [
+        { role: "user", content: "[Summary: steps 1-3]" },
+        { role: "assistant", content: "done 3" },
+        { role: "user", content: "step 4" },
+        { role: "assistant", content: "done 4" },
+        { role: "user", content: "step 5" },
+        { role: "assistant", content: "done 5" },
+        { role: "user", content: "step 6" },
+      ], "sdk-s")
 
-    expect(getCaptured()?.options?.resume).toBeDefined()
+      expect(getCaptured()?.options?.resume).toBeDefined()
+    } finally {
+      delete process.env.MERIDIAN_COMPACTION_SURVIVAL
+    }
   })
 
   it("does NOT resume when both prefix AND suffix changed (real branch)", async () => {
@@ -719,7 +730,12 @@ describe("Session lineage: post-compaction behavior", () => {
       { role: "user", content: "H" },
     ], "sdk-2c")
 
-    expect(getCaptured()?.options?.resume).toBeDefined()
+    expect(getCaptured()?.options?.resume).toBeUndefined()
+    expect(getCaptured()?.prompt).toContain("[Summary: A-F]")
+  // Measured at 5317ms on CI, over the 5s default this suite used to run with.
+  // It drives four compaction rounds through the HTTP layer, so it is
+  // legitimately slow rather than stuck; the harness budget is now 30s
+  // (#917/#933).
   })
 
   it("undo after compaction is correctly rejected", async () => {

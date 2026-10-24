@@ -1,7 +1,38 @@
+import type { AntigravityPlugin } from "./backends/antigravityPlugins"
 import type { Server } from "node:http"
 import type { ProfileConfig } from "./profiles"
 
+export interface AntigravityOptions {
+  executable?: string
+  /** Optional Meridian-owned SQLite file for response snapshots and bounded telemetry. */
+  statePath?: string
+  /** Explicit provider plugins; Claude SDK transforms are not loaded here. */
+  plugins?: AntigravityPlugin[]
+  pluginPaths?: string[]
+  /** Explicit consent to the auto-approval + deny-hook tool bridge. */
+  allowToolBridge?: boolean
+  /** Map numeric client thinking budgets to approximate Gemini effort variants. */
+  adaptThinkingBudgets?: boolean
+  maxConcurrent?: number
+  turnTimeoutMs?: number
+  /** Retain matching ordinary conversations in a live official CLI process. */
+  reuseConversations?: boolean
+  /** Explicit opt-in until an authenticated Windows live gate is available. */
+  allowUnverifiedWindows?: boolean
+  /** Native actions execute inside agy, outside client approval dialogs. */
+  allowNativeBrowser?: boolean
+  /** Installed Chrome DevTools MCP 1.9.0 executable; never downloaded at request time. */
+  browserMcpExecutable?: string
+  allowNativeSubagents?: boolean
+  pendingToolTimeoutMs?: number
+  /** How long a finished conversation's live process waits for the next turn (default pendingToolTimeoutMs). After it expires the next turn replays the whole history. */
+  idleConversationMs?: number
+}
+
 export interface ProxyConfig {
+  /** Defaults to Claude. Antigravity is an opt-in, subscription-account CLI backend. */
+  backend?: "claude" | "antigravity" | "combined"
+  antigravity?: AntigravityOptions
   port: number
   host: string
   debug: boolean
@@ -35,6 +66,30 @@ export interface ProxyConfig {
   maxConcurrent?: number
 }
 
+/** Read backend selection at instance creation, rather than module import. */
+export function resolveBackendConfig(config: Partial<ProxyConfig>): ProxyConfig {
+  const backend = config.backend ?? process.env.MERIDIAN_BACKEND ?? "claude"
+  if (backend !== "claude" && backend !== "antigravity" && backend !== "combined") throw new Error("MERIDIAN_BACKEND must be claude, antigravity or combined")
+  return {
+    ...DEFAULT_PROXY_CONFIG, ...config, backend,
+    ...(backend !== "claude" ? { antigravity: {
+      executable: process.env.MERIDIAN_AGY_PATH,
+      statePath: process.env.MERIDIAN_AGY_STATE_PATH || undefined,
+      pluginPaths: process.env.MERIDIAN_AGY_PLUGIN_PATHS ? parseAgPluginPaths(process.env.MERIDIAN_AGY_PLUGIN_PATHS) : undefined,
+      allowToolBridge: process.env.MERIDIAN_AGY_ALLOW_TOOL_BRIDGE === "1",
+      adaptThinkingBudgets: process.env.MERIDIAN_AGY_ADAPT_THINKING_BUDGETS === "1",
+      allowNativeBrowser: process.env.MERIDIAN_AGY_ALLOW_NATIVE_BROWSER === "1",
+      browserMcpExecutable: process.env.MERIDIAN_AGY_BROWSER_MCP_PATH,
+      allowNativeSubagents: process.env.MERIDIAN_AGY_ALLOW_NATIVE_SUBAGENTS === "1",
+      maxConcurrent: process.env.MERIDIAN_AGY_MAX_CONCURRENT === undefined ? undefined : Number(process.env.MERIDIAN_AGY_MAX_CONCURRENT),
+      turnTimeoutMs: process.env.MERIDIAN_AGY_TURN_TIMEOUT_MS === undefined ? undefined : Number(process.env.MERIDIAN_AGY_TURN_TIMEOUT_MS),
+      pendingToolTimeoutMs: process.env.MERIDIAN_AGY_TOOL_TIMEOUT_MS === undefined ? undefined : Number(process.env.MERIDIAN_AGY_TOOL_TIMEOUT_MS),
+      idleConversationMs: process.env.MERIDIAN_AGY_IDLE_CONVERSATION_MS === undefined ? undefined : Number(process.env.MERIDIAN_AGY_IDLE_CONVERSATION_MS),
+      ...config.antigravity,
+    } } : {}),
+  }
+}
+
 export interface ProxyInstance {
   /** The underlying http.Server */
   server: Server
@@ -52,6 +107,8 @@ export interface ProxyServer {
   config: ProxyConfig
   /** Load plugins from disk and wire them into the request pipeline */
   initPlugins?(): Promise<void>
+  /** Release optional backend resources when embedding app.fetch directly. */
+  closeBackend?(): Promise<void>
   /**
    * Stop admitting new `/v1/messages` requests (fast-fails with 503) and
    * report `/health` as `draining`. Used by `startProxyServer`'s `close()`
@@ -64,6 +121,25 @@ export interface ProxyServer {
   getInFlightCount?(): number
   /** Run one fail-closed transcript maintenance sweep. */
   sweepSessionGc?(): Promise<void>
+  /** Present only when this instance has a ChatGPT credential source. */
+  chatGpt?: ChatGptUpstreamControl
+}
+
+/** The ChatGPT credential source, as much of it as a host lifecycle needs. */
+export interface ChatGptUpstreamControl {
+  readonly mode: "owned" | "follow-external"
+  accounts(): number
+  isServing(): boolean
+  /** Take refresh authority (owned). Rejects rather than degrading. No-op for follow-external. */
+  acquire(): Promise<void>
+  release(): void
+  /** Renew the seat most overdue for renewal (owned); true when one was renewed. Always false for follow-external. */
+  renewDue(): Promise<boolean>
+  /**
+   * Resolves once every credential exchange already under way (renewals,
+   * sign-ins) has recorded its result. Await it before `release`.
+   */
+  settle(): Promise<void>
 }
 
 export const DEFAULT_PROXY_CONFIG: ProxyConfig = {
@@ -77,4 +153,10 @@ export const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   profiles: undefined,
   defaultProfile: undefined,
   version: undefined,
+}
+
+function parseAgPluginPaths(value: string): string[] {
+  const paths: unknown = JSON.parse(value)
+  if (!Array.isArray(paths) || paths.some(path => typeof path !== 'string' || !path) || paths.length > 16) throw new Error('MERIDIAN_AGY_PLUGIN_PATHS must be a JSON array of at most 16 module paths')
+  return paths
 }

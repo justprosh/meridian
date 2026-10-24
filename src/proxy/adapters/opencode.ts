@@ -6,8 +6,9 @@
  */
 
 import type { Context } from "hono"
-import type { AgentAdapter } from "../adapter"
+import type { AgentAdapter, RoutingTurnIdentity } from "../adapter"
 import { type FileChange, extractFileChangesFromBash } from "../fileChanges"
+import { PRIORITY_ATTESTATION_HEADER, verifyPriorityAttestation } from "../priorityAttestation"
 import { normalizeContent } from "../messages"
 import { extractClientCwd } from "../session/fingerprint"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME, ALLOWED_MCP_TOOLS } from "../tools"
@@ -38,9 +39,44 @@ function isTransientUserPromptHook(block: unknown): boolean {
   } catch {
     return false
   }
-  if (!isRecord(parsed) || !isRecord(parsed.hookSpecificOutput)) return false
-  return parsed.hookSpecificOutput.hookEventName === "UserPromptSubmit"
-    && typeof parsed.hookSpecificOutput.additionalContext === "string"
+  if (!isRecord(parsed)) return false
+  if (isRecord(parsed.hookSpecificOutput)) {
+    return parsed.hookSpecificOutput.hookEventName === "UserPromptSubmit"
+      && typeof parsed.hookSpecificOutput.additionalContext === "string"
+  }
+  // NOTE: OpenCode's hook bridge also wraps common SyncHookJSONOutput fields,
+  // e.g. {"continue":true}, without hookSpecificOutput (#872). Recognize the
+  // documented control envelope, not arbitrary JSON or arbitrary removed text.
+  const fields = Object.entries(parsed)
+  return fields.length > 0 && fields.every(([key, value]) => {
+    switch (key) {
+      case "continue":
+      case "suppressOutput": return typeof value === "boolean"
+      case "stopReason":
+      case "systemMessage":
+      case "reason": return typeof value === "string"
+      case "decision": return value === "approve" || value === "block"
+      default: return false
+    }
+  })
+}
+
+/**
+ * NOTE: OpenCode-specific (oh-my-openagent plugin). When OpenCode's message
+ * list ends on an assistant message, oh-my-openagent pushes a synthetic user
+ * turn with exactly this text: on every tool round after a compaction
+ * auto-continue, and on every tool round for model families that reject an
+ * assistant prefill. OpenCode keeps a completed tool round inside that
+ * assistant message, so on the wire the text lands as an extra block after the
+ * tool results of the trailing user slot. It is never persisted: the next
+ * request adds it again after the new tail only, and the earlier slot comes
+ * back without it. Hashing it made that slot look edited on every round, so
+ * each round replayed the whole conversation into a fresh SDK session.
+ */
+const PREFILL_RECOVERY_TEXT = "[internal] Continue from the previous assistant state."
+
+function isTransientPrefillRecovery(block: unknown): boolean {
+  return isRecord(block) && block.type === "text" && block.text === PREFILL_RECOVERY_TEXT
 }
 
 export function canonicalizeOpenCodeMessagesForLineage(
@@ -49,7 +85,14 @@ export function canonicalizeOpenCodeMessagesForLineage(
   // Preserve message positions exactly; only block content may be filtered.
   return messages.map((message) => {
     if (message.role !== "user" || !Array.isArray(message.content)) return message
-    const content = message.content.filter((block) => !isTransientUserPromptHook(block))
+    let content = message.content.filter((block) => !isTransientUserPromptHook(block))
+    // Recognize the actual wire shape: completed tool results followed by one
+    // synthetic recovery block. Preserve the wording when it is embedded in
+    // a user's meaningful follow-up or appears before the tool results.
+    if (content.length > 1 && isTransientPrefillRecovery(content.at(-1))
+      && content.slice(0, -1).every((block) => isRecord(block) && block.type === "tool_result")) {
+      content = content.slice(0, -1)
+    }
     // A hook-only message has no durable identity. Retain it rather than
     // collapsing distinct requests to the same empty hash.
     if (content.length === 0 || content.length === message.content.length) return message
@@ -59,6 +102,12 @@ export function canonicalizeOpenCodeMessagesForLineage(
 
 export const openCodeAdapter: AgentAdapter = {
   name: "opencode",
+
+  /**
+   * NOTE: OpenCode-specific. OpenCode can call a network-hosted Meridian while
+   * its tools and environment block remain local to the OpenCode process.
+   */
+  clientEnvironmentMayDifferFromProxy: true,
 
   /**
    * NOTE: OpenCode-specific. OpenCode runs its internal one-shot agents —
@@ -106,7 +155,46 @@ export const openCodeAdapter: AgentAdapter = {
     return c.req.header("x-opencode-agent-mode")
   },
 
+  /**
+   * NOTE: OpenCode-specific. Only a final-hook HMAC assertion can authorize a
+   * user-turn routing change. Raw request-kind/request-ID headers are not a
+   * trust boundary: OpenCode is the default adapter and any HTTP client can
+   * copy them.
+   */
+  getRoutingTurnIdentity(c: Context): RoutingTurnIdentity | undefined {
+    // Explicit pins never participate in priority failback. Check presence,
+    // not truthiness, so an empty malformed pin also fails closed.
+    if (c.req.header("x-meridian-profile") !== undefined) return undefined
+    const sessionId = c.req.header("x-opencode-session")
+    const agentId = c.req.header("x-opencode-agent-name")
+    if (!sessionId || !agentId || c.req.header("x-opencode-agent-mode") !== "primary") {
+      return undefined
+    }
+    const attestation = verifyPriorityAttestation(c.req.header(PRIORITY_ATTESTATION_HEADER))
+    if (!attestation || attestation.sessionId !== sessionId || attestation.agentId !== agentId) {
+      return undefined
+    }
+    return {
+      kind: "human",
+      turnId: attestation.turnId,
+      issuedAt: attestation.issuedAt,
+      generation: attestation.generation === "oc1"
+        ? "opencode-v1"
+        : attestation.generation === "oc2b18314" ? "opencode-v2-beta-18314" : "opencode-v2-2.0.16",
+    }
+  },
+
   extractWorkingDirectory(body: any): string | undefined {
+    return extractClientCwd(body)
+  },
+
+  /**
+   * NOTE: OpenCode-specific. Expose the same request parse independently from
+   * `extractWorkingDirectory`: operator overrides may replace the SDK cwd, but
+   * must not replace the path used for project fingerprinting or the client
+   * environment note.
+   */
+  extractClientWorkingDirectory(body: any): string | undefined {
     return extractClientCwd(body)
   },
 

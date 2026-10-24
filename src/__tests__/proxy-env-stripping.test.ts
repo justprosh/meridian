@@ -11,13 +11,16 @@
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 // Capture the env passed to query()
 let capturedQueryOptions: any = null
 const savedEnv: Record<string, string | undefined> = {}
 
 import { resolveMockSdkSessionId } from "./helpers"
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryOptions = params.options
     return (async function* () {
@@ -38,14 +41,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-env-stripping.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -72,9 +75,9 @@ const BASIC_REQUEST = {
 }
 
 describe("Environment variable stripping", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedQueryOptions = null
-    clearSessionCache()
+    await clearSessionCache()
     // Save current env
     for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]) {
       savedEnv[key] = process.env[key]
@@ -200,9 +203,9 @@ describe("SDK model pin injection (fixes #419)", () => {
   ]
   const savedModelEnv: Record<string, string | undefined> = {}
 
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedQueryOptions = null
-    clearSessionCache()
+    await clearSessionCache()
     for (const k of modelEnvKeys) {
       savedModelEnv[k] = process.env[k]
       delete process.env[k]
@@ -220,10 +223,10 @@ describe("SDK model pin injection (fixes #419)", () => {
     const app = createTestApp()
     // Bare alias: no envOverride kicks in, so the canonical pin is exercised.
     await post(app, { ...BASIC_REQUEST, model: "sonnet" })
-    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5")
-    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-5")
-    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5")
-    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("claude-haiku-4-5")
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5-1")
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-5-5")
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5-5")
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("claude-haiku-5-5")
   })
 
   it("explicit claude-opus-4-6 requests pin the SDK env to 4.6", async () => {
@@ -238,9 +241,15 @@ describe("SDK model pin injection (fixes #419)", () => {
     expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5")
   })
 
+  it("explicit claude-fable-5-1 requests pin the SDK env to Fable 5.1", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASIC_REQUEST, model: "claude-fable-5-1" })
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5-1")
+  })
+
   // Mythos has no SDK alias of its own — it resolves through the fable alias,
   // so an explicit claude-mythos-* request must pin ANTHROPIC_DEFAULT_FABLE_MODEL
-  // to the requested id (not Meridian's canonical claude-fable-5 pin).
+  // to the requested id (not Meridian's canonical claude-fable-5-1 pin).
   it("explicit claude-mythos-5 requests pin the SDK env to mythos via the fable alias", async () => {
     const app = createTestApp()
     await post(app, { ...BASIC_REQUEST, model: "claude-mythos-5" })
@@ -251,10 +260,25 @@ describe("SDK model pin injection (fixes #419)", () => {
   // collapsed to the generic "sonnet" alias and resolved to Meridian's
   // canonical pin (claude-sonnet-4-6) instead of the requested version,
   // because envOverrides only special-cased opus/fable requests.
+  it("explicit claude-sonnet-5-5 requests pin the SDK env to sonnet-5-5", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASIC_REQUEST, model: "claude-sonnet-5-5" })
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5-5")
+  })
+
   it("explicit claude-sonnet-5 requests pin the SDK env to sonnet-5", async () => {
     const app = createTestApp()
     await post(app, { ...BASIC_REQUEST, model: "claude-sonnet-5" })
     expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5")
+  })
+
+  it("bare Haiku uses the new canonical pin and explicit 5.5 beats a legacy shell pin", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASIC_REQUEST, model: "haiku" })
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("claude-haiku-5-5")
+    process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = "claude-haiku-4-5"
+    await post(app, { ...BASIC_REQUEST, model: "claude-haiku-5-5" })
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("claude-haiku-5-5")
   })
 
   it("explicit claude-haiku-4-5 requests pin the SDK env to haiku-4-5", async () => {
@@ -297,7 +321,7 @@ describe("SDK model pin injection (fixes #419)", () => {
   it("bare 'sonnet' alias requests do not set an envOverride, falling back to the canonical pin", async () => {
     const app = createTestApp()
     await post(app, { ...BASIC_REQUEST, model: "sonnet" })
-    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5")
+    expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5-5")
   })
 
   it("shell ANTHROPIC_DEFAULT_* values win over Meridian's pins", async () => {
@@ -320,7 +344,7 @@ describe("SDK model pin injection (fixes #419)", () => {
 
     // Now add a shell env — it wins over MERIDIAN_ too.
     process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "claude-opus-shell-wins"
-    clearSessionCache()
+    await clearSessionCache()
     const app2 = createTestApp()
     await post(app2, BASIC_REQUEST)
     expect(capturedQueryOptions.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-shell-wins")

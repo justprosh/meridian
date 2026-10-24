@@ -25,6 +25,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { makeRequest, withMockSdkSessionId } from "./helpers"
 
 const PASSTHROUGH_PREFIX = "mcp__oc__"
@@ -52,7 +55,7 @@ function toolTurn(toolId: string, toolName: string, input: Record<string, unknow
   }
 }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) =>
     (async function* () {
       const preHook = opts?.options?.hooks?.PreToolUse?.[0]?.hooks?.[0]
@@ -76,14 +79,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     name: "test",
     instance: { tool: () => {}, registerTool: () => ({}) },
   }),
-}))
+}), "proxy-passthrough-single-turn.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -126,13 +129,13 @@ describe("Passthrough non-streaming: client-driven single-step semantics", () =>
   // "parallel same-tool calls" describe for the current-default coverage.
   // The legacy path stays reachable via MERIDIAN_PASSTHROUGH_EARLY_STOP=0
   // and must keep working.
-  beforeEach(() => {
+  beforeEach(async () => {
     mockTurns = []
     origEnv = process.env.MERIDIAN_PASSTHROUGH
     origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
     process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = "0"
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {

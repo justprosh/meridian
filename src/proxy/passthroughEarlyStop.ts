@@ -23,8 +23,10 @@
  * combination an immediate abort could not give — it skipped the commit.
  *
  * This module still drains rather than aborts, because the cap is lifted for
- * deferred tools, advisors, structured output, and the kill switch. In those
- * configurations the digest turn does generate and is discarded here.
+ * deferred tools, advisors, structured output, and the kill switch. With
+ * deferred tools or an advisor, a PostToolBatch hook ends the query after the
+ * forwarded batch (see stopAfterForwardedBatch), so no digest turn runs. With
+ * structured output or the kill switch it does generate and is discarded here.
  *
  * Settlement is necessary but NOT sufficient to freeze the checkpoint. Two
  * further conditions belong to the caller, which owns the wire:
@@ -41,13 +43,15 @@
  * Pure module — no I/O, no imports from server.ts or session/.
  */
 
-/** Passthrough MCP prefix — mirrors PASSTHROUGH_MCP_PREFIX in passthroughTools.
- *  Duplicated here (with a cross-check test) to keep this module leaf-pure. */
+/** Default passthrough MCP prefix — mirrors PASSTHROUGH_MCP_PREFIX in
+ *  passthroughTools. Duplicated here (with a cross-check test) to keep this
+ *  module leaf-pure. An adapter with its own namespace passes it in instead
+ *  (#893); the default is what every adapter used before that existed. */
 const CLIENT_TOOL_PREFIX = "mcp__oc__"
 
-/** Internal SDK tool that executes for real (deferred tool discovery) — its
- *  calls are never forwarded to the client and must not arm the tracker. */
-const INTERNAL_TOOLS = new Set(["ToolSearch"])
+/** Internal SDK tools execute inside the SDK. Their results never require
+ *  a client tool_result and must not arm a passthrough checkpoint. */
+const INTERNAL_TOOLS = new Set(["ToolSearch", "StructuredOutput"])
 
 export interface EarlyStopTracker {
   /** tool_use ids of client-forwarded calls awaiting an iterator-observed deny */
@@ -79,23 +83,30 @@ export interface ClientForwardedToolUse {
   name: string
 }
 
-export function isClientForwardedToolUse(block: unknown): block is ClientForwardedToolUse {
+export function isClientForwardedToolUse(
+  block: unknown,
+  clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+): block is ClientForwardedToolUse {
   const b = block as { type?: unknown; id?: unknown; name?: unknown } | null | undefined
   if (!b || b.type !== "tool_use") return false
   if (typeof b.id !== "string" || b.id.length === 0) return false
   if (typeof b.name !== "string") return false
   if (INTERNAL_TOOLS.has(b.name)) return false
-  if (b.name.startsWith("mcp__") && !b.name.startsWith(CLIENT_TOOL_PREFIX)) return false
+  if (b.name.startsWith("mcp__") && !b.name.startsWith(clientToolPrefix)) return false
   return true
 }
 
 /**
  * Record the client-forwarded tool_use ids from an assistant message's content.
  */
-export function noteAssistantContent(tracker: EarlyStopTracker, content: unknown): void {
+export function noteAssistantContent(
+  tracker: EarlyStopTracker,
+  content: unknown,
+  clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+): void {
   if (!Array.isArray(content)) return
   for (const block of content) {
-    if (isClientForwardedToolUse(block)) {
+    if (isClientForwardedToolUse(block, clientToolPrefix)) {
       tracker.expected.add(block.id)
     }
   }
@@ -110,12 +121,23 @@ export function noteAssistantContent(tracker: EarlyStopTracker, content: unknown
  * updating the boundary for every forwarded call leaves the correct stable
  * checkpoint.
  */
-export function noteAssistantMessage(tracker: EarlyStopTracker, message: unknown): void {
+export function noteAssistantMessage(
+  tracker: EarlyStopTracker,
+  message: unknown,
+  clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+): void {
   const m = message as { type?: unknown; uuid?: unknown; message?: { content?: unknown } } | null | undefined
   if (m?.type !== "assistant") return
   const content = m.message?.content
   const before = tracker.expected.size
-  noteAssistantContent(tracker, content)
+  // The prefix MUST be threaded through. Defaulting it here silently armed the
+  // tracker only for `mcp__oc__*`, so on an adapter with its own namespace
+  // (`mcp__litellm__*` since #983) nothing was ever expected: no checkpoint
+  // UUID, no stored `passthroughToolCallIds`, and therefore no tool round ever
+  // resumed (#996). `isClientForwardedToolUse` is deliberately strict about
+  // foreign `mcp__*` names, which is what makes a missed prefix silent rather
+  // than noisy.
+  noteAssistantContent(tracker, content, clientToolPrefix)
   if (tracker.expected.size > before) {
     // A newer tool-bearing assistant message supersedes the older checkpoint.
     // Fail closed when its UUID is absent: the older message may not contain
@@ -160,6 +182,49 @@ export function allForwardedCallsResolved(tracker: EarlyStopTracker): boolean {
 }
 
 /**
+ * Opt-in flags for the checkpoint continuation validators.
+ */
+export interface CompleteToolResultContinuationOptions {
+  /**
+   * NOTE: agent-specific (claude-code, pi, opencode) — with its
+   * `mid-conversation-system` feature on (beta
+   * `mid-conversation-system-2026-04-07`; seen on 2.1.259 and 2.1.261),
+   * claude-cli ends a tool-result delta with one trailing `system` reminder
+   * turn; Oh My Pi upgrades developer-origin notes to the same turn, and
+   * OpenCode 2 (seen on 2.0.21) sends instruction updates (a changed
+   * AGENTS.md, a date rollover, an MCP or skill catalog change) the same way
+   * on models with native system updates. The Messages contract has no system
+   * role, so the turn is admitted only here, only as the final message, only
+   * behind a single echo of the complete expected ID set, and is delivered as
+   * unprivileged user text after the results — never as an SDK system prompt.
+   */
+  allowTrailingSystemReminder?: boolean
+}
+
+/**
+ * Detect mid-conversation effort metadata system messages (e.g. pi >= 0.85.0
+ * Persistent Claude thinking effort). These carry effort metadata in
+ * `output_config` with empty content and no tool ids or text instructions.
+ */
+export function isMidConvoEffortSystemMessage(
+  message: { role?: unknown; content?: unknown; output_config?: unknown } | null | undefined,
+): boolean {
+  if (!message || message.role !== "system") return false
+  const outputConfig = (message as { output_config?: unknown; outputConfig?: unknown }).output_config
+    ?? (message as { output_config?: unknown; outputConfig?: unknown }).outputConfig
+  if (typeof outputConfig !== "object" || outputConfig === null) return false
+  const content = message.content
+  if (content === undefined || content === null || content === "") return true
+  if (Array.isArray(content)) {
+    if (content.length === 0) return true
+    return content.every((b: any) =>
+      b === null || b === undefined || (b.type === "text" && (typeof b.text !== "string" || b.text.trim().length === 0))
+    )
+  }
+  return false
+}
+
+/**
  * Verify that a resumed tool-result delta settles exactly the tool calls at the
  * stored assistant checkpoint, then coalesce queued user turns into one SDK
  * input. Tool results must precede any ordinary user content, matching the
@@ -167,7 +232,8 @@ export function allForwardedCallsResolved(tracker: EarlyStopTracker): boolean {
  */
 export function coalesceCompleteToolResultContinuation(
   messages: Array<{ role?: unknown; content?: unknown }>,
-  expectedIds: readonly string[]
+  expectedIds: readonly string[],
+  options?: CompleteToolResultContinuationOptions,
 ): Array<{ role: "user"; content: unknown[] }> | undefined {
   if (expectedIds.length === 0 || messages.length === 0) return undefined
   const expected = new Set(expectedIds)
@@ -176,8 +242,39 @@ export function coalesceCompleteToolResultContinuation(
   const content: unknown[] = []
   let sawUser = false
   let sawNonToolResult = false
+  let sawTrailingSystem = false
+  const systemTextBlocks: unknown[] = []
+  let echoMessages = 0
+  // Set by a mid-batch echo: the next user message continues the same batch.
+  let continuesBatch = false
 
   for (const message of messages) {
+    if (isMidConvoEffortSystemMessage(message)) {
+      continue
+    }
+
+    if (message.role === "system") {
+      if (!options?.allowTrailingSystemReminder) return undefined
+      if (!sawUser || sawTrailingSystem) return undefined
+      sawTrailingSystem = true
+      if (typeof message.content === "string") {
+        if (message.content.trim().length === 0) return undefined
+        systemTextBlocks.push({ type: "text", text: message.content })
+        continue
+      }
+      if (Array.isArray(message.content)) {
+        for (const rawBlock of message.content) {
+          const block = rawBlock as { type?: unknown; text?: unknown } | null | undefined
+          if (block?.type !== "text" || typeof block.text !== "string" || block.text.trim().length === 0) return undefined
+          // cache_control survives here; the caller's strip path removes it before the SDK.
+          systemTextBlocks.push(block)
+        }
+        if (systemTextBlocks.length === 0) return undefined
+        continue
+      }
+      return undefined
+    }
+    if (sawTrailingSystem) return undefined
     // The client echoes the just-produced assistant tool_use before its user
     // result. That assistant turn already exists at resumeSessionAt, so the
     // structured SDK delta below intentionally filters it out.
@@ -193,12 +290,33 @@ export function coalesceCompleteToolResultContinuation(
         }
       }
       if (!sawToolUse) return undefined
+      echoMessages++
+      continue
+    }
+    // NOTE: a Responses-API client that records each tool output right after
+    // its own call (Meowbert did) reaches us as one assistant/user pair per
+    // call: [assistant A, user A, assistant B, user B]. Every later pair still
+    // belongs to the checkpoint batch, so accept it while the batch is unsettled,
+    // only results have been seen, and the echo names only unseen batch calls.
+    if (message.role === "assistant") {
+      if (echoMessages === 0 || sawNonToolResult || actual.size === expected.size) return undefined
+      if (!Array.isArray(message.content) || message.content.length === 0) return undefined
+      for (const rawBlock of message.content) {
+        const block = rawBlock as { type?: unknown; id?: unknown } | null | undefined
+        if (block?.type !== "tool_use") return undefined
+        if (typeof block.id !== "string" || !expected.has(block.id) || echoedCalls.has(block.id)) return undefined
+        echoedCalls.add(block.id)
+      }
+      echoMessages++
+      continuesBatch = true
       continue
     }
     if (message.role !== "user") return undefined
     // A queued user turn may follow only after the first turn settled the full
-    // checkpoint batch. Splitting results across turns is not a valid resume.
-    if (sawUser && actual.size !== expected.size) return undefined
+    // checkpoint batch. Splitting results across turns is not a valid resume,
+    // except across the per-call echoes accepted above.
+    if (sawUser && actual.size !== expected.size && !continuesBatch) return undefined
+    continuesBatch = false
     const userContent = Array.isArray(message.content)
       ? message.content
       : typeof message.content === "string"
@@ -211,6 +329,8 @@ export function coalesceCompleteToolResultContinuation(
       if (block?.type === "tool_result") {
         if (sawNonToolResult || typeof block.tool_use_id !== "string") return undefined
         if (!expected.has(block.tool_use_id) || actual.has(block.tool_use_id)) return undefined
+        // Once the client echoes calls, each result must follow its own echo.
+        if (echoedCalls.size > 0 && !echoedCalls.has(block.tool_use_id)) return undefined
         actual.add(block.tool_use_id)
       } else {
         sawNonToolResult = true
@@ -223,13 +343,67 @@ export function coalesceCompleteToolResultContinuation(
     actual.size !== expected.size ||
     (echoedCalls.size !== 0 && echoedCalls.size !== expected.size)
   ) return undefined
+  // With a reminder the echo must be exactly one message carrying the full ID
+  // set: a split, partial, or absent echo does not prove the checkpoint.
+  if (sawTrailingSystem && (echoMessages !== 1 || echoedCalls.size !== expected.size)) return undefined
+  // Reminder last, as on the wire.
+  if (systemTextBlocks.length > 0) content.push(...systemTextBlocks)
   return [{ role: "user", content }]
+}
+
+/**
+ * The delta settles the checkpoint batch in its first user message, but the
+ * history then moved on past it: an assistant turn follows. A stream cut off
+ * by a dropped connection leaves exactly this shape — complete tool results,
+ * a partial assistant message, then the next user turn. The checkpoint is not
+ * contradicted, only passed, so the caller can resume the stored session
+ * instead of replaying the whole conversation.
+ */
+export function settlesCheckpointThenContinues(
+  messages: Array<{ role?: unknown; content?: unknown }>,
+  expectedIds: readonly string[],
+  options?: CompleteToolResultContinuationOptions,
+): boolean {
+  const firstUser = messages.findIndex((message) => message.role === "user")
+  if (firstUser < 0) return false
+  if (coalesceCompleteToolResultContinuation(messages.slice(0, firstUser + 1), expectedIds, options) === undefined) return false
+
+  // This rescue covers only the observed interrupted-text shape. Looking for
+  // any later assistant turn would skip validation of later tool results,
+  // tool calls or system reminders and resume a genuinely changed history.
+  const interrupted = messages[firstUser + 1]
+  if (interrupted?.role !== "assistant") return false
+  const assistantContent = typeof interrupted.content === "string"
+    ? [{ type: "text", text: interrupted.content }]
+    : interrupted.content
+  if (!Array.isArray(assistantContent) || assistantContent.length === 0 ||
+      !assistantContent.every((rawBlock) => {
+        const block = rawBlock as { type?: unknown; text?: unknown } | null | undefined
+        return block?.type === "text" && typeof block.text === "string" && block.text.trim().length > 0
+      })) return false
+
+  const subsequent = messages.slice(firstUser + 2)
+  if (subsequent.length === 0) return false
+  for (const message of subsequent) {
+    if (message.role !== "user") return false
+    if (typeof message.content === "string") {
+      if (message.content.trim().length === 0) return false
+      continue
+    }
+    if (!Array.isArray(message.content) || message.content.length === 0) return false
+    for (const rawBlock of message.content) {
+      const block = rawBlock as { type?: unknown } | null | undefined
+      if (!block || typeof block !== "object" || block.type === "tool_result" || block.type === "tool_use") return false
+    }
+  }
+  return true
 }
 
 /** Find and validate the exact echoed assistant checkpoint plus its result tail. */
 export function findCompleteToolResultCheckpoint(
   messages: Array<{ role?: unknown; content?: unknown }>,
   expectedIds: readonly string[],
+  options?: CompleteToolResultContinuationOptions,
 ): Array<{ role: "user"; content: unknown[] }> | undefined {
   if (expectedIds.length === 0) return undefined
   const expected = new Set(expectedIds)
@@ -247,7 +421,7 @@ export function findCompleteToolResultCheckpoint(
     }
     if (malformed || ids.length !== expected.size || new Set(ids).size !== ids.length) continue
     if (!ids.every((id) => expected.has(id))) continue
-    return coalesceCompleteToolResultContinuation(messages.slice(index), expectedIds)
+    return coalesceCompleteToolResultContinuation(messages.slice(index), expectedIds, options)
   }
   return undefined
 }

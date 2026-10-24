@@ -8,12 +8,15 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { assistantMessage, toolUseBlockStart, textBlockStart, textDelta, blockStop, messageDelta, messageStop, messageStart, withMockSdkSessionId } from "./helpers"
 
 let mockMessages: any[] = []
 let capturedQueryParams: any = null
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
@@ -24,14 +27,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-crush-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -86,10 +89,10 @@ async function post(app: any, body: any, headers: Record<string, string> = {}) {
 describe("Crush adapter: detection", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -119,10 +122,10 @@ describe("Crush adapter: detection", () => {
 describe("Crush adapter: MCP server name", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -172,10 +175,10 @@ describe("Crush adapter: MCP server name", () => {
 describe("Crush adapter: no session header", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -204,10 +207,10 @@ describe("Crush adapter: no session header", () => {
 describe("Crush adapter: fingerprint session resume", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -269,10 +272,10 @@ describe("Crush adapter: fingerprint session resume", () => {
 describe("Crush adapter: no subagent routing", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -317,10 +320,10 @@ describe("Crush adapter: headless auto-execute", () => {
 describe("Crush adapter: response format", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Here are the files: ..." }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -353,7 +356,7 @@ describe("Crush adapter: response format", () => {
 describe("Crush adapter: streaming", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [
       messageStart(),
       textBlockStart(0),
@@ -364,7 +367,7 @@ describe("Crush adapter: streaming", () => {
       messageStop(),
     ]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -394,10 +397,10 @@ describe("Crush adapter: streaming", () => {
 describe("Backward compatibility: OpenCode unaffected by Crush adapter", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "OpenCode response" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })

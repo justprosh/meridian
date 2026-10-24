@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process"
+import { execFile, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { readFileSync, readlinkSync } from "node:fs"
 
@@ -47,6 +47,23 @@ const PROBE_TIMEOUT_MS = 2_000
 // path runs before the SDK command opens, so wait long enough to capture the
 // durable writer identity instead of failing every first launch closed.
 const WINDOWS_PROBE_TIMEOUT_MS = 10_000
+// A probe awaited rather than run synchronously holds nothing else meanwhile,
+// so it can wait out a loaded host (captureProcessIncarnationAsync).
+const ASYNC_PROBE_TIMEOUT_MS = 10_000
+// execFile's timeout only signals the probe, and its callback still waits for
+// the probe to exit. A probe that ignores the signal would hold the awaiting
+// request forever, so the awaited probe also answers by this later deadline.
+const ASYNC_PROBE_DEADLINE_GRACE_MS = 2_000
+
+/**
+ * How long a single capture may block before it gives up. Callers that gate a
+ * child on work they do *after* capturing its incarnation must add this to the
+ * child's own deadline: on win32 the capture shells out to PowerShell and can
+ * spend the whole budget before the caller reaches its next step.
+ */
+export function processIncarnationProbeBudgetMs(): number {
+  return process.platform === "win32" ? WINDOWS_PROBE_TIMEOUT_MS : PROBE_TIMEOUT_MS
+}
 
 let cachedLocalBootIdentity: LocalBootIdentity | undefined
 let cachedCurrentProcessIncarnation: ProcessIncarnation | undefined
@@ -162,15 +179,74 @@ function linuxLocalBootIdentity(): LocalBootIdentity | undefined {
   }
 }
 
+function darwinProbeEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC0" }
+}
+
 function runDarwin(command: string, args: readonly string[]): string | undefined {
   const result = spawnSync(command, args, {
     encoding: "utf8",
-    env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC0" },
+    env: darwinProbeEnv(),
     timeout: PROBE_TIMEOUT_MS,
     maxBuffer: 1024 * 1024,
   })
   if (result.error || result.status !== 0 || typeof result.stdout !== "string") return undefined
   return result.stdout
+}
+
+export interface ProcessProbeResult {
+  /** Exit status, or null when the probe did not exit on its own. */
+  status: number | null
+  stdout?: string
+}
+
+export interface ProcessProbeLimits {
+  env?: NodeJS.ProcessEnv
+  /** When execFile signals the probe. */
+  timeoutMs?: number
+  /** When the probe is answered as failed and force-killed, whatever its state. */
+  deadlineMs?: number
+}
+
+/**
+ * Run a probe without holding the event loop, as the synchronous runners do
+ * with spawnSync. Always settles: by the probe's own result, or by the outer
+ * deadline, which force-kills the probe and releases its pipes.
+ */
+export function runProcessProbeAsync(
+  command: string,
+  args: readonly string[],
+  limits: ProcessProbeLimits = {},
+): Promise<ProcessProbeResult> {
+  const timeoutMs = limits.timeoutMs ?? ASYNC_PROBE_TIMEOUT_MS
+  const deadlineMs = limits.deadlineMs ?? timeoutMs + ASYNC_PROBE_DEADLINE_GRACE_MS
+  return new Promise((resolve) => {
+    let settled = false
+    let deadline: ReturnType<typeof setTimeout> | undefined
+    const settle = (result: ProcessProbeResult): void => {
+      if (settled) return
+      settled = true
+      if (deadline) clearTimeout(deadline)
+      resolve(result)
+    }
+    const child = execFile(command, [...args], {
+      encoding: "utf8",
+      ...(limits.env ? { env: limits.env } : {}),
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    }, (error, stdout) => {
+      const status = error === null ? 0 : typeof error.code === "number" ? error.code : null
+      settle({ status, ...(typeof stdout === "string" ? { stdout } : {}) })
+    })
+    deadline = setTimeout(() => {
+      if (settled) return
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+      settle({ status: null })
+    }, deadlineMs)
+  })
 }
 
 function darwinLocalBootIdentity(): LocalBootIdentity | undefined {
@@ -191,14 +267,16 @@ function uuidFromIdentity(value: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
+const POWERSHELL_ARGS = [
+  "-NoLogo",
+  "-NoProfile",
+  "-NonInteractive",
+  "-ExecutionPolicy", "Bypass",
+  "-Command",
+] as const
+
 function runWindowsPowerShell(script: string): { status: number | null; stdout?: string } {
-  const result = spawnSync("powershell.exe", [
-    "-NoLogo",
-    "-NoProfile",
-    "-NonInteractive",
-    "-ExecutionPolicy", "Bypass",
-    "-Command", script,
-  ], {
+  const result = spawnSync("powershell.exe", [...POWERSHELL_ARGS, script], {
     encoding: "utf8",
     windowsHide: true,
     timeout: WINDOWS_PROBE_TIMEOUT_MS,
@@ -228,6 +306,40 @@ Write-Output $boot.ToUniversalTime().Ticks
   }
 }
 
+/**
+ * Operator-pinned host identity (#905).
+ *
+ * The derived `hostId` is wrong in both directions inside a container:
+ *
+ *   - NOT STABLE. It mixes in the pid-namespace inode, which changes on every
+ *     `docker restart`. The session store lives in the writable layer and
+ *     survives that restart, so a proxy SIGKILLed while holding a store lock
+ *     comes back with a different `hostId`; `probeProcessIncarnation` then
+ *     returns `indeterminate` rather than `dead`, `retireStaleLock` refuses to
+ *     retire it, and every request fails with `timed out waiting for lock`
+ *     until the container is recreated. It fails toward a permanent hang.
+ *   - NOT UNIQUE. Every container from a given image tag has a byte-identical
+ *     `/etc/machine-id`, so `hostId` reduces to that pid-namespace inode, which
+ *     is allocated from a fixed base at boot. Two freshly-booted hosts sharing
+ *     a session directory can each read the other's LIVE lock as `dead` and
+ *     retire it, deleting session resources under a running owner.
+ *
+ * Pinning it — the container ID works — fixes both. Unset outside containers,
+ * where the derived value is genuinely stable and unique, so nothing changes.
+ *
+ * Hashed like the derived value rather than used raw: `hostId` is compared for
+ * equality only, and hashing keeps a pinned value from leaking an operator's
+ * hostname into a lock file that is read cross-host.
+ */
+export function pinnedHostIdFor(pin: string | undefined): string | undefined {
+  const trimmed = pin?.trim()
+  return trimmed ? hashIdentity(`pinned:${trimmed}`) : undefined
+}
+
+function pinnedHostId(): string | undefined {
+  return pinnedHostIdFor(process.env.MERIDIAN_HOST_ID)
+}
+
 function getLocalBootIdentity(): LocalBootIdentity | undefined {
   if (cachedLocalBootIdentity) return cachedLocalBootIdentity
   try {
@@ -238,11 +350,64 @@ function getLocalBootIdentity(): LocalBootIdentity | undefined {
         : process.platform === "win32"
           ? windowsLocalBootIdentity()
           : undefined
-    if (identity) cachedLocalBootIdentity = identity
-    return identity
+    // The pin replaces only hostId. bootId still comes from the platform, so a
+    // reboot is still detected — pinning must not make a dead owner look alive.
+    const pinned = pinnedHostId()
+    const resolved = identity && pinned ? { ...identity, hostId: pinned } : identity
+    if (resolved) cachedLocalBootIdentity = resolved
+    return resolved
   } catch {
     return undefined
   }
+}
+
+/**
+ * Whether this host can produce a boot identity, and what to do if it cannot.
+ *
+ * Every session-store write takes a lock stamped with a process incarnation,
+ * and `captureProcessIncarnation` returns undefined without a boot identity —
+ * so `acquireLock` throws and EVERY request that touches a session fails with a
+ * 500. `/health` never probed this, so a container missing `/etc/machine-id`
+ * reported healthy to Docker and to any orchestrator while serving nothing,
+ * which is why the original occurrence took three days to find (#906, split
+ * from #903).
+ *
+ * Exported so both the startup check and `/health` read the same source rather
+ * than each inferring it.
+ */
+export interface BootIdentityStatus {
+  available: boolean
+  platform: string
+  /** Actionable next step, present only when unavailable. */
+  hint?: string
+}
+
+/**
+ * What to tell an operator when this platform produced no boot identity.
+ *
+ * Pure and exported separately so every branch is testable without breaking the
+ * host it runs on. "cannot capture lock owner process incarnation" is what the
+ * original failure said, and it names nothing an operator can act on.
+ */
+export function bootIdentityHint(platform: string): string {
+  if (platform === "linux") {
+    return "no readable /etc/machine-id or /var/lib/dbus/machine-id, or /proc is not mounted. "
+      + "Distroless, scratch, chroot and gVisor images commonly lack machine-id: "
+      + "generate one (`dbus-uuidgen > /etc/machine-id`) or bind-mount the host's."
+  }
+  if (platform === "darwin") {
+    return "could not read the hardware UUID or boot time from the system profiler."
+  }
+  if (platform === "win32") {
+    return "could not read the machine GUID or boot time from the registry."
+  }
+  return `unsupported platform "${platform}" — boot identity is implemented for linux, darwin and win32 only.`
+}
+
+export function describeLocalBootIdentity(): BootIdentityStatus {
+  const platform = process.platform
+  if (getLocalBootIdentity()) return { available: true, platform }
+  return { available: false, platform, hint: bootIdentityHint(platform) }
 }
 
 function pidPresence(pid: number): "present" | "missing" | "indeterminate" {
@@ -280,8 +445,12 @@ function linuxProcessStart(pid: number): ProcessStartObservation {
   return pidPresence(pid) === "missing" ? { status: "missing" } : { status: "indeterminate" }
 }
 
-function darwinProcessStart(pid: number): ProcessStartObservation {
-  const output = runDarwin("/bin/ps", ["-p", String(pid), "-o", "lstart="])
+function darwinStartArgs(pid: number): string[] {
+  return ["-p", String(pid), "-o", "lstart="]
+}
+
+/** `ps -o lstart=` output, or undefined when it did not exit 0. */
+function darwinStartFrom(output: string | undefined, pid: number): ProcessStartObservation {
   if (output !== undefined) {
     const startId = output.trimEnd().trimStart()
     if (DARWIN_START_PATTERN.test(startId)) {
@@ -291,8 +460,12 @@ function darwinProcessStart(pid: number): ProcessStartObservation {
   return pidPresence(pid) === "missing" ? { status: "missing" } : { status: "indeterminate" }
 }
 
-function windowsProcessStart(pid: number): ProcessStartObservation {
-  const result = runWindowsPowerShell(String.raw`
+function darwinProcessStart(pid: number): ProcessStartObservation {
+  return darwinStartFrom(runDarwin("/bin/ps", darwinStartArgs(pid)), pid)
+}
+
+function windowsStartScript(pid: number): string {
+  return String.raw`
 $ErrorActionPreference = 'Stop'
 try {
   $process = Get-Process -Id ${pid} -ErrorAction Stop
@@ -302,7 +475,10 @@ try {
 } catch {
   exit 4
 }
-`)
+`
+}
+
+function windowsStartFrom(result: { status: number | null; stdout?: string }, pid: number): ProcessStartObservation {
   const startId = result.stdout?.trim()
   if (result.status === 0 && startId && WINDOWS_START_PATTERN.test(startId)) {
     return { status: "found", startId, startIdKind: "windows-start-ticks" }
@@ -311,7 +487,22 @@ try {
   return pidPresence(pid) === "missing" ? { status: "missing" } : { status: "indeterminate" }
 }
 
+function windowsProcessStart(pid: number): ProcessStartObservation {
+  return windowsStartFrom(runWindowsPowerShell(windowsStartScript(pid)), pid)
+}
+
 function observeProcessStart(pid: number): ProcessStartObservation {
+  // The pid is this process, so its start is the one already captured. On
+  // win32 and darwin a fresh observation is a synchronous child process that
+  // stalls the event loop, and the lifecycle probes this process's own leases
+  // on every sweep while holding its lock.
+  if (pid === process.pid && cachedCurrentProcessIncarnation) {
+    return {
+      status: "found",
+      startId: cachedCurrentProcessIncarnation.startId,
+      startIdKind: cachedCurrentProcessIncarnation.startIdKind,
+    }
+  }
   if (process.platform === "linux") return linuxProcessStart(pid)
   if (process.platform === "darwin") return darwinProcessStart(pid)
   if (process.platform === "win32") return windowsProcessStart(pid)
@@ -339,6 +530,42 @@ export function captureProcessIncarnation(pid = process.pid): ProcessIncarnation
   return { ...identity }
 }
 
+async function observeProcessStartAsync(pid: number): Promise<ProcessStartObservation> {
+  if (process.platform === "darwin") {
+    const result = await runProcessProbeAsync("/bin/ps", darwinStartArgs(pid), { env: darwinProbeEnv() })
+    return darwinStartFrom(result.status === 0 ? result.stdout : undefined, pid)
+  }
+  if (process.platform === "win32") {
+    return windowsStartFrom(await runProcessProbeAsync("powershell.exe", [...POWERSHELL_ARGS, windowsStartScript(pid)]), pid)
+  }
+  // Linux reads /proc: a file, with no child process to wait for.
+  return observeProcessStart(pid)
+}
+
+/**
+ * `captureProcessIncarnation` of another process, without holding the event
+ * loop while the probe runs. On darwin and win32 the probe is a child process:
+ * run synchronously it holds every other request, and on a host loaded near 40
+ * it outran PROBE_TIMEOUT_MS. The SDK gate captures each request's wrapper this
+ * way (sdkProcessGate.ts). Same probe and output as the synchronous capture.
+ * A probe that never answers is force-killed at its outer deadline, and the
+ * capture returns undefined, so the awaiting request fails rather than hangs.
+ */
+export async function captureProcessIncarnationAsync(pid: number): Promise<ProcessIncarnation | undefined> {
+  if (!isPositivePid(pid) || pid === process.pid) return captureProcessIncarnation(pid)
+  const localBoot = getLocalBootIdentity()
+  if (!localBoot) return undefined
+  const start = await observeProcessStartAsync(pid)
+  if (start.status !== "found") return undefined
+  return {
+    version: PROCESS_INCARNATION_VERSION,
+    pid,
+    ...localBoot,
+    startId: start.startId,
+    startIdKind: start.startIdKind,
+  }
+}
+
 /** Probe one stored owner. Recovery callers must act only on `dead`. */
 export function probeProcessIncarnation(owner: ProcessIncarnation): ProcessIncarnationProbe {
   const parsed = parseProcessIncarnation(owner)
@@ -353,4 +580,18 @@ export function probeProcessIncarnation(owner: ProcessIncarnation): ProcessIncar
 
 export function processIncarnationIsDead(owner: ProcessIncarnation): boolean {
   return probeProcessIncarnation(owner) === "dead"
+}
+
+/**
+ * Whether `owner` ran on this host during an earlier boot. A reboot ends every
+ * process, descendants included, so this holds even where a dead process
+ * cannot prove its children are gone. It never spawns a probe.
+ */
+export function processIncarnationPredatesBoot(owner: ProcessIncarnation): boolean {
+  const parsed = parseProcessIncarnation(owner)
+  const localBoot = getLocalBootIdentity()
+  return parsed !== undefined
+    && localBoot !== undefined
+    && parsed.hostId === localBoot.hostId
+    && parsed.bootId !== localBoot.bootId
 }

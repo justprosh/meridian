@@ -8,6 +8,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   assistantMessage,
   messageStart,
@@ -26,7 +29,7 @@ let mockMessages: any[] = []
 let capturedQueryParams: any = null
 let firePreToolUseHooks = false
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
 
@@ -100,14 +103,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     type: "sdk", name: "test", instance: { registerTool: () => ({}), tool: () => ({}) },
   }),
   tool: () => ({}),
-}))
+}), "proxy-file-changes.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -146,11 +149,11 @@ async function postStream(app: any, body: any) {
 describe("File change visibility: PostToolUse hook registration", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
     firePreToolUseHooks = false
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -230,10 +233,10 @@ describe("File change visibility: PostToolUse hook registration", () => {
 describe("File change visibility: non-streaming response", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -353,10 +356,10 @@ describe("File change visibility: non-streaming response", () => {
 describe("File change visibility: streaming response", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })
@@ -478,10 +481,10 @@ describe("File change visibility: MERIDIAN_NO_FILE_CHANGES opt-out", () => {
   let origClaude: string | undefined
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
     origMeridian = process.env.MERIDIAN_NO_FILE_CHANGES
     origClaude = process.env.CLAUDE_PROXY_NO_FILE_CHANGES
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
@@ -609,11 +612,11 @@ describe("File change visibility: MERIDIAN_NO_FILE_CHANGES opt-out", () => {
 describe("File change visibility: other adapters still track", () => {
   let savedPassthrough: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
     capturedQueryParams = null
     firePreToolUseHooks = false
-    clearSessionCache()
+    await clearSessionCache()
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
   })

@@ -14,6 +14,8 @@ import { describe, it, expect } from "bun:test"
 import {
   clientAbortDisposition,
   coalesceCompleteToolResultContinuation,
+  settlesCheckpointThenContinues,
+  isMidConvoEffortSystemMessage,
   findCompleteToolResultCheckpoint,
   createEarlyStopTracker,
   allForwardedCallsResolved,
@@ -51,6 +53,11 @@ describe("isClientForwardedToolUse", () => {
   it("matches bare tool names (SDK sometimes strips the prefix in events)", () => {
     expect(isClientForwardedToolUse(toolUse("t1", "read"))).toBe(true)
     expect(isClientForwardedToolUse(toolUse("t2", "Bash"))).toBe(true)
+  })
+
+  it("excludes SDK StructuredOutput but preserves a client MCP tool with that name", () => {
+    expect(isClientForwardedToolUse(toolUse("internal", "StructuredOutput"))).toBe(false)
+    expect(isClientForwardedToolUse(toolUse("client", "mcp__oc__StructuredOutput"))).toBe(true)
   })
 
   it("excludes ToolSearch (internal, SDK-executed for deferred loading)", () => {
@@ -280,6 +287,46 @@ describe("early-stop tracking", () => {
 })
 
 
+describe("settlesCheckpointThenContinues", () => {
+  const result = (id: string) => ({ type: "tool_result", tool_use_id: id, content: "ok" })
+  const partial = { role: "assistant", content: [{ type: "text", text: "The file contains" }] }
+  const next = { role: "user", content: "still there?" }
+
+  it("accepts complete results followed by an interrupted assistant turn", () => {
+    expect(settlesCheckpointThenContinues([
+      { role: "user", content: [result("t1"), result("t2")] }, partial, next,
+    ], ["t1", "t2"])).toBe(true)
+    expect(settlesCheckpointThenContinues([
+      { role: "user", content: [result("t1")] }, partial, next, { role: "user", content: "one more queued instruction" },
+    ], ["t1"])).toBe(true)
+  })
+
+  it("rejects partial or unknown results even when history moved on", () => {
+    expect(settlesCheckpointThenContinues([{ role: "user", content: [result("t1")] }, partial, next], ["t1", "t2"])).toBe(false)
+    expect(settlesCheckpointThenContinues([{ role: "user", content: [result("other")] }, partial, next], ["t1"])).toBe(false)
+  })
+
+  it("rejects a delta with no later assistant turn, which the coalescer owns", () => {
+    expect(settlesCheckpointThenContinues([{ role: "user", content: [result("t1")] }, next], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([partial], ["t1"])).toBe(false)
+  })
+
+  it("rejects later unmatched or duplicate results after a settled batch", () => {
+    const settled = { role: "user", content: [result("t1")] }
+    expect(settlesCheckpointThenContinues([settled, partial, { role: "user", content: [result("unknown")] }], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, partial, { role: "user", content: [result("t1")] }], ["t1"])).toBe(false)
+  })
+
+  it("rejects later tool calls, reminders, and an assistant-only tail", () => {
+    const settled = { role: "user", content: [result("t1")] }
+    const newCall = { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "read", input: {} }] }
+    expect(settlesCheckpointThenContinues([settled, newCall, next], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, partial, { role: "system", content: "reminder" }, next], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, partial], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, { role: "assistant", content: [{ type: "text", text: "  " }] }, next], ["t1"])).toBe(false)
+  })
+})
+
 describe("coalesceCompleteToolResultContinuation", () => {
   const result = (id: string, content: unknown = "ok") => ({ type: "tool_result", tool_use_id: id, content })
 
@@ -366,6 +413,84 @@ describe("coalesceCompleteToolResultContinuation", () => {
       { role: "assistant", content: [{ type: "text", text: "late" }] },
     ], ["t1"])).toBeUndefined()
   })
+
+  describe("per-call echo/result pairs from a Responses-API client", () => {
+    const echo = (...ids: string[]) => ({
+      role: "assistant",
+      content: ids.map(id => ({ type: "tool_use", id, name: "read", input: {} })),
+    })
+
+    it("coalesces [echo A, result A, echo B, result B] into one settled batch", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t2"),
+        { role: "user", content: [result("t2"), { type: "text", text: "note" }] },
+      ], ["t1", "t2"])).toEqual([{
+        role: "user",
+        content: [result("t1"), result("t2"), { type: "text", text: "note" }],
+      }])
+    })
+
+    it("rejects pairs that leave the batch unsettled or name other calls", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t2"),
+      ], ["t1", "t2"])).toBeUndefined()
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t3"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t1"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+
+    it("rejects a result that arrives before its own echo", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1"), result("t2")] },
+        echo("t2"),
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+
+    it("rejects a later echo after user text or once the batch is settled", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1"), { type: "text", text: "queued" }] },
+        echo("t2"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t1"),
+      ], ["t1"])).toBeUndefined()
+    })
+
+    it("rejects a later echo when the batch had no leading echo", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        { role: "user", content: [result("t1")] },
+        echo("t2"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+
+    it("rejects a later echo that also carries assistant text", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        { role: "assistant", content: [{ type: "text", text: "and next" }, { type: "tool_use", id: "t2", name: "read", input: {} }] },
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+  })
 })
 
 describe("findCompleteToolResultCheckpoint", () => {
@@ -385,5 +510,237 @@ describe("findCompleteToolResultCheckpoint", () => {
     expect(findCompleteToolResultCheckpoint([assistant, { role: "user", content: [result("a"), result("b"), result("extra")] }], ["a", "b"])).toBeUndefined()
     expect(findCompleteToolResultCheckpoint([assistant, { role: "user", content: [result("a")] }], ["a", "b"])).toBeUndefined()
     expect(findCompleteToolResultCheckpoint([assistant, { role: "assistant", content: [result("a"), result("b")] }], ["a", "b"])).toBeUndefined()
+  })
+})
+
+describe("claude-code trailing system delta", () => {
+  const result = (id: string, content: unknown = "ok") => ({ type: "tool_result", tool_use_id: id, content })
+  const echo = (ids: string[]) => ({
+    role: "assistant",
+    content: ids.map((id) => ({ type: "tool_use", id, name: "read", input: {} })),
+  })
+  const reminder = (text: string, cacheControl = false) => ({
+    role: "system",
+    content: [{ type: "text", text, ...(cacheControl ? { cache_control: { type: "ephemeral" } } : {}) }],
+  })
+  const opts = { allowTrailingSystemReminder: true }
+
+  it("accepts the captured delta: complete expected-ID echo, results, trailing reminder", () => {
+    const results = [result("t1"), result("t2")]
+    // cache_control is kept here; the caller strips it before the SDK.
+    const cases: Array<[{ role: string; content: unknown }, unknown]> = [
+      [{ role: "system", content: "<total_tokens> 4151" }, { type: "text", text: "<total_tokens> 4151" }],
+      [reminder("<total_tokens> 4151", true), { type: "text", text: "<total_tokens> 4151", cache_control: { type: "ephemeral" } }],
+    ]
+    for (const [tail, expectedBlock] of cases) {
+      expect(coalesceCompleteToolResultContinuation(
+        [echo(["t1", "t2"]), { role: "user", content: results }, tail],
+        ["t1", "t2"],
+        opts,
+      )).toEqual([{ role: "user", content: [...results, expectedBlock] }])
+    }
+  })
+
+  it("delivers the reminder after results and queued user content, in wire order", () => {
+    const queuedText = { type: "text", text: "continue" }
+    const queuedImage = { type: "image", source: { type: "base64", data: "abc" } }
+    expect(coalesceCompleteToolResultContinuation(
+      [echo(["t1"]), { role: "user", content: [result("t1")] }, { role: "user", content: [queuedText, queuedImage] }, reminder("reminder")],
+      ["t1"],
+      opts,
+    )).toEqual([{ role: "user", content: [result("t1"), queuedText, queuedImage, { type: "text", text: "reminder" }] }])
+  })
+
+  it("rejects the reminder-bearing delta without the opt-in (generic default)", () => {
+    expect(coalesceCompleteToolResultContinuation(
+      [echo(["t1"]), { role: "user", content: [result("t1")], }, reminder("reminder")],
+      ["t1"],
+    )).toBeUndefined()
+  })
+
+  it("rejects leading, non-final, repeated, non-text, and empty reminders", () => {
+    const delta = [echo(["t1"]), { role: "user", content: [result("t1")] }]
+    for (const body of [
+      [reminder("leading"), ...delta], // leading (undemonstrated form)
+      [echo(["t1"]), reminder("non-final"), { role: "user", content: [result("t1")] }], // before results
+      [...delta, reminder("one"), reminder("two")], // repeated
+      [...delta, reminder("final"), { role: "user", content: "after" }], // message after reminder
+      [...delta, { role: "system", content: [{ type: "image", source: { type: "base64", data: "x" } }] }], // non-text block
+      [...delta, { role: "system", content: [{ type: "tool_result", tool_use_id: "t1", content: "x" }] }], // tool_result block
+      [...delta, { role: "system", content: [] }], // empty array
+      [...delta, { role: "system", content: [{ type: "text", text: "" }] }], // empty text
+      [...delta, { role: "system", content: "" }], // empty string
+    ]) {
+      expect(coalesceCompleteToolResultContinuation(body, ["t1"], opts)).toBeUndefined()
+    }
+  })
+
+  it("fails on incomplete or split echoes even with a trailing reminder", () => {
+    const cases: Array<[Array<{ role?: unknown; content?: unknown }>, string[]]> = [
+      [[{ role: "user", content: [result("t1")], }, reminder("r")], ["t1"]], // missing echo
+      [[echo(["t1", "t2"]), { role: "user", content: [result("t1")] }, reminder("r")], ["t1", "t2"]], // partial results
+      // split echo: coalesce must reject it even though find never binds it
+      [[echo(["t1"]), echo(["t2"]), { role: "user", content: [result("t1"), result("t2")] }, reminder("r")], ["t1", "t2"]],
+    ]
+    for (const [messages, ids] of cases) {
+      expect(coalesceCompleteToolResultContinuation(messages, ids, opts)).toBeUndefined()
+    }
+  })
+
+  it("find accepts the actual suffix under the opt-in; default stays rejected", () => {
+    const body = [
+      { role: "user", content: "history" },
+      echo(["a"]),
+      { role: "user", content: [result("a")] },
+      reminder("reminder", true),
+    ]
+    expect(findCompleteToolResultCheckpoint(body, ["a"], opts))
+      .toEqual([{ role: "user", content: [result("a"), { type: "text", text: "reminder", cache_control: { type: "ephemeral" } }] }])
+    expect(findCompleteToolResultCheckpoint(body, ["a"])).toBeUndefined()
+  })
+
+  it("rejects a system message between two result turns", () => {
+    expect(coalesceCompleteToolResultContinuation(
+      [
+        echo(["t1", "t2"]),
+        { role: "user", content: [result("t1")] },
+        reminder("mid-conversation"),
+        { role: "user", content: [result("t2")] },
+      ],
+      ["t1", "t2"],
+      opts,
+    )).toBeUndefined()
+  })
+
+  it("rejects whitespace-only reminders in string and text-block form", () => {
+    const delta = [echo(["t1"]), { role: "user", content: [result("t1")] }]
+    expect(coalesceCompleteToolResultContinuation(
+      [...delta, { role: "system", content: "   " }],
+      ["t1"],
+      opts,
+    )).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation(
+      [...delta, { role: "system", content: [{ type: "text", text: "   " }] }],
+      ["t1"],
+      opts,
+    )).toBeUndefined()
+  })
+
+  it("accepts one reminder carrying two text blocks, both delivered in order", () => {
+    expect(coalesceCompleteToolResultContinuation(
+      [
+        echo(["t1"]),
+        { role: "user", content: [result("t1")] },
+        { role: "system", content: [{ type: "text", text: "first" }, { type: "text", text: "second" }] },
+      ],
+      ["t1"],
+      opts,
+    )).toEqual([{ role: "user", content: [result("t1"), { type: "text", text: "first" }, { type: "text", text: "second" }] }])
+  })
+
+  it("rejects object and number reminder content", () => {
+    const delta = [echo(["t1"]), { role: "user", content: [result("t1")] }]
+    expect(coalesceCompleteToolResultContinuation(
+      [...delta, { role: "system", content: { text: "shaped" } }],
+      ["t1"],
+      opts,
+    )).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation(
+      [...delta, { role: "system", content: 42 }],
+      ["t1"],
+      opts,
+    )).toBeUndefined()
+  })
+
+  it("rejects an echo carrying an extra unknown tool_use id alongside a valid reminder", () => {
+    expect(coalesceCompleteToolResultContinuation(
+      [
+        { role: "assistant", content: [
+          { type: "tool_use", id: "t1", name: "read", input: {} },
+          { type: "tool_use", id: "unknown-x", name: "read", input: {} },
+        ] },
+        { role: "user", content: [result("t1")] },
+        reminder("valid reminder"),
+      ],
+      ["t1"],
+      opts,
+    )).toBeUndefined()
+  })
+
+  it("tolerates adjacent thinking/text blocks in the echoing assistant message", () => {
+    // only tool_use blocks bind the echo; thinking/text neither reject nor reach the output
+    expect(coalesceCompleteToolResultContinuation(
+      [
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "hmm", signature: "sig" },
+          { type: "tool_use", id: "t1", name: "read", input: {} },
+          { type: "text", text: "Reading the file." },
+        ] },
+        { role: "user", content: [result("t1")] },
+        reminder("r"),
+      ],
+      ["t1"],
+      opts,
+    )).toEqual([{ role: "user", content: [result("t1"), { type: "text", text: "r" }] }])
+  })
+})
+
+describe("pi 0.85+ mid-conversation effort system messages (#1047)", () => {
+  it("detects effort metadata system messages accurately", () => {
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: [], output_config: { effort: "high" } })).toBe(true)
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: "", output_config: { effort: "medium" } })).toBe(true)
+    expect(isMidConvoEffortSystemMessage({ role: "system", output_config: { effort: "low" } })).toBe(true)
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: [{ type: "text", text: "" }], output_config: { effort: "max" } })).toBe(true)
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: [{ type: "text", text: "   " }], output_config: { effort: "xhigh" } })).toBe(true)
+
+    // Rejects messages with real instructions
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: "instruction", output_config: { effort: "high" } })).toBe(false)
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: [{ type: "text", text: "instruction" }], output_config: { effort: "high" } })).toBe(false)
+
+    // Rejects non-system or non-effort messages
+    expect(isMidConvoEffortSystemMessage({ role: "system", content: [] })).toBe(false)
+    expect(isMidConvoEffortSystemMessage({ role: "user", content: [], output_config: { effort: "high" } })).toBe(false)
+    expect(isMidConvoEffortSystemMessage(null)).toBe(false)
+    expect(isMidConvoEffortSystemMessage(undefined)).toBe(false)
+  })
+
+  it("coalesces tool result continuation when pi sends trailing effort system message without opt-in", () => {
+    const delta = [
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+      { role: "system", content: [], output_config: { effort: "high" } },
+    ]
+    // Default options (no allowTrailingSystemReminder) — pi is not Claude Code
+    const res = coalesceCompleteToolResultContinuation(delta, ["call_1"])
+    expect(res).toEqual([
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+    ])
+  })
+
+  it("admits effort system messages preceding assistant echo and trailing after user results", () => {
+    const delta = [
+      { role: "system", content: [], output_config: { effort: "high" } },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+      { role: "system", content: [], output_config: { effort: "high" } },
+    ]
+    const res = coalesceCompleteToolResultContinuation(delta, ["call_1"])
+    expect(res).toEqual([
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+    ])
+  })
+
+  it("findCompleteToolResultCheckpoint finds assistant checkpoint across mid-conversation effort messages", () => {
+    const history = [
+      { role: "user", content: "start" },
+      { role: "system", content: [], output_config: { effort: "high" } },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+      { role: "system", content: [], output_config: { effort: "high" } },
+    ]
+    const res = findCompleteToolResultCheckpoint(history, ["call_1"])
+    expect(res).toEqual([
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "data" }] },
+    ])
   })
 })

@@ -18,13 +18,24 @@ export const settingsPageHtml = `<!DOCTYPE html>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
          color: var(--text); padding: 0; line-height: 1.5; }
   ${profileBarCss}
-  .content { max-width: 900px; margin: 0 auto; padding: 24px; }
+  .container { max-width: 900px; margin: 0 auto; padding: 24px; }
   h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
   .nav { display: flex; gap: 16px; margin-bottom: 24px; font-size: 13px; }
   .nav a { color: var(--muted); text-decoration: none; }
   .nav a:hover { color: var(--accent); }
   .nav a.active { color: var(--accent); }
+
+  /* Harness tabs — dashboard.ts's tab rules, kept identical on purpose; wraps
+     because there are more harnesses than the dashboard's three panels. */
+  .tabs { display: flex; flex-wrap: wrap; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 10px 20px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer;
+         border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color 0.15s, border-color 0.15s;
+         user-select: none; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-dot { display: inline-block; width: 5px; height: 5px; border-radius: 50%; margin-left: 7px;
+             vertical-align: middle; background: var(--green); }
 
   .adapter-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
@@ -42,15 +53,23 @@ export const settingsPageHtml = `<!DOCTYPE html>
   .badge-active { background: rgba(63, 185, 80, 0.15); color: var(--green); }
   .badge-inactive { background: rgba(139, 148, 158, 0.15); color: var(--muted); }
 
-  .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (max-width: 600px) { .feature-grid { grid-template-columns: 1fr; } }
+  .feature-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 600px) { .feature-grid { grid-template-columns: minmax(0, 1fr); } }
+  /* Wide layout: two columns across the whole window put a toggle a thousand
+     pixels from its label, so rows keep their contained width and add columns.
+     The pricing table sizes to its columns for the same reason. */
+  html[data-layout="wide"] .feature-grid { grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); }
+  html[data-layout="wide"] .pricing-table { width: auto; }
 
   .feature-row {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 10px 14px; border-radius: 6px;
     background: var(--bg); border: 1px solid var(--border);
   }
-  .feature-info { display: flex; flex-direction: column; }
+  /* A select as wide as its longest option does not fit beside its label on
+     a phone: it goes below the label instead of past the card's edge. */
+  @media (max-width: 600px) { .feature-row { flex-wrap: wrap; } }
+  .feature-info { display: flex; flex-direction: column; min-width: 0; }
   .feature-label { font-size: 13px; font-weight: 500; }
   .feature-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
@@ -75,6 +94,7 @@ export const settingsPageHtml = `<!DOCTYPE html>
   .feature-select {
     background: var(--surface); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer;
+    min-width: 0; max-width: 100%; flex-shrink: 0;
   }
 
   .save-indicator {
@@ -91,16 +111,24 @@ export const settingsPageHtml = `<!DOCTYPE html>
   }
   .reset-btn:hover { border-color: var(--red); color: var(--red); }
 
-  /* Model pricing */
+  /* Model pricing. Four rate inputs cannot shrink to a phone viewport, so
+     the table scrolls inside its card instead of the page, and a model id
+     stays on one line rather than breaking into a column of fragments.
+     A rate is a few digits ($/Mtok such as 123.45), so its input is sized
+     to that; the spinner, useless at a 0.01 step, would cover the digits. */
+  .pricing-scroll { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
   .pricing-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .pricing-table th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500;
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
   .pricing-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
   .pricing-table tr:last-child td { border-bottom: none; }
-  .pricing-model { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  .pricing-model { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: nowrap; }
   .pricing-input { background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 8px; font-size: 12px; width: 84px; text-align: right;
     font-variant-numeric: tabular-nums; }
+  .pricing-table .pricing-input { width: calc(7ch + 18px); -moz-appearance: textfield; appearance: textfield; }
+  .pricing-table .pricing-input::-webkit-inner-spin-button,
+  .pricing-table .pricing-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   .pricing-input:focus { border-color: var(--accent); outline: none; }
   .pricing-badge { font-size: 10px; padding: 2px 8px; border-radius: 10px;
     text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
@@ -112,34 +140,60 @@ export const settingsPageHtml = `<!DOCTYPE html>
   .add-btn { background: var(--accent); border: none; color: #fff; border-radius: 6px;
     padding: 5px 14px; font-size: 12px; font-weight: 500; cursor: pointer; }
   .pricing-note { font-size: 11px; color: var(--muted); margin-top: 12px; line-height: 1.6; }
+  /* An executable path is one long unbroken string; on a phone it would widen
+     the whole page rather than wrap. */
+  #claude-exe-card code { overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 ${profileBarHtml}
-<div class="content">
-  <h1>SDK Features <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(210,153,34,0.15);color:var(--yellow);vertical-align:middle;margin-left:8px">Experimental</span></h1>
-  <p class="subtitle" style="max-width:720px;line-height:1.6">
-    Unlock Claude Code features for any connected agent. Capabilities like auto-memory, dreaming, and CLAUDE.md — normally
-    exclusive to Claude Code — become available to OpenCode, Crush, Droid, and any other harness routed through Meridian.
-    Each agent keeps its own toolchain while gaining access to these additional features.<br><br>
-    <strong style="color:var(--text)">System prompts:</strong> For these features to work correctly, both the Claude Code prompt and your client prompt
-    should be enabled. When both are active, they are appended together — Claude Code's base instructions come first,
-    followed by your agent's specific instructions.
-  </p>
-
-  <div id="adapters"></div>
-
-  <h1 style="margin-top:40px">Routing</h1>
+<div class="container">
+  <h1>Routing</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     How unpinned requests choose an account. <strong style="color:var(--text)">Active</strong> uses the manually
     selected profile. <strong style="color:var(--text)">Sticky</strong> distributes sessions across profiles evenly
     (cache-affine). <strong style="color:var(--text)">Priority</strong> drains the pool in order — highest first —
     and fails over per request when an account runs out; conversations keep their account, and new sessions
-    return to the preferred account after its window resets. An explicit <code>x-meridian-profile</code> header
+    return to the preferred account after its window resets.
+    <strong style="color:var(--text)">Active+priority</strong> keeps you in charge - every request goes to the
+    profile you selected - but the moment that account is refused, the request is re-sent to the next healthy
+    account in the pool order and answered from there, so the client never sees the error. Switching the active
+    profile moves running conversations too, which is the difference from priority. It reuses the same pool
+    order below; the active profile always goes first, wherever it sits in that list.
+    An explicit <code>x-meridian-profile</code> header
     always overrides. Changes apply to the next request — no restart needed.
   </p>
   <div class="adapter-card" id="routing-card">
     <div id="routing-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">SDK Features <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:rgba(210,153,34,0.15);color:var(--yellow);vertical-align:middle;margin-left:8px">Experimental</span></h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Choose SDK features for each connected agent. In passthrough, tools and project instructions come from the client;
+    Meridian does not load proxy-host CLAUDE.md, hooks, or MCP integrations. SDK-owned tool execution can use the host
+    instruction sources selected below. Memory and dreaming remain separate opt-ins.<br><br>
+    <strong style="color:var(--text)">System prompts:</strong> For these features to work correctly, both the Claude Code prompt and your client prompt
+    should be enabled. When both are active, they are appended together — Claude Code's base instructions come first,
+    followed by your agent's specific instructions.
+  </p>
+
+  <div class="tabs" id="adapterTabs"></div>
+  <div id="adapters"></div>
+
+  <div id="chatgpt-section" hidden>
+    <h1 style="margin-top:40px">ChatGPT</h1>
+    <p class="subtitle" style="max-width:720px;line-height:1.6">
+      GPT models are served from your ChatGPT subscription as a pass-through: Meridian adds no prompt and runs no
+      request plugins on them, and the SDK features above do not apply. These settings act only on the response
+      and on retries. Changes apply to the next request.
+    </p>
+    <div class="adapter-card">
+      <div class="adapter-header">
+        <span class="adapter-name">ChatGPT gateway</span>
+        <button class="reset-btn" onclick="resetChatGpt()">Reset</button>
+      </div>
+      <div class="feature-grid" id="chatgpt-grid"></div>
+    </div>
   </div>
 
   <h1 style="margin-top:40px">Model Pricing</h1>
@@ -149,10 +203,12 @@ ${profileBarHtml}
     dashboard until defined here). Changes apply on the next dashboard refresh.
   </p>
   <div class="adapter-card">
-    <table class="pricing-table">
-      <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th><th>Source</th><th></th></tr></thead>
-      <tbody id="pricingRows"></tbody>
-    </table>
+    <div class="pricing-scroll">
+      <table class="pricing-table">
+        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th><th>Source</th><th></th></tr></thead>
+        <tbody id="pricingRows"></tbody>
+      </table>
+    </div>
     <div class="pricing-add">
       <input type="text" class="pricing-input" id="newModelName" placeholder="model id (e.g. claude-opus-9)">
       <input type="number" class="pricing-input" id="newModelInput" placeholder="input" min="0" step="0.01">
@@ -164,8 +220,69 @@ ${profileBarHtml}
     <div class="pricing-note">
       Cache read and cache write are optional; when left blank they default to 0.1x and 1.25x of the
       input rate (the 5-minute cache TTL multipliers). Verify current list prices at
-      <a href="https://claude.com/pricing" target="_blank" rel="noreferrer" style="color:var(--accent)">claude.com/pricing</a>.
+      <a href="https://claude.com/pricing" target="_blank" rel="noreferrer" style="color:var(--accent)">claude.com/pricing</a>
+      and <a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noreferrer" style="color:var(--accent)">OpenAI pricing</a>.
     </div>
+  </div>
+
+  <h1 style="margin-top:40px">Telemetry Storage</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    What <a href="/telemetry" style="color:var(--accent)">/telemetry</a> remembers, and for how long. By default
+    telemetry lives in a fixed-size ring in memory: fast, free, and gone the moment the proxy restarts — which is
+    also why a window longer than an hour or so usually shows less than it names. Persisting moves it to SQLite,
+    where rows survive a restart and are deleted by age instead of by count.
+    <strong style="color:var(--text)">These settings apply on the next start, not to the running proxy.</strong>
+    The stores are built once at startup and cannot be swapped out from under requests already in flight.
+  </p>
+  <div class="adapter-card" id="telemetry-card">
+    <div id="telemetry-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Updates</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Meridian is installed and updated by hand, so an instance can sit on an old version for weeks without
+    anyone noticing. Switch this on and it asks the npm registry once a day whether a newer version is
+    published; the site header then says so, beside the version it is running. Off unless you turn it on —
+    nothing contacts the registry until then. The header shows the running version either way.
+  </p>
+  <div class="adapter-card" id="updates-card">
+    <div id="updates-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Claude Code Executable</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Which Claude Code runs each request. <strong style="color:var(--text)">System</strong> uses the <code>claude</code>
+    on your PATH, so an installation newer than Meridian's own copy can serve a model that copy is too old for; Meridian's
+    copy is used when there is none. <strong style="color:var(--text)">Bundled</strong> uses the copy Meridian ships with,
+    the version its Agent SDK was tested against, and falls back to PATH. <strong style="color:var(--text)">Custom</strong>
+    runs the executable at a path you choose. A change applies to the next request without a restart; requests already
+    running finish on the executable they started with. <code>MERIDIAN_CLAUDE_PATH</code>, when set, overrides this choice.
+  </p>
+  <div class="adapter-card" id="claude-exe-card">
+    <div id="claude-exe-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Site Header</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    With several Meridian instances open in tabs, they all look the same. Switch this on and the header names
+    the machine this one runs on, beside its status. Off unless you turn it on, because the hostname is then
+    also reported by <code>/health</code>, which answers without the API key.
+  </p>
+  <div class="adapter-card" id="header-card">
+    <div id="header-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Layout</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    How much of the window these pages use. <strong style="color:var(--text)">Contained</strong> keeps every page in
+    a centered column, the way Meridian has always looked. <strong style="color:var(--text)">Wide</strong> uses the
+    whole window, for a big monitor and many accounts: the home page fits more account cards on each row at about the
+    same size, and Profiles lays its larger cards out side by side, two to four to a row depending on the screen.
+    Phones get one column either way. The choice is saved on this Meridian, so every browser that opens it sees the same
+    layout. Other pages pick it up on their next load; this one switches as soon as you choose.
+  </p>
+  <div class="adapter-card" id="layout-card">
+    <div id="layout-body">Loading…</div>
   </div>
 </div>
 
@@ -175,7 +292,7 @@ ${profileBarHtml}
 const FEATURES = [
   { key: 'codeSystemPrompt', label: 'Claude Code Prompt', desc: 'Include the built-in Claude Code system prompt (tool usage rules, safety guidelines, coding best practices)', type: 'toggle' },
   { key: 'clientSystemPrompt', label: 'Client Prompt', desc: 'Include the system prompt sent by the connecting agent (e.g. OpenCode or Crush instructions)', type: 'toggle' },
-  { key: 'claudeMd', label: 'CLAUDE.md', desc: 'Load CLAUDE.md instruction files — Off: none, Project: ./CLAUDE.md only, Full: ~/.claude/CLAUDE.md + ./CLAUDE.md', type: 'select', options: ['off', 'project', 'full'] },
+  { key: 'claudeMd', label: 'CLAUDE.md', desc: 'Load host instruction files for SDK-owned tool execution — Off: none, Project: ./CLAUDE.md, Full: user + project. Passthrough ignores this setting and uses client context.', type: 'select', options: ['off', 'project', 'full'] },
   { key: 'memory', label: 'Memory', desc: 'Read and write memories across sessions', type: 'toggle' },
   { key: 'dreaming', label: 'Auto-Dream', desc: 'Background memory consolidation', type: 'toggle' },
   { key: 'thinking', label: 'Thinking', desc: 'Extended thinking mode', type: 'select', options: ['disabled', 'adaptive', 'enabled'] },
@@ -188,6 +305,33 @@ const FEATURES = [
   { key: 'sdkDebug', label: 'SDK Debug Logging', desc: 'Enable verbose SDK debug output to proxy stderr', type: 'toggle' },
   { key: 'additionalDirectories', label: 'Additional Directories', desc: 'Comma-separated extra paths Claude can access (monorepo libs, etc.)', type: 'text' },
 ];
+
+// ChatGPT gateway settings (/settings/api/chatgpt). Rendered only when this
+// instance serves ChatGPT; descriptions state the provider's own limits.
+const CHATGPT_FEATURES = [
+  { key: 'thinkingPassthrough', label: 'Thinking Passthrough', desc: 'Forward ChatGPT reasoning summaries to the client. ChatGPT is secretive about reasoning: it never shows the raw chain of thought, only short reasoning summary headers, and only when the client asks for a summary. Off removes those summaries; the encrypted reasoning the client must send back is always kept', type: 'toggle' },
+  { key: 'reasoningSummary', label: 'Reasoning Summary', desc: 'How much reasoning summary ChatGPT is asked for on every request, whatever the client chose. Clients pick a level per model variant, and some send none at all, so ChatGPT returns no summary. Detailed asks for the fullest summary ChatGPT offers. Summaries still reach the client only while Thinking Passthrough is on', type: 'summary' },
+  { key: 'maxBudgetUsd', label: 'Max Budget (USD)', desc: 'Per-request cost cap from OpenAI pricing (0 = disabled). Refused before sending when the input alone is over it, stopped mid-stream when the estimate passes it. Hidden reasoning tokens are only counted when the response ends', type: 'number' },
+  { key: 'fallbackModel', label: 'Fallback Model', desc: 'Retry once on this ChatGPT model when the requested one fails before any output was sent: a server error, every account rate limited, or the model refused. Never on a sign-in problem', type: 'select' },
+  { key: 'creditsPolicy', label: 'Codex Credits', desc: 'When a seat whose plan usage is used up may keep serving on its purchased Codex credits. Credits may be real money: ChatGPT spends them by itself once a seat\u2019s plan runs out, and an account with automatic reload is charged again every time its balance runs low. Meridian cannot see whether reload is on. Seats with plan usage left are never affected', type: 'policy' },
+  { key: 'freeSeatOrder', label: 'Free-Plan Seats', desc: 'Where a seat on ChatGPT\u2019s free plan ranks for work no profile is pinned to. It always comes after every paid seat with plan usage left, because a free seat refuses most Codex models, and it does so even when it is the active seat. A turn pinned to it still goes there', type: 'freeseat' },
+];
+const REASONING_SUMMARY_OPTIONS = [
+  { value: 'client', label: 'As the client asks (unchanged)' },
+  { value: 'auto', label: 'Auto' },
+  { value: 'concise', label: 'Concise' },
+  { value: 'detailed', label: 'Detailed' },
+];
+const FREE_SEAT_ORDER_OPTIONS = [
+  { value: 'before-credits', label: 'Before any seat spends credits (free usage costs nothing)' },
+  { value: 'after-credits', label: 'Only once no seat can serve on credits either' },
+];
+const CREDITS_POLICY_OPTIONS = [
+  { value: 'never', label: 'Never use credits' },
+  { value: 'reserve', label: 'Only when no seat has plan usage left' },
+  { value: 'immediately', label: 'As soon as the seat\u2019s plan usage is drained' },
+];
+let chatgptState = null;
 
 // Display names only — NOT the list of adapters to render. The page renders
 // whatever /settings/api/features returns, so a new adapter shows up here the
@@ -207,6 +351,7 @@ const ADAPTER_LABELS = {
 };
 
 let currentConfig = {};
+let selectedAdapter = null;
 
 async function loadConfig() {
   const res = await fetch('/settings/api/features');
@@ -232,6 +377,139 @@ async function resetAdapter(adapter) {
   showSaved();
 }
 
+async function loadChatGpt() {
+  const res = await fetch('/settings/api/chatgpt');
+  if (!res.ok) return;
+  chatgptState = await res.json();
+  document.getElementById('chatgpt-section').hidden = !chatgptState.enabled;
+  if (chatgptState.enabled) renderChatGpt();
+}
+
+function renderChatGpt() {
+  const grid = document.getElementById('chatgpt-grid');
+  grid.innerHTML = '';
+  const features = chatgptState.features;
+  for (const feat of CHATGPT_FEATURES) {
+    const row = document.createElement('div');
+    row.className = 'feature-row';
+    const info = document.createElement('div');
+    info.className = 'feature-info';
+    const label = document.createElement('span');
+    label.className = 'feature-label';
+    label.textContent = feat.label;
+    const desc = document.createElement('span');
+    desc.className = 'feature-desc';
+    desc.textContent = feat.desc;
+    info.append(label, desc);
+    row.appendChild(info);
+    if (feat.type === 'toggle') {
+      const toggle = document.createElement('label');
+      toggle.className = 'toggle';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = !!features[feat.key];
+      input.addEventListener('change', function () { saveChatGpt(feat.key, input.checked); });
+      const track = document.createElement('span');
+      track.className = 'toggle-track';
+      toggle.append(input, track);
+      row.appendChild(toggle);
+    } else if (feat.type === 'number') {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.className = 'feature-select';
+      input.style.width = '80px';
+      input.style.textAlign = 'right';
+      input.min = '0';
+      input.step = '0.01';
+      input.value = String(features[feat.key] ?? 0);
+      input.addEventListener('change', function () { saveChatGpt(feat.key, parseFloat(input.value) || 0); });
+      row.appendChild(input);
+    } else if (feat.type === 'policy') {
+      row.appendChild(policySelect(CREDITS_POLICY_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
+    } else if (feat.type === 'summary') {
+      row.appendChild(policySelect(REASONING_SUMMARY_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
+    } else if (feat.type === 'freeseat') {
+      row.appendChild(policySelect(FREE_SEAT_ORDER_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
+    } else {
+      const select = document.createElement('select');
+      select.className = 'feature-select';
+      [''].concat(chatgptState.models).forEach(function (model) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model === '' ? '(None)' : model;
+        option.selected = features[feat.key] === model;
+        select.appendChild(option);
+      });
+      select.addEventListener('change', function () { saveChatGpt(feat.key, select.value); });
+      row.appendChild(select);
+    }
+    grid.appendChild(row);
+  }
+  // Auto-reload is a property of each account, so each seat may differ from
+  // the instance's policy - stricter for one that reloads, looser for one
+  // whose credits are meant to be spent.
+  var seats = chatgptState.seats || [];
+  for (const seat of seats) {
+    const row = document.createElement('div');
+    row.className = 'feature-row';
+    const info = document.createElement('div');
+    info.className = 'feature-info';
+    const label = document.createElement('span');
+    label.className = 'feature-label';
+    label.textContent = 'Credits: ' + seat.id;
+    const desc = document.createElement('span');
+    desc.className = 'feature-desc';
+    desc.textContent = seat.label + ' \u2014 overrides the Codex Credits policy for this seat only';
+    info.append(label, desc);
+    row.appendChild(info);
+    const options = [{ value: 'inherit', label: 'Same as above (' + features.creditsPolicy + ')' }].concat(CREDITS_POLICY_OPTIONS);
+    row.appendChild(policySelect(options, seat.creditsPolicy || 'inherit', function (value) {
+      const patch = {};
+      patch[seat.id] = value;
+      saveChatGpt('seatCreditsPolicy', patch);
+    }));
+    grid.appendChild(row);
+  }
+}
+
+function policySelect(options, current, onChange) {
+  const select = document.createElement('select');
+  select.className = 'feature-select';
+  select.style.maxWidth = '100%';
+  options.forEach(function (choice) {
+    const option = document.createElement('option');
+    option.value = choice.value;
+    option.textContent = choice.label;
+    option.selected = current === choice.value;
+    select.appendChild(option);
+  });
+  select.addEventListener('change', function () { onChange(select.value); });
+  return select;
+}
+
+async function saveChatGpt(key, value) {
+  const patch = {};
+  patch[key] = value;
+  const res = await fetch('/settings/api/chatgpt', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(function () { return {}; });
+    alert(err.error || 'Failed to save ChatGPT settings');
+  } else {
+    showSaved();
+  }
+  await loadChatGpt();
+}
+
+async function resetChatGpt() {
+  await fetch('/settings/api/chatgpt', { method: 'DELETE' });
+  await loadChatGpt();
+  showSaved();
+}
+
 function showSaved() {
   const el = document.getElementById('saveIndicator');
   el.classList.add('visible');
@@ -247,69 +525,103 @@ function hasAnyEnabled(features) {
          features.additionalDirectories;
 }
 
-function render() {
-  const container = document.getElementById('adapters');
-  container.innerHTML = '';
+function selectAdapter(adapter) {
+  selectedAdapter = adapter;
+  render();
+}
+
+function renderTabs() {
+  const tabs = document.getElementById('adapterTabs');
+  tabs.innerHTML = '';
 
   for (const adapter of Object.keys(currentConfig)) {
-    const label = ADAPTER_LABELS[adapter] || adapter;
-    const features = currentConfig[adapter] || {};
-    const active = hasAnyEnabled(features);
+    const tabLabel = ADAPTER_LABELS[adapter] || adapter;
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (adapter === selectedAdapter ? ' active' : '');
+    tab.dataset.adapter = adapter;
+    tab.textContent = tabLabel;
+    // Stacked cards showed every harness's state at once and one body at a
+    // time cannot, so a harness that is off its defaults says so on its tab.
+    if (hasAnyEnabled(currentConfig[adapter] || {})) {
+      const dot = document.createElement('span');
+      dot.className = 'tab-dot';
+      dot.title = 'Customized — not on defaults';
+      tab.appendChild(dot);
+    }
+    tab.addEventListener('click', function () { selectAdapter(adapter); });
+    tabs.appendChild(tab);
+  }
+}
 
-    const card = document.createElement('div');
-    card.className = 'adapter-card';
-    card.innerHTML = '<div class="adapter-header">' +
-      '<span class="adapter-name">' + label + '</span>' +
-      '<div style="display:flex;gap:8px;align-items:center">' +
-        '<span class="adapter-badge ' + (active ? 'badge-active' : 'badge-inactive') + '">' +
-          (active ? 'Active' : 'Default') +
-        '</span>' +
-        '<button class="reset-btn" onclick="resetAdapter(\\''+adapter+'\\')">Reset</button>' +
-      '</div>' +
-    '</div>';
+function adapterCard(adapter) {
+  const label = ADAPTER_LABELS[adapter] || adapter;
+  const features = currentConfig[adapter] || {};
+  const active = hasAnyEnabled(features);
 
-    const grid = document.createElement('div');
-    grid.className = 'feature-grid';
+  const card = document.createElement('div');
+  card.className = 'adapter-card';
+  card.innerHTML = '<div class="adapter-header">' +
+    '<span class="adapter-name">' + label + '</span>' +
+    '<div style="display:flex;gap:8px;align-items:center">' +
+      '<span class="adapter-badge ' + (active ? 'badge-active' : 'badge-inactive') + '">' +
+        (active ? 'Active' : 'Default') +
+      '</span>' +
+      '<button class="reset-btn" onclick="resetAdapter(\\''+adapter+'\\')">Reset</button>' +
+    '</div>' +
+  '</div>';
 
-    for (const feat of FEATURES) {
-      const row = document.createElement('div');
-      row.className = 'feature-row';
+  const grid = document.createElement('div');
+  grid.className = 'feature-grid';
 
-      const info = '<div class="feature-info"><span class="feature-label">' +
-        feat.label + '</span><span class="feature-desc">' + feat.desc + '</span></div>';
+  for (const feat of FEATURES) {
+    const row = document.createElement('div');
+    row.className = 'feature-row';
 
-      if (feat.type === 'toggle') {
-        const checked = features[feat.key] ? 'checked' : '';
-        row.innerHTML = info +
-          '<label class="toggle"><input type="checkbox" ' + checked +
-          ' onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', this.checked)">' +
-          '<span class="toggle-track"></span></label>';
-      } else if (feat.type === 'select') {
-        const options = feat.options.map(o => {
-          const label = o === '' ? '(None)' : o.charAt(0).toUpperCase()+o.slice(1);
-          return '<option value="'+o+'"'+(features[feat.key]===o?' selected':'')+'>'+label+'</option>';
-        }).join('');
-        row.innerHTML = info +
-          '<select class="feature-select" onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', this.value)">' +
-          options + '</select>';
-      } else if (feat.type === 'number') {
-        const value = features[feat.key] ?? 0;
-        row.innerHTML = info +
-          '<input type="number" class="feature-select" style="width:80px;text-align:right" min="0" step="0.01" value="'+value+'"' +
-          ' onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', parseFloat(this.value)||0)">';
-      } else if (feat.type === 'text') {
-        const value = (features[feat.key] ?? '').toString().replace(/"/g, '&quot;');
-        row.innerHTML = info +
-          '<input type="text" class="feature-select" style="width:180px" value="'+value+'"' +
-          ' onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', this.value)">';
-      }
+    const info = '<div class="feature-info"><span class="feature-label">' +
+      feat.label + '</span><span class="feature-desc">' + feat.desc + '</span></div>';
 
-      grid.appendChild(row);
+    if (feat.type === 'toggle') {
+      const checked = features[feat.key] ? 'checked' : '';
+      row.innerHTML = info +
+        '<label class="toggle"><input type="checkbox" ' + checked +
+        ' onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', this.checked)">' +
+        '<span class="toggle-track"></span></label>';
+    } else if (feat.type === 'select') {
+      const options = feat.options.map(o => {
+        const label = o === '' ? '(None)' : o.charAt(0).toUpperCase()+o.slice(1);
+        return '<option value="'+o+'"'+(features[feat.key]===o?' selected':'')+'>'+label+'</option>';
+      }).join('');
+      row.innerHTML = info +
+        '<select class="feature-select" onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', this.value)">' +
+        options + '</select>';
+    } else if (feat.type === 'number') {
+      const value = features[feat.key] ?? 0;
+      row.innerHTML = info +
+        '<input type="number" class="feature-select" style="width:80px;text-align:right" min="0" step="0.01" value="'+value+'"' +
+        ' onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', parseFloat(this.value)||0)">';
+    } else if (feat.type === 'text') {
+      const value = (features[feat.key] ?? '').toString().replace(/"/g, '&quot;');
+      row.innerHTML = info +
+        '<input type="text" class="feature-select" style="width:180px" value="'+value+'"' +
+        ' onchange="saveFeature(\\''+adapter+'\\', \\''+feat.key+'\\', this.value)">';
     }
 
-    card.appendChild(grid);
-    container.appendChild(card);
+    grid.appendChild(row);
   }
+
+  card.appendChild(grid);
+  return card;
+}
+
+function render() {
+  const names = Object.keys(currentConfig);
+  if (names.indexOf(selectedAdapter) === -1) selectedAdapter = names[0] || null;
+
+  renderTabs();
+
+  const container = document.getElementById('adapters');
+  container.innerHTML = '';
+  if (selectedAdapter) container.appendChild(adapterCard(selectedAdapter));
 }
 
 // ---- Model pricing (telemetry cost estimate) ----
@@ -439,10 +751,14 @@ async function loadRouting() {
   let h = '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">'
     + '<label style="color:var(--muted);font-size:13px;width:90px">Mode</label>'
     + '<select id="routing-mode" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
-    + ['active','sticky','priority'].map(m => '<option value="'+m+'"'+(cfg.routing===m?' selected':'')+'>'+m+'</option>').join('')
+    + (cfg.modes || ['active','sticky','priority']).map(m => '<option value="'+m+'"'+(cfg.routing===m?' selected':'')+'>'+m+'</option>').join('')
     + '</select>' + envNote(cfg.envOverride.routing) + '</div>';
-  h += '<div id="routing-order-wrap" style="'+(cfg.routing==='priority'?'':'display:none')+'">'
-    + '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">Pool order — highest priority first. Drained top to bottom.'
+  var usesPool = cfg.routing === 'priority' || cfg.routing === 'active+priority';
+  h += '<div id="routing-order-wrap" style="'+(usesPool?'':'display:none')+'">'
+    + '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">'
+    + (cfg.routing === 'active+priority'
+        ? 'Fallback order - used when the active profile runs out. The active profile always goes first, wherever it sits in this list.'
+        : 'Pool order — highest priority first. Drained top to bottom.')
     + envNote(cfg.envOverride.profileOrder) + '</div>'
     + '<ol id="routing-order" style="margin:0;padding-left:22px">'
     + cfg.profileOrder.map((id, i) =>
@@ -467,9 +783,318 @@ async function loadRouting() {
   }));
 }
 
+function telemetryBytes(n) {
+  if (n == null) return null;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+function telemetryEsc(s) {
+  return String(s).replace(/[&<>"']/g, function (ch) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  });
+}
+
+// The saved value drives the form; the EFFECTIVE one is what the proxy is
+// actually doing. Rendering only the former is the failure mode this whole card
+// exists to avoid — a form that reads back what you typed and implies it landed.
+function telemetryRow(label, control, effective, note) {
+  return '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">'
+    + '<label style="color:var(--muted);font-size:13px;width:150px">' + label + '</label>'
+    + control
+    + '<span style="color:var(--muted);font-size:12px">now: ' + effective + '</span>'
+    + (note || '')
+    + '</div>';
+}
+
+async function loadTelemetry() {
+  const res = await fetch('/settings/api/telemetry');
+  const cfg = await res.json();
+  const el = document.getElementById('telemetry-body');
+  const live = cfg.effective || {};
+  const lim = cfg.limits || {};
+  const envNote = (on) => on ? ' <span style="font-size:11px;color:var(--yellow)">(env override active — setting saved but env wins)</span>' : '';
+  const persisting = live.kind === 'sqlite';
+
+  const num = (key, value, suffix) => {
+    const l = lim[key] || { min: 1, max: 1000000 };
+    return '<input type="number" id="tel-' + key + '" value="' + (value == null ? '' : value) + '"'
+      + ' min="' + l.min + '" max="' + l.max + '" step="1" placeholder="default"'
+      + ' style="width:110px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
+      + (suffix ? ' <span style="color:var(--muted);font-size:12px">' + suffix + '</span>' : '');
+  };
+
+  let h = telemetryRow('Persist to SQLite',
+    '<input type="checkbox" id="tel-persist"' + (cfg.wanted.persist ? ' checked' : '') + '>',
+    persisting ? 'SQLite' : 'memory',
+    envNote(cfg.envOverride.telemetryPersist));
+
+  h += telemetryRow('Retention',
+    num('telemetryRetentionDays', cfg.saved.telemetryRetentionDays, 'days'),
+    persisting ? (live.retentionDays + 'd') : 'n/a while in memory',
+    envNote(cfg.envOverride.telemetryRetentionDays));
+
+  h += telemetryRow('Request ring size',
+    num('telemetrySize', cfg.saved.telemetrySize, 'rows'),
+    persisting ? 'n/a while persisting' : (live.capacity == null ? '—' : live.capacity.toLocaleString()),
+    envNote(cfg.envOverride.telemetrySize));
+
+  h += telemetryRow('Diagnostic log size',
+    num('diagnosticLogSize', cfg.saved.diagnosticLogSize, 'entries'),
+    persisting ? 'n/a while persisting' : (live.diagnosticLogCapacity == null ? '—' : live.diagnosticLogCapacity.toLocaleString()),
+    envNote(cfg.envOverride.diagnosticLogSize));
+
+  const held = (live.held == null ? 0 : live.held).toLocaleString();
+  let state = 'Holding ' + held + ' request' + (live.held === 1 ? '' : 's');
+  if (persisting) {
+    state += ' in ' + telemetryEsc(live.dbPath || 'SQLite');
+    const size = telemetryBytes(live.dbBytes);
+    if (size) state += ' (' + size + ')';
+  } else {
+    state += ' in memory — lost on restart';
+  }
+  h += '<div class="pricing-note" style="margin-top:4px">' + state + '</div>';
+
+  // The only honest thing a page can offer for a restart-scoped setting: name
+  // the exact command for how THIS proxy was started. Guessing systemctl at a
+  // process started by hand sends someone chasing a unit that does not exist.
+  if (cfg.pendingRestart && cfg.pendingRestart.length > 0) {
+    const sup = cfg.supervision || {};
+    h += '<div class="pricing-note" style="margin-top:10px;color:var(--yellow)">'
+      + 'Saved, but not in effect: <strong>' + cfg.pendingRestart.map(telemetryEsc).join('</strong>, <strong>') + '</strong>. '
+      + (sup.restartCommand
+          ? 'Restart to apply: <code style="color:var(--text)">' + telemetryEsc(sup.restartCommand) + '</code>'
+          : 'Restart Meridian to apply.')
+      + '</div>';
+  }
+
+  h += '<div class="pricing-note" style="margin-top:10px">'
+    + 'Leave a number blank to use the default. The database path is set with '
+    + '<code>MERIDIAN_TELEMETRY_DB</code> and is deliberately not editable here.'
+    + '</div>';
+
+  el.innerHTML = h;
+
+  document.getElementById('tel-persist').addEventListener('change', async (e) => {
+    await putTelemetry({ telemetryPersist: e.target.checked });
+  });
+  ['telemetryRetentionDays', 'telemetrySize', 'diagnosticLogSize'].forEach((key) => {
+    const input = document.getElementById('tel-' + key);
+    if (!input) return;
+    input.addEventListener('change', async () => {
+      const raw = input.value.trim();
+      const body = {};
+      body[key] = raw === '' ? null : Number(raw);
+      await putTelemetry(body);
+    });
+  });
+}
+
+async function putTelemetry(body) {
+  const res = await fetch('/settings/api/telemetry', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save telemetry settings');
+  } else {
+    showSaved();
+  }
+  await loadTelemetry();
+}
+
+async function loadUpdates() {
+  const cfg = await (await fetch('/settings/api/updates')).json();
+  const build = cfg.build || {};
+
+  let state;
+  if (cfg.envOptOut) state = 'forced off';
+  else if (!cfg.checkForUpdates) state = 'not checking';
+  else if (!build.latest) state = 'checking…';
+  else state = build.updateAvailable ? telemetryEsc(build.latest) + ' available' : 'up to date';
+
+  document.getElementById('updates-body').innerHTML = telemetryRow('Check for updates',
+    '<input type="checkbox" id="upd-enabled"' + (cfg.checkForUpdates ? ' checked' : '') + (cfg.envOptOut ? ' disabled' : '') + '>',
+    state,
+    cfg.envOptOut ? ' <span style="font-size:11px;color:var(--yellow)">(MERIDIAN_NO_UPDATE_CHECK=1 wins over this setting)</span>' : '')
+    + '<div class="pricing-note" style="margin-top:4px">Running ' + telemetryEsc(build.version || 'unknown')
+      + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build; the header shows its separate release and runtime provenance' : '')
+      + '.</div>';
+
+  const box = document.getElementById('upd-enabled');
+  if (box && !cfg.envOptOut) box.addEventListener('change', (e) => putUpdates(e.target.checked));
+}
+
+async function putUpdates(checkForUpdates) {
+  const res = await fetch('/settings/api/updates', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ checkForUpdates }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save update settings');
+  } else {
+    showSaved();
+    if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  }
+  await loadUpdates();
+}
+
+function claudeExeCandidate(c) {
+  if (!c || !c.path) return '<span style="color:var(--muted)">' + telemetryEsc((c && c.detail) || 'not available') + '</span>';
+  return '<code>' + telemetryEsc(c.path) + '</code> '
+    + (c.version ? telemetryEsc(c.version) : '<span style="color:var(--yellow)">' + telemetryEsc(c.detail || 'version unknown') + '</span>');
+}
+
+async function loadClaudeExecutable() {
+  let cfg;
+  try {
+    const response = await fetch('/settings/api/claude-executable');
+    cfg = await response.json();
+    if (!response.ok) throw new Error(cfg.error || 'Failed to load the Claude Code executable');
+  } catch (error) {
+    document.getElementById('claude-exe-body').innerHTML = '<div role="alert" style="color:var(--red)">'
+      + telemetryEsc(error.message || 'Failed to load the Claude Code executable')
+      + '</div><button class="add-btn" id="claude-exe-retry" style="margin-top:12px">Retry</button>';
+    document.getElementById('claude-exe-retry').addEventListener('click', loadClaudeExecutable);
+    return;
+  }
+  const cands = cfg.candidates || {};
+  const modes = cfg.modes || ['system', 'bundled', 'custom'];
+  const select = '<select id="claude-exe-mode" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
+    + modes.map(m => '<option value="' + m + '"' + (cfg.mode === m ? ' selected' : '') + '>' + m + '</option>').join('')
+    + '</select>';
+  const active = cfg.active
+    ? claudeExeCandidate(cfg.active) + ' <span style="color:var(--muted)">(' + telemetryEsc(cfg.active.source) + ')</span>'
+    : '<span style="color:var(--red)">' + telemetryEsc(cfg.activeError || 'none resolved') + '</span>';
+  const envNote = !cfg.envOverride ? ''
+    : ' <span style="font-size:11px;color:var(--yellow)">('
+      + (cfg.active && cfg.active.source === 'env'
+        ? 'MERIDIAN_CLAUDE_PATH wins over this setting'
+        : 'MERIDIAN_CLAUDE_PATH is set but not used: ' + telemetryEsc(cfg.envOverride.detail || 'it cannot run'))
+      + ')</span>';
+  let h = telemetryRow('Executable', select, active, envNote);
+  h += '<div class="pricing-note" style="margin-top:4px">System: ' + claudeExeCandidate(cands.system) + '</div>';
+  h += '<div class="pricing-note" style="margin-top:4px">Bundled: ' + claudeExeCandidate(cands.bundled) + '</div>';
+  h += '<div style="display:flex;align-items:center;gap:8px;margin-top:14px;flex-wrap:wrap">'
+    + '<label for="claude-exe-path" style="color:var(--muted);font-size:13px;width:150px">Custom path</label>'
+    + '<input type="text" class="pricing-input" id="claude-exe-path" style="width:360px;max-width:100%;text-align:left"'
+    + ' placeholder="/absolute/path/to/claude" value="' + telemetryEsc(cfg.customPath || '') + '">'
+    + '<button class="add-btn" id="claude-exe-use">Use this path</button>'
+    + '</div>';
+  if (cfg.customPath) h += '<div class="pricing-note" style="margin-top:4px">Custom: ' + claudeExeCandidate(cands.custom) + '</div>';
+  document.getElementById('claude-exe-body').innerHTML = h;
+
+  const pathInput = document.getElementById('claude-exe-path');
+  const chosenPath = () => pathInput.value.trim() || undefined;
+  document.getElementById('claude-exe-mode').addEventListener('change', (e) => {
+    putClaudeExecutable(e.target.value === 'custom' ? { mode: 'custom', path: chosenPath() } : { mode: e.target.value });
+  });
+  document.getElementById('claude-exe-use').addEventListener('click', () => putClaudeExecutable({ mode: 'custom', path: chosenPath() }));
+}
+
+// Saving runs the chosen executable's --version first, which a cold binary can
+// take a while to answer, so the controls stay disabled until the reply.
+async function putClaudeExecutable(body) {
+  document.querySelectorAll('#claude-exe-body select, #claude-exe-body input, #claude-exe-body button')
+    .forEach(control => { control.disabled = true; });
+  try {
+    const res = await fetch('/settings/api/claude-executable', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Failed to save the Claude Code executable');
+    } else {
+      showSaved();
+    }
+  } catch {
+    alert('Failed to save the Claude Code executable');
+  }
+  await loadClaudeExecutable();
+}
+
+async function loadHeaderSettings() {
+  const cfg = await (await fetch('/settings/api/header')).json();
+  document.getElementById('header-body').innerHTML = telemetryRow('Show hostname',
+    '<input type="checkbox" id="hdr-hostname" aria-label="Show hostname"' + (cfg.showHostname ? ' checked' : '') + '>',
+    cfg.showHostname ? 'shown' : 'hidden',
+    ' <span style="font-size:12px;color:var(--muted)">This machine: <code>' + telemetryEsc(cfg.hostname || 'unknown') + '</code></span>');
+  document.getElementById('hdr-hostname').addEventListener('change', (e) => putHeaderSettings(e.target.checked));
+}
+
+async function putHeaderSettings(showHostname) {
+  const checkbox = document.getElementById('hdr-hostname');
+  checkbox.disabled = true;
+  try {
+    const res = await fetch('/settings/api/header', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ showHostname }),
+    });
+    if (!res.ok) {
+      checkbox.checked = !showHostname;
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Failed to save header settings');
+    } else {
+      showSaved();
+      if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+    }
+  } catch {
+    checkbox.checked = !showHostname;
+    alert('Failed to save header settings');
+  } finally {
+    try { await loadHeaderSettings(); }
+    catch { alert('Failed to reload header settings'); }
+    checkbox.disabled = false;
+  }
+}
+
+async function loadLayout() {
+  const cfg = await (await fetch('/settings/api/layout')).json();
+  const el = document.getElementById('layout-body');
+  el.innerHTML = '<div style="display:flex;align-items:center;gap:12px">'
+    + '<label for="layout-mode" style="color:var(--muted);font-size:13px;width:90px">Layout</label>'
+    + '<select id="layout-mode" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
+    + (cfg.layouts || ['contained', 'wide']).map(l => '<option value="'+l+'"'+(cfg.layout===l?' selected':'')+'>'+l+'</option>').join('')
+    + '</select></div>';
+  document.getElementById('layout-mode').addEventListener('change', (e) => putLayout(e.target.value));
+}
+
+async function putLayout(layout) {
+  const res = await fetch('/settings/api/layout', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layout }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save the layout');
+  } else {
+    const saved = await res.json();
+    if (saved.layout === 'contained') document.documentElement.removeAttribute('data-layout');
+    else document.documentElement.setAttribute('data-layout', saved.layout);
+    showSaved();
+  }
+  await loadLayout();
+}
+
 loadConfig();
+loadChatGpt();
 loadPricing();
 loadRouting();
+loadTelemetry();
+loadUpdates();
+loadClaudeExecutable();
+loadHeaderSettings();
+loadLayout();
 ${profileBarJs}
 </script>
 </body>

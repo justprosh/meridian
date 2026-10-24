@@ -12,13 +12,16 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { assistantMessage, messageStart, textBlockStart, textDelta, blockStop, messageDelta, messageStop, withMockSdkSessionId } from "./helpers"
 
 let mockMessages: any[] = []
 let capturedQueryParams: any = null
 let savedPassthrough: string | undefined
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
@@ -29,14 +32,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-pretooluse-hook.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -79,12 +82,12 @@ Available agent types and the tools they have access to:
 }
 
 describe("PreToolUse hook: agent name correction", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -206,12 +209,12 @@ describe("PreToolUse hook: agent name correction", () => {
 })
 
 describe("SDK agents option", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -281,12 +284,12 @@ describe("SDK agents option", () => {
 })
 
 describe("PreToolUse hook: cleanup of old hacks", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -332,12 +335,12 @@ describe("PreToolUse hook: passthrough ToolSearch", () => {
   // `ZodError: expected object, received undefined` and cascade into
   // `Reached maximum number of turns (2)`. The hook must return an object
   // (at minimum `{}`) so the SDK can continue handling ToolSearch internally.
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     process.env.MERIDIAN_PASSTHROUGH = "1"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -415,14 +418,14 @@ describe("PreToolUse hook: deny reasons must not promise delivery for dropped ca
   // normal forwarded reason — the dropped-call reason only applies in
   // legacy mode (and to forced-single, which is mode-independent).
   let savedEarlyStop: string | undefined
-  beforeEach(() => {
+  beforeEach(async () => {
     savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
     savedEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
     process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = "0"
     mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
     capturedQueryParams = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {

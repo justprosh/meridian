@@ -30,7 +30,7 @@ linearGradient (vertical): #58a6ff → #bc8cff
 **Wordmark:** `MERIDIAN`, uppercase, weight 700, generous letter-spacing
 (2px at header size, 10px at banner size), in `--text`.
 
-**Tagline:** “Harness Claude, your way.”
+**Tagline:** “Claude & Antigravity, in your tools.”
 
 **Asset inventory** (change the mark → update ALL of these together):
 
@@ -75,8 +75,9 @@ Meridian is deliberately **two-tone**: blue and violet appear together only
 in the brand gradient. Everywhere else, each has a fixed job:
 
 - **Blue (`--accent`)** = *you can click it, or it is the active thing.*
-  Links, nav highlight, buttons, focus rings, active tab underline, the
-  active account card border + pill, section emphasis.
+  Links, nav highlight, buttons, focus rings, active tab underline, section
+  emphasis. The one exception is the active *account* card, whose border and
+  pill are its provider's brand (see Provider brands below).
 - **Violet (`--accent2`)** = *literal or meta, never interactive.*
   Inline code / command snippets, mono identifiers, and the telemetry
   dashboard’s session-lineage & meta annotations (e.g. the `undo` lineage
@@ -95,7 +96,56 @@ green `rgba(63,185,80,α)`, yellow `rgba(210,153,34,α)`, red
 
 Usage bars and percentage readouts color by value: `< 60%` green,
 `≥ 60%` yellow, `≥ 85%` red. Health dot: healthy green (with soft glow),
-degraded yellow, offline red.
+degraded yellow, offline red. With the opt-in `showHostname` setting the pill
+names the machine after its status (`Operational · nwkr-desktop`), first DNS
+label only with the full name on hover; at phone width the name stays,
+ellipsized, and keeps its separator only where the status text stays too.
+When native Claude traffic from this instance reports definite connection failures,
+the health pill becomes a red tinted pill ("Claude connection failed") and a
+yellow one ("Rechecking Claude connection") while traffic is let back in.
+Details identify this instance's configured Claude egress and are available
+on hover across the trigger, gap and panel or native-button activation;
+Escape or blur dismisses them. The button's accessible name always includes
+the current status and any displayed opt-in hostname, including at phone width.
+Both keep their text at phone width, where the plain status shows only its dot.
+Draining and offline status retain precedence; combined instances name Claude
+explicitly and do not imply Antigravity is unavailable. Existing hostname and
+provenance composition remains shared across pages.
+
+### Provider brands
+
+Account cards on `/` and `/profiles` show which provider an account belongs
+to, and which account is active for each provider, in that provider's brand.
+Brand colours appear on account cards and their provider chips and headings,
+nowhere else.
+
+| Token | Value | Use |
+|---|---|---|
+| `--claude` | `#c15f3c` | Claude accounts |
+| `--chatgpt` | `#74aa9c` | ChatGPT seats |
+
+Each has `-bright` (the brand mixed 30% toward white: hover, badge and pill
+text) and `-rgb` (tinted fills). A card's `.provider-<id>` class
+(`profileProviders.ts`) points `--brand`, `--brand-bright` and `--brand-rgb`
+at its provider, so card CSS never names one.
+
+- **Every card:** a brand stripe on its left edge and a brand badge naming
+  the provider.
+- **Active:** brand border + 1px brand ring, brand dot and brand Active pill.
+  There is one per provider.
+- **Switchable on hover:** `-bright` border with a faint brand fill.
+- **Spent or failing:** shown by dimming and the existing badges. The active
+  border is never recoloured or faded, and the active card's name row, with
+  its Active pill and spent badge, never dims. Only its figures do.
+- **Needs a login:** a red border, the same for every provider, and a
+  needs-login badge. An active card keeps its brand ring outside the red.
+- **Controls stay blue:** buttons, links, focus rings, drag handles and drop
+  targets.
+
+ChatGPT's brand is its green-grey, not its violet `#ab68ff`. The violet shares
+`--accent2`'s hue (ΔE2000 9), and its brighter tint is `--accent2` itself.
+The web UI is dark-only. A light theme would need `#4a8a7a` for ChatGPT
+(4.0:1 on white), because `#74aa9c` there is 2.6:1.
 
 ## 3. The backsplash
 
@@ -127,9 +177,22 @@ Every HTML page is assembled the same way:
    dashboard uses full-width padding instead)
 5. `profileBarJs` appended to the page script
 
+**Wide layout.** The `layout` setting (Settings → Layout) serves every page
+with `data-layout="wide"` on `<html>`. The shared rule in `profileBarCss`
+then lifts the `.container` max-width and pads it and the header with
+`--page-gutter` (`clamp(16px, 3vw, 48px)`). A page that lays out cards or
+label/value rows adds its own `html[data-layout="wide"]` rule so a value
+never ends up a screen away from its label: the home page keeps its card size
+and adds columns, `/profiles` shows larger cards side by side, and Settings
+and Providers keep rows and cards about as wide as when contained. The content
+wrapper must be `.container` for any of this to reach it. A contained page
+carries no attribute, so it renders as before.
+
 **The header owns the brand.** It shows the mark + wordmark (links home),
 the site nav (Home · Telemetry · Profiles · Settings · Plugins), the
-active-profile chip, and the live health pill. Consequences:
+active-profile chip, the live health pill, the running version to its right,
+and — when the update check is on and a newer release exists — a blue
+update badge after that. Consequences:
 
 - Page `<h1>` is the *page name* (“Telemetry”, “Profiles”) — never
   “Meridian”, never a logo. Subtitle below it: 13–14px `--muted`.
@@ -154,15 +217,17 @@ account card on the home page (or the Profiles page). The header chip only
 ## 6. Component vocabulary
 
 - **Card:** `--surface`, 1px `--border`, radius 12px, padding 16–20px.
-  Active card: `--accent` border + 1px accent ring. Clickable cards get
-  `cursor: pointer` and an accent border on hover, plus a hover-revealed
-  uppercase hint (e.g. “Click to activate”).
+  Active account card: its provider's brand border + 1px brand ring.
+  Clickable cards get `cursor: pointer` and a hover border (the brighter
+  provider brand on an account card), plus a hover-revealed uppercase hint
+  (e.g. “Click to activate”).
 - **Stats strip:** one flex row of cells separated by 1px `--border`
   dividers inside a single card — label (micro-label), value (20px/700),
   optional muted detail line. Use instead of a grid of chunky cards.
 - **Pills:** radius 10–20px, tinted fill + tinted border of the same hue
-  (e.g. Active pill: blue text on `rgba(88,166,255,0.12)` with
-  `rgba(88,166,255,0.35)` border). Status badges: green/muted/red variants.
+  (e.g. the update chip: blue text on `rgba(88,166,255,0.12)` with
+  `rgba(88,166,255,0.35)` border; an account's Active pill does the same in
+  its provider's brand). Status badges: green/muted/red variants.
 - **Usage bar:** 6–8px track in `--surface2`, radius 3–4px, fill colored
   by the utilization thresholds; percentage readout matches the fill color.
 - **Buttons:** `--surface2` fill, accent text + accent border; hover =
@@ -173,6 +238,16 @@ account card on the home page (or the Profiles page). The header chip only
 - **Inline code chip:** mono, `--surface`/`--bg` fill, 1px border, radius
   4–5px, **violet text** (`--accent2`).
 - **Empty states:** calm centered `--muted` text in a card — never red.
+- **Header build badge:** a current npm install shows nothing; an
+  outdated one shows the blue update chip linking to releases. A local or
+  dev build shows one violet metadata pill (release · build number or
+  "source run" · branch · short commit · dirty) on a single line, with the
+  branch ellipsized first and full values in the tooltip. Branch and commit
+  are blue links only when the backend supplies a credential-free HTTPS URL;
+  otherwise they stay violet text. Unknown fields are omitted. Drift is a
+  separate chip: muted for current or unknown states, yellow only for real
+  drift ("3 builds behind", "rolled back", "source changed"). A failed
+  drift refresh shows "drift unknown" and never changes the health pill.
 
 ## 7. Principles
 
@@ -193,8 +268,70 @@ account card on the home page (or the Profiles page). The header chip only
 ## 8. New-page checklist
 
 - [ ] Prepends `themeCss`, embeds `profileBarCss/Html/Js`
+- [ ] Content wrapper is `.container`; the route serves the page through `withSavedLayout`
 - [ ] No `body` background, no hardcoded hex colors, tokens only
 - [ ] `<h1>` = page name + muted subtitle; header handles brand/status
 - [ ] Nav link added to `profileBarHtml` (and its active-state id)
 - [ ] Blue = interactive/active · violet = code/meta · semantic colors earned
 - [ ] Layout contract covered in `src/__tests__/site-header.test.ts`
+
+## Native desktop preview
+
+The optional `apps/desktop` shell uses native window controls and sidebar
+navigation instead of the web `profileBar` header. Its system light/dark tokens
+live alongside `themeCss` in `desktopThemeCss` in `profileBar.ts`; this explicit
+native-shell exception does not change the shared header contract for web pages.
+The build extracts those tokens into the desktop stylesheet. Native Liquid
+Glass appears in the sidebar and compact menu-bar panel, with nearly opaque content surfaces
+for telemetry legibility. Blue remains interactive and violet remains metadata.
+
+The interface labels itself as a preview. Unsupported lifecycle controls are
+not presented as working actions; external service ownership stays visible.
+
+The menu-bar panel prioritizes cache reuse, connection health and account limits.
+Account switching and owned service controls remain available without opening the
+dashboard. It uses system typography, canonical light/dark tokens, blue active
+accounts and violet cache metrics. Escape or loss of focus dismisses the panel;
+missing or stale quota data never looks like unused capacity.
+
+Menu-bar accounts use compact rows with side-by-side quota bars, so multiple
+accounts and their switch controls remain visible together. The active account
+shows its next reset; each limit retains full reset detail in its tooltip and
+accessible name. Account lists scroll only when they exceed the available space. Each account
+reserves a separate line for its name and action; plan/allowance and organization
+are secondary text, never a row of non-shrinking badges. The 5-hour and weekly
+limits are primary; model-specific limits live in a disclosure that stays open
+through refresh. Service controls stay outside the scrolling account list.
+
+The macOS menu-bar icon uses a transparent monochrome Meridian template, tinted
+by the system. The Dock retains the full-color app icon unless the macOS **Hide Dock icon**
+preference is enabled; the menu-bar icon and dashboard remain available. Committed 18-point
+assets include 1x, 2x and 3x representations; regenerate them with
+`swift scripts/render-tray-icon.swift`.
+
+
+## 9. Provider navigation
+
+`/providers` and Meridian Desktop share `telemetry/providerView.ts`. The primary
+filter is All providers / Claude / Antigravity. A compact stats strip summarizes
+observed hourly activity; provider cards own their accounts, model catalogues,
+quota windows and management links. Never add subscription percentages across
+providers or show an unavailable reading as zero. Old readings remain visible
+with stale labels while background refresh runs.
+
+Keep provider identity separate from model identity: Claude models reached
+through Antigravity consume a Google allowance. Claude profile controls stay
+inside the Claude account view. Shared totals must label partial data. Use the
+existing blue active underline, neutral cards, violet endpoint/model literals,
+and semantic quota thresholds. The provider brands (§2) stay on account cards.
+
+`/` and `/profiles` list every account in one grid, grouped by provider
+(Claude, then ChatGPT) under a heading for each. Chips above the grid show or
+hide a provider. All chips start on, the browser remembers the choice for both
+pages, and chips appear only while two or more providers have accounts. A
+card moves only among its own provider's cards, because each provider's pool
+is ranked on its own.
+
+The desktop menu bar separates account quota groups and labels combined activity.
+Provider selection belongs in managed-service settings, with tool permission as
+a separate opt-in. An attached service remains controlled by its owner.

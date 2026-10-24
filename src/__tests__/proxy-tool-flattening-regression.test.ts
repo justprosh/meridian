@@ -11,6 +11,8 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -28,7 +30,7 @@ let capturedParams: CapturedParams | null = null
 let queuedSessionIds: string[] = []
 function getCaptured(): CapturedParams | null { return capturedParams }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: unknown) => {
     capturedParams = params as CapturedParams
     const options = (params as CapturedParams).options
@@ -42,9 +44,9 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-tool-flattening-regression.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => Promise<Response> | Response) => fn(),
 }))
@@ -122,11 +124,11 @@ const history = [
   { role: "user", content: "now read it back to me" },
 ]
 
-beforeEach(() => {
+beforeEach(async () => {
   mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
   capturedParams = null
   queuedSessionIds = []
-  clearSessionCache()
+  await clearSessionCache()
   clearSharedSessions()
 })
 
@@ -159,7 +161,7 @@ describe("Issue #386 — tool_use blocks must not leak into SDK prompt as text",
     ], "sdk-rehydrate")
 
     // Simulate proxy restart: wipe in-memory cache (shared store remains)
-    clearSessionCache()
+    await clearSessionCache()
 
     // Turn 2 — same session header, full history with tool_use blocks
     capturedParams = null
@@ -249,8 +251,8 @@ describe("tool-result attribution on full-history replay (#552)", () => {
     },
   ]
 
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     clearSharedSessions()
     capturedParams = null
     mockMessages = [assistantMessage([{ type: "text", text: "You created tmp/test2.txt" }])]
@@ -369,5 +371,37 @@ describe("transcript-format imitation (#496 self-talk regression)", () => {
     expect(prompt).toContain("[Assistant: Paris.]")
     expect(prompt).toContain("what is the capital of France?")
     expect(prompt).toContain("and of Germany?")
+  })
+})
+
+describe("fresh passthrough replay tool names (#1107)", () => {
+  it("shows the registered MCP names, including collision-free aliases, in old calls", async () => {
+    const app = createTestApp()
+    const response = await app.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-meridian-agent": "pi", "x-session-affinity": "fresh-replay-names" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5", max_tokens: 128, stream: false,
+        tools: ["bash", "read", "mcp__oc__read"].map(name => ({
+          name, description: name, input_schema: { type: "object", properties: {} },
+        })),
+        messages: [
+          { role: "user", content: "Inspect the files." },
+          { role: "assistant", content: [
+            { type: "tool_use", id: "old-bash", name: "bash", input: { command: "pwd" } },
+            { type: "tool_use", id: "old-read", name: "mcp__oc__read", input: { path: "a.txt" } },
+          ] },
+          { role: "user", content: [
+            { type: "tool_result", tool_use_id: "old-bash", content: "/tmp" },
+            { type: "tool_result", tool_use_id: "old-read", content: "file content" },
+          ] },
+          { role: "user", content: "Continue." },
+        ],
+      }),
+    }))
+    expect(response.status).toBe(200)
+    const prompt = promptToString(getCaptured()?.prompt)
+    expect(prompt).toContain('Previously called tool: {"id":"old-bash","name":"mcp__oc__bash"')
+    expect(prompt).toContain('Previously called tool: {"id":"old-read","name":"mcp__oc__read_2"')
   })
 })

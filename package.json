@@ -1,11 +1,12 @@
 {
   "name": "@rynfar/meridian",
-  "version": "1.64.0-profile-auth-keepalive-usage.1",
-  "description": "Local Anthropic API powered by your Claude Max subscription. One subscription, every agent.",
+  "version": "1.85.0-hub.2",
+  "description": "Use Claude and Antigravity subscriptions with Pi, OpenCode and other coding clients. Local API bridge, usage dashboard and optional Mac app.",
   "type": "module",
   "main": "./dist/server.js",
   "types": "./dist/proxy/server.d.ts",
   "bin": {
+    "meridian-bookkeeping": "./dist/session-bookkeeping.js",
     "meridian": "./dist/cli.js",
     "claude-max-proxy": "./dist/cli.js"
   },
@@ -21,36 +22,37 @@
   "scripts": {
     "start": "./bin/claude-proxy-supervisor.sh",
     "proxy": "./bin/claude-proxy-supervisor.sh",
-    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && bun build bin/cli.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external jsonc-parser --entry-naming \"[name].js\" && tsc -p tsconfig.build.json",
-    "postbuild": "node scripts/fix-bun-exports.mjs && node --check dist/cli.js && node --check dist/server.js && node --check dist/meridian-v2.js && node -e \"if(!require('fs').existsSync('dist/proxy/server.d.ts'))process.exit(1)\"",
+    "build": "bun scripts/build.ts",
     "postinstall": "node -e \"try{require('child_process').spawnSync(process.execPath,[require.resolve('@anthropic-ai/claude-code/install.cjs')],{stdio:'inherit'})}catch(e){console.error('[meridian] claude-code postinstall skipped:',e.message)}\"",
     "prepublishOnly": "bun run build",
-    "test": "bun test --path-ignore-patterns '**/*session-store*' --path-ignore-patterns '**/*proxy-async-ops*' --path-ignore-patterns '**/*models-auth-status*' --path-ignore-patterns '**/*proxy-context-usage-store*' --path-ignore-patterns '**/*proxy-passthrough-thinking*' --path-ignore-patterns '**/*proxy-thinking-setting*' --path-ignore-patterns '**/*session-recovery*' --path-ignore-patterns '**/*models.test*' --path-ignore-patterns '**/*proxy-health-build*' && bun test src/__tests__/proxy-async-ops.test.ts && bun test src/__tests__/proxy-session-store.test.ts && bun test src/__tests__/session-store-pruning.test.ts && bun test src/__tests__/proxy-session-store-locking.test.ts && bun test src/__tests__/proxy-context-usage-store.test.ts && bun test src/__tests__/models-auth-status.test.ts && bun test src/__tests__/proxy-passthrough-thinking.test.ts && bun test src/__tests__/proxy-session-recovery.test.ts && bun test src/__tests__/proxy-thinking-setting.test.ts && bun test src/__tests__/models.test.ts && bun test src/__tests__/proxy-health-build.test.ts",
-    "nix:lock": "bun2nix -o bun.nix",
+    "pretest": "tsc --noEmit",
+    "test": "bun test ./src/__tests__ --timeout 30000 --path-ignore-patterns '**/*bookkeeping-admission-seam*' --path-ignore-patterns '**/*session-store*' --path-ignore-patterns '**/*store-mutation-loop-lag*' --path-ignore-patterns '**/*session-fingerprint-context*' --path-ignore-patterns '**/*priority-routing-integration*' --path-ignore-patterns '**/*proxy-async-ops*' --path-ignore-patterns '**/*models-auth-status*' --path-ignore-patterns '**/*proxy-context-usage-store*' --path-ignore-patterns '**/*proxy-passthrough-thinking*' --path-ignore-patterns '**/*proxy-thinking-setting*' --path-ignore-patterns '**/*session-recovery*' --path-ignore-patterns '**/*models.test*' --path-ignore-patterns '**/*replay-budget*' --path-ignore-patterns '**/*proxy-health-build*' --path-ignore-patterns '**/*follow-active-integration*' --path-ignore-patterns '**/*profile-credential-isolation*' --path-ignore-patterns '**/*header-settings-routes*' --path-ignore-patterns '**/*claude-executable-settings*' --path-ignore-patterns '**/*proxy-idle-guard-queue*' --path-ignore-patterns '**/*proxy-deny-hold-generating*' --path-ignore-patterns '**/*upstream-reachability-routes*' && bun test --timeout 30000 src/__tests__/bookkeeping-admission-seam.test.ts && bun test --timeout 30000 src/__tests__/proxy-async-ops.test.ts && bun test --timeout 30000 src/__tests__/proxy-session-store.test.ts && bun test --timeout 30000 src/__tests__/session-store-pruning.test.ts && bun test --timeout 30000 src/__tests__/proxy-session-store-locking.test.ts && bun test --timeout 30000 src/__tests__/session-fingerprint-context.test.ts && bun test --timeout 30000 src/__tests__/proxy-context-usage-store.test.ts && bun test --timeout 30000 src/__tests__/models-auth-status.test.ts && bun test --timeout 30000 src/__tests__/proxy-passthrough-thinking.test.ts && bun test --timeout 30000 src/__tests__/proxy-session-recovery.test.ts && bun test --timeout 30000 src/__tests__/proxy-thinking-setting.test.ts && bun test --timeout 30000 src/__tests__/models.test.ts && bun test --timeout 30000 src/__tests__/replay-budget.test.ts && bun test --timeout 30000 src/__tests__/proxy-health-build.test.ts && bun test --timeout 30000 src/__tests__/priority-routing-integration.test.ts && bun test --timeout 30000 src/__tests__/follow-active-integration.test.ts && bun test --timeout 30000 src/__tests__/store-mutation-loop-lag.test.ts && bun test --timeout 30000 src/__tests__/profile-credential-isolation.test.ts && bun test --timeout 30000 src/__tests__/header-settings-routes.test.ts && bun test --timeout 30000 src/__tests__/priority-session-store.test.ts && bun test --timeout 30000 src/__tests__/claude-executable-settings.test.ts && bun test --timeout 30000 src/__tests__/proxy-idle-guard-queue.test.ts && bun test --timeout 30000 src/__tests__/proxy-deny-hold-generating.test.ts && bun test --timeout 30000 src/__tests__/upstream-reachability-routes.test.ts && bun test --timeout 30000 --test-name-pattern 'naturally closes failed recovery|telemetry settings routes' ./scripts/fixtures/logger-mock-load-order.test.mjs",
     "typecheck": "tsc --noEmit",
     "proxy:direct": "bun run ./bin/cli.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.117",
-    "@anthropic-ai/claude-code": "^2.1.198",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.141",
+    "@anthropic-ai/claude-code": "^2.1.296",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "cross-spawn": "7.0.6",
     "jsonc-parser": "^3.3.1",
     "libsql": "^0.5.29",
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@hono/node-server": "^1.19.11",
+    "@hono/node-server": "^1.19.15",
     "@opencode-ai/plugin": "0.0.0-beta-18314",
     "@types/bun": "^1.3.11",
     "@types/cross-spawn": "6.0.6",
     "@types/node": "^22.0.0",
-    "bun2nix": "^2.0.8",
     "glob": "^13.0.0",
-    "hono": "^4.11.4",
+    "hono": "^4.12.34",
     "typescript": "^5.8.2"
   },
   "files": [
     "dist/",
+    "docs/configuration.md",
     "plugin/",
     "assets/",
     "bin/meridian-launchd.sh",
@@ -78,7 +80,12 @@
     "open-webui",
     "llm",
     "coding-assistant",
-    "opencode-claude-max-proxy"
+    "opencode-claude-max-proxy",
+    "antigravity",
+    "google-antigravity",
+    "gemini",
+    "openai-compatible",
+    "ai-agents"
   ],
   "repository": {
     "type": "git",

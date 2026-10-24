@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 const testDir = dirname(fileURLToPath(import.meta.url))
 const serverModule = pathToFileURL(resolve(testDir, "../proxy/server.ts")).href
+const sdkMockModule = pathToFileURL(resolve(testDir, "sdkMock.ts")).href
 const sessionStoreModule = pathToFileURL(resolve(testDir, "../proxy/sessionStore.ts")).href
 
 // Each worker is a separate Bun OS process with its own module graph and
@@ -32,6 +33,11 @@ function event(name, extra = {}) {
   }) + "\n")
 }
 
+try {
+if (process.env.MERIDIAN_TEST_WORKER_STARTUP_ERROR) {
+  throw new Error(process.env.MERIDIAN_TEST_WORKER_STARTUP_ERROR)
+}
+
 // Import a cache-busted copy as the implementation, then mock the canonical
 // module imported by server.ts. The wrapper exposes the exact moment the route
 // takes its durable arrival snapshot, before it waits on the process lock.
@@ -48,7 +54,8 @@ mock.module(process.env.SESSION_STORE_MODULE, () => ({
   },
 }))
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+const { setSdkMock, sdkMockQuery, assertSyntheticClaudeBoundary } = await import(process.env.SDK_MOCK_MODULE)
+setSdkMock(() => ({
   query: (params) => {
     const call = ++queryCall
     const resume = params?.options?.resume ?? null
@@ -138,13 +145,16 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   tool: () => ({}),
 }))
 
+const sdk = await import("@anthropic-ai/claude-agent-sdk")
+if (sdk.query !== sdkMockQuery) throw new Error("SDK worker mock identity was not installed")
+await assertSyntheticClaudeBoundary()
 const { createProxyServer } = await import(process.env.SERVER_MODULE)
 const app = createProxyServer({ port: 0, host: "127.0.0.1", silent: true }).app
 const request = new Request("http://localhost/v1/messages", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    "x-opencode-session": process.env.CLIENT_SESSION_ID,
+    ...JSON.parse(process.env.REQUEST_HEADERS),
   },
   body: process.env.REQUEST_BODY,
 })
@@ -155,6 +165,9 @@ try {
   const response = await app.fetch(request)
   const body = await response.text()
   event("result", { status: response.status, body })
+} finally {
+  requestActive = false
+}
 } catch (error) {
   event("worker-error", {
     errorName: error?.name ?? "Error",
@@ -162,8 +175,6 @@ try {
     stack: error?.stack,
   })
   throw error
-} finally {
-  requestActive = false
 }
 `
 
@@ -217,30 +228,50 @@ function spawnProxyWorker(
   id: string,
   clientSessionId: string,
   messages: Array<{ role: string, content: unknown }>,
+  options: { adapter?: "pi"; stream?: boolean; passthrough?: boolean; startupError?: string } = {},
 ): WorkerHandle {
   const releaseFile = join(paths.base, `release-${id}`)
   const requestBody = JSON.stringify({
     model: "claude-sonnet-4-6",
     max_tokens: 128,
-    stream: false,
+    stream: options.stream ?? false,
     messages,
+    ...(options.adapter === "pi" ? { metadata: { user_id: JSON.stringify({ session_id: clientSessionId }) } } : {}),
   })
+  // `bun -e` does not run the test preload. Reapply its namespace isolation
+  // before setting the worker's own knobs: unrelated files may have changed
+  // auth, routing, profiles or telemetry in the parent process since preload.
+  const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !key.startsWith("MERIDIAN_") && !key.startsWith("CLAUDE_PROXY_")))
   const child = Bun.spawn([process.execPath, "-e", workerSource], {
     env: {
-      ...process.env,
+      ...inheritedEnv,
       SERVER_MODULE: serverModule,
+      SDK_MOCK_MODULE: sdkMockModule,
       SESSION_STORE_MODULE: sessionStoreModule,
+      // These workers model the same proxy configuration and share canonical
+      // SDK config paths, as well as the explicitly shared session store.
+      MERIDIAN_CONFIG_DIR: join(paths.base, "config"),
       MERIDIAN_SESSION_DIR: paths.sessions,
-      MERIDIAN_PASSTHROUGH: "0",
+      MERIDIAN_PASSTHROUGH: options.passthrough ? "1" : "0",
       CLAUDE_PROXY_PASSTHROUGH: "0",
       MERIDIAN_MAX_CONCURRENT: "8",
-      MERIDIAN_SESSION_TURN_ACQUIRE_TIMEOUT_MS: "5000",
-      MERIDIAN_SESSION_TURN_MAX_HOLD_MS: "5000",
+      // Match the preload's existing SDK-double contract: this query mock
+      // never creates a native SDK child. Real proxy runs do not set this.
+      MERIDIAN_TEST_DISABLE_SDK_PROCESS_GATE: "1",
+      // The test controls release through a file and has its own 15–20s
+      // timeout. A test-configured 5s watchdog can abort a healthy owner while
+      // another test file or OS process delays this harness's release call.
+      MERIDIAN_SESSION_TURN_ACQUIRE_TIMEOUT_MS: "30000",
+      MERIDIAN_SESSION_TURN_MAX_HOLD_MS: "60000",
       MERIDIAN_SESSION_TURN_RETRY_MS: "5",
       EVENT_FILE: paths.events,
       RELEASE_FILE: releaseFile,
       WORKER_ID: id,
+      MERIDIAN_TEST_WORKER_STARTUP_ERROR: options.startupError ?? "",
       CLIENT_SESSION_ID: clientSessionId,
+      REQUEST_HEADERS: JSON.stringify(options.adapter === "pi"
+        ? { "x-meridian-agent": "pi" } : { "x-opencode-session": clientSessionId }),
       REQUEST_BODY: requestBody,
     },
     stdout: "ignore",
@@ -276,12 +307,25 @@ async function waitForEvent(
     }
     const found = all.find(item => item.workerId === workerId && item.name === name)
     if (found) return found
+    const completed = all.find(item => item.workerId === workerId && item.name === "result")
+    if (completed) {
+      throw new Error(`${workerId} completed before ${name}: status=${completed.status}; body=${completed.body}`)
+    }
     await Bun.sleep(10)
   }
-  throw new Error(`Timed out waiting for ${workerId}:${name}`)
+  // afterEach removes the owned event file, so retain its lifecycle facts in
+  // the failure itself rather than erasing the only diagnostic evidence.
+  const observed = (await readEvents(path)).filter(item => item.workerId === workerId)
+  throw new Error(`Timed out waiting for ${workerId}:${name}; observed=${JSON.stringify(observed)}`)
 }
 
 async function release(worker: WorkerHandle): Promise<void> {
+  // Optional scheduling stall for reproducing a watchdog race without relying
+  // on CPU contention during the full suite.
+  const delayMs = Number(process.env.CROSS_PROCESS_TEST_RELEASE_DELAY_MS ?? 0)
+  if (worker.id === "modified-owner" && Number.isFinite(delayMs) && delayMs > 0) {
+    await Bun.sleep(delayMs)
+  }
   await writeFile(worker.releaseFile, "release")
 }
 
@@ -312,6 +356,94 @@ function conflictBody(event: WorkerEvent): unknown {
 }
 
 describe("proxy coordination across OS processes", () => {
+  test("does not inherit the parent suite's HTTP authentication into coordination workers", async () => {
+    const previousKey = process.env.MERIDIAN_API_KEY
+    process.env.MERIDIAN_API_KEY = "owned-parent-fixture-key"
+    try {
+      const paths = await makePaths()
+      const worker = spawnProxyWorker(paths, "isolated-auth", "isolated-auth-session",
+        [{ role: "user", content: "owned coordination request" }])
+      await waitForEvent(paths.events, worker.id, "sdk-start")
+      await release(worker)
+      expect((await result(paths, worker)).status).toBe(200)
+    } finally {
+      if (previousKey === undefined) delete process.env.MERIDIAN_API_KEY
+      else process.env.MERIDIAN_API_KEY = previousKey
+    }
+  })
+
+  test("reports a worker's startup refusal instead of losing it behind an SDK timeout", async () => {
+    const paths = await makePaths()
+    const worker = spawnProxyWorker(paths, "startup-refusal", "startup-refusal-session",
+      [{ role: "user", content: "never dispatched" }], { startupError: "owned fixture startup refusal" })
+    await expect(waitForEvent(paths.events, worker.id, "sdk-start")).rejects.toThrow("owned fixture startup refusal")
+    expect((await readEvents(paths.events)).some(item => item.name === "sdk-start")).toBe(false)
+  })
+
+  for (const stream of [false, true]) {
+    for (const firstName of ["main", "side"] as const) {
+      test(`Pi keeps both branches valid across processes: ${firstName} first, stream=${stream}`, async () => {
+        const paths = await makePaths()
+        const key = `pi-race-${firstName}-${stream}`
+        const prefix = [{ role: "user", content: "shared fixture" }, { role: "assistant", content: "ok" }]
+        const main = [...prefix, { role: "user", content: "main-only fixture field" }]
+        const side = [...prefix, { role: "user", content: "side-only fixture field" }]
+        const owner = spawnProxyWorker(paths, "pi-owner", key, firstName === "main" ? main : side, { adapter: "pi", stream })
+        const ownerSdk = await waitForEvent(paths.events, owner.id, "sdk-start")
+        const waiter = spawnProxyWorker(paths, "pi-waiter", key, firstName === "main" ? side : main, { adapter: "pi", stream })
+        await waitForEvent(paths.events, waiter.id, "arrival-snapshot")
+        expect((await readEvents(paths.events)).some(row => row.workerId === waiter.id && row.name === "sdk-start")).toBe(false)
+        await release(owner)
+        expect((await result(paths, owner)).status).toBe(200)
+        const waiterSdk = await waitForEvent(paths.events, waiter.id, "sdk-start")
+        expect(waiterSdk.resume).toBeNull()
+        expect(waiterSdk.sdkSessionId).not.toBe(ownerSdk.sdkSessionId)
+        await release(waiter)
+        expect((await result(paths, waiter)).status).toBe(200)
+
+        const followup = spawnProxyWorker(paths, "pi-followup", key, [...main,
+          { role: "assistant", content: "ok" }, { role: "user", content: "continue the main fixture" }], { adapter: "pi", stream })
+        const followupSdk = await waitForEvent(paths.events, followup.id, "sdk-start")
+        // A single key stores the most recent branch. A later main turn either
+        // resumes that main branch or safely replays after a side branch.
+        expect(followupSdk.resume).toBe(firstName === "side" ? waiterSdk.sdkSessionId! : null)
+        await release(followup)
+        expect((await result(paths, followup)).status).toBe(200)
+      }, 20_000)
+    }
+  }
+
+  for (const stream of [false, true]) {
+    for (const passthrough of [false, true]) {
+      test(`modified-history conflict is replayable only in passthrough across processes: passthrough=${passthrough}, stream=${stream}`, async () => {
+        const paths = await makePaths()
+        const key = `modified-${stream}-${passthrough}`
+        const opening = [{ role: "user", content: "shared fixture" }, { role: "assistant", content: "ok" },
+          { role: "user", content: "old fixture value" }]
+        const revised = [...opening.slice(0, 2), { role: "user", content: "revised fixture value" },
+          { role: "assistant", content: "revised decision" }, { role: "user", content: "repeat the decision" }]
+        const owner = spawnProxyWorker(paths, "modified-owner", key, opening, { stream, passthrough })
+        const ownerSdk = await waitForEvent(paths.events, owner.id, "sdk-start")
+        const waiter = spawnProxyWorker(paths, "modified-waiter", key, revised, { stream, passthrough })
+        await waitForEvent(paths.events, waiter.id, "arrival-snapshot")
+        expect((await readEvents(paths.events)).some(row => row.workerId === waiter.id && row.name === "sdk-start")).toBe(false)
+        await release(owner)
+        expect((await result(paths, owner)).status).toBe(200)
+        if (passthrough) {
+          const waiterSdk = await waitForEvent(paths.events, waiter.id, "sdk-start")
+          expect(waiterSdk.resume).toBeNull()
+          expect(waiterSdk.sdkSessionId).not.toBe(ownerSdk.sdkSessionId)
+          await release(waiter)
+          expect((await result(paths, waiter)).status).toBe(200)
+        } else {
+          const waiterResult = await result(paths, waiter)
+          expect(waiterResult.status, JSON.stringify(waiterResult)).toBe(400)
+          expect((await readEvents(paths.events)).some(row => row.workerId === waiter.id && row.name === "sdk-start")).toBe(false)
+        }
+      }, 20_000)
+    }
+  }
+
   test("serializes one session and rejects a stale arrival after durable advancement", async () => {
     const paths = await makePaths()
     const opening = [{ role: "user", content: "hello" }]

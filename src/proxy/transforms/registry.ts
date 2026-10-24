@@ -9,6 +9,7 @@ import { passthroughTransforms } from "./passthrough"
 import { cherryTransforms } from "./cherry"
 import { codexTransforms } from "./codex"
 import { claudeCodeTransforms } from "./claudecode"
+import { polytokenTransforms } from "./polytoken"
 
 const ADAPTER_TRANSFORMS: Record<string, readonly Transform[]> = {
   opencode: openCodeTransforms,
@@ -34,9 +35,16 @@ const ADAPTER_TRANSFORMS: Record<string, readonly Transform[]> = {
   // tool config. Without this entry it falls through to the empty default —
   // built-ins unblocked under bypassPermissions, passthrough off.
   jcode: openCodeTransforms,
+  // Letta Code rides the same OpenAI-compatible endpoint. Without this entry its
+  // adapter gets no transforms and one tool call executes twice on two machines.
+  letta: openCodeTransforms,
   // Codex (/v1/responses): OpenCode's tool config + a follow-on transform
   // that forces passthrough (Codex executes its own tools). See #475.
   codex: [...openCodeTransforms, ...codexTransforms],
+  // Polytoken native client: pure passthrough plumbing keyed by base name.
+  // Keyed by adapter.name ("polytoken"); instances resolve behavior via
+  // baseName, so an instance keeps these transforms.
+  polytoken: polytokenTransforms,
 }
 
 export function getAdapterTransforms(adapterName: string): readonly Transform[] {

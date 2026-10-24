@@ -1,0 +1,205 @@
+/**
+ * Persistent server settings.
+ *
+ * Stored in ~/.config/meridian/settings.json (MERIDIAN_CONFIG_DIR moves the
+ * directory). Survives proxy restarts.
+ * Shared between CLI, UI, and API — browser localStorage is only used
+ * for client-only preferences (theme, collapsed sections, etc.).
+ *
+ * Lives at the src root, beside env.ts, rather than under proxy/, because
+ * telemetry reads it too and telemetry may not import from proxy —
+ * dependencies flow proxy → telemetry only. env.ts is the existing precedent
+ * for "configuration both layers need"; a copy of the path logic in each
+ * would be two things to keep agreeing about MERIDIAN_CONFIG_DIR.
+ *
+ * Leaf module: node builtins only, no imports from anywhere in the tree.
+ */
+
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
+import { dirname } from "node:path"
+import { configPath } from "./configDir"
+import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
+import type { PageLayout } from "./telemetry/pageLayout"
+
+/**
+ * Resolve the settings file path.
+ *
+ * Resolved per call rather than frozen at import time so tests can redirect
+ * it via MERIDIAN_CONFIG_DIR (see `src/__tests__/preload.ts`). Without the
+ * override the path is exactly what it has always been, so existing installs
+ * are unaffected. See configDir.ts for the resolution rule itself.
+ */
+function settingsFile(): string {
+  return configPath("settings.json")
+}
+
+export interface MeridianSettings {
+  /** Last active profile ID — restored on proxy startup */
+  activeProfile?: string
+  /** Profile routing mode (#383, priority spec): "active" (default),
+   *  "sticky", or "priority". MERIDIAN_ROUTING env var takes precedence. */
+  routing?: string
+  /** Priority-mode pool order (highest priority first). Falls back to
+   *  profiles.json order. MERIDIAN_PROFILE_ORDER env var takes precedence. */
+  profileOrder?: string[]
+  priorityFailback?: PriorityFailbackPolicy
+  /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
+  chatGptActiveSeat?: string
+  /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
+  chatGptProfileNames?: Record<string, string>
+  /**
+   * Former ids of renamed ChatGPT seats, keyed by seat id. The ChatGPT half of
+   * a Claude profile's `aliases`: a request, link or exclusion naming one still
+   * reaches the seat until a profile takes that name again.
+   */
+  chatGptProfileAliases?: Record<string, string[]>
+
+  /**
+   * Keep telemetry in SQLite instead of memory, so it survives a restart.
+   * MERIDIAN_TELEMETRY_PERSIST takes precedence.
+   *
+   * The four telemetry keys below differ from every other setting here in one
+   * way that the UI must not hide: the stores are built once at startup, so a
+   * change to any of them does nothing until the proxy is restarted. Routing
+   * is re-read per request; these are not, and cannot be without swapping a
+   * store out from under in-flight writes.
+   */
+  telemetryPersist?: boolean
+  /** Days before persisted telemetry is deleted. MERIDIAN_TELEMETRY_RETENTION_DAYS wins. */
+  telemetryRetentionDays?: number
+  /** Rows the in-memory ring holds. Ignored when persisting. MERIDIAN_TELEMETRY_SIZE wins. */
+  telemetrySize?: number
+  /** Entries the in-memory diagnostic log ring holds. MERIDIAN_DIAGNOSTIC_LOG_SIZE wins. */
+  diagnosticLogSize?: number
+
+  integrations?: MeridianIntegrationSettings
+
+  /** ChatGPT gateway features. Re-read per request; resolved in proxy/chatgpt/features.ts. */
+  chatgpt?: ChatGptFeatureSettings
+
+  /**
+   * Sentry-protocol DSN (GlitchTip, Sentry) that Meridian's own uncaught
+   * exceptions and unhandled rejections are reported to. Unset means off.
+   * MERIDIAN_ERROR_REPORTING_DSN wins. Read once at startup.
+   */
+  errorReportingDsn?: string
+  /** Ask the npm registry once a day whether a newer Meridian is published.
+   *  Off unless switched on: an instance only reaches a third party on a timer
+   *  because someone asked it to. The header shows the running version either
+   *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
+  checkForUpdates?: boolean
+  /** Name the machine Meridian runs on beside the site header's status, so
+   *  several instances can be told apart at a glance. Off unless switched on,
+   *  because it also publishes the hostname in the unauthenticated /health. */
+  showHostname?: boolean
+  /** How much of the window the web pages use: "contained" (default) keeps
+   *  them in a centered column, "wide" spans the window. Read on every page
+   *  load, so a change shows on the next reload. */
+  layout?: PageLayout
+  /** Which Claude Code executable runs each turn: "system" (default) prefers
+   *  the `claude` on PATH, "bundled" the copy Meridian ships with, "custom"
+   *  `claudeExecutablePath`. MERIDIAN_CLAUDE_PATH wins over all three. Read
+   *  whenever the executable is resolved, so a change applies to the next turn. */
+  claudeExecutable?: ClaudeExecutableMode
+  /** The absolute path custom mode runs. Kept when another mode is chosen, so
+   *  switching back does not mean typing it again. */
+  claudeExecutablePath?: string
+
+  /**
+   * When `/readyz` declares a connection outage on this instance's configured
+   * Claude egress: after at
+   * least `upstreamUnreachableMinFailures` connection failures (default 3)
+   * spanning `upstreamUnreachableAfterMs` (default 120000) with no qualifying configured-egress transport answer
+   * in between. It then holds for `upstreamUnreachableHoldMs` after
+   * the latest failure (default 300000; 0 never fails readiness) before letting
+   * traffic back in. MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS / _HOLD_MS /
+   * _MIN_FAILURES win over CLAUDE_PROXY_* aliases and persisted numeric
+   * fields. Invalid values fall back safely. Re-read on every evaluation.
+   */
+  upstreamUnreachableAfterMs?: number
+  upstreamUnreachableHoldMs?: number
+  upstreamUnreachableMinFailures?: number
+}
+
+/** What the operator saved; absent keys take the defaults in proxy/chatgpt/features.ts. */
+export type ChatGptFeatureSettings = {
+  thinkingPassthrough?: boolean
+  /** "client" | "auto" | "concise" | "detailed"; see ChatGptReasoningSummary. */
+  reasoningSummary?: string
+  maxBudgetUsd?: number
+  fallbackModel?: string
+  /** "never" | "reserve" | "immediately"; see ChatGptCreditsPolicy. */
+  creditsPolicy?: string
+  /** Seat id (accountUserId) -> policy overriding `creditsPolicy` for that seat. */
+  seatCreditsPolicy?: Record<string, string>
+  /** "before-credits" | "after-credits"; see ChatGptFreeSeatOrder. */
+  freeSeatOrder?: string
+}
+
+/**
+ * A type alias rather than an interface so it carries an implicit index
+ * signature: flags written by a newer build survive a round-trip through an
+ * older one.
+ */
+export type MeridianIntegrationSettings = {
+  /** ChatGPT account usage windows, read with the accounts' own access tokens. Never refreshes. */
+  codexUsage?: boolean
+}
+
+/** On unless the operator turned it off; off means no usage request at all. */
+export function isCodexUsageEnabled(settings: MeridianSettings): boolean {
+  return settings.integrations?.codexUsage ?? true
+}
+
+/**
+ * Accepted range for each numeric telemetry setting, and the reason for it.
+ *
+ * Lives here rather than in the route so the form and the validator read the
+ * same numbers: a page that offers a value the API rejects is a worse bug than
+ * either bound being slightly wrong.
+ *
+ * The upper bounds guard a value that only takes effect on the next start, so
+ * a typo is not discovered until a restart that then fails or thrashes. Both
+ * ring sizes are whole request/log records held in memory; a million rows is
+ * hundreds of megabytes of resident heap, which is not a setting anyone means
+ * to type. Retention is capped at ten years because SQLite cleanup deletes by
+ * a cutoff, and a cutoff further out than the data's usefulness simply never
+ * deletes anything.
+ */
+export const TELEMETRY_SETTING_LIMITS = {
+  telemetryRetentionDays: { min: 1, max: 3650 },
+  telemetrySize: { min: 10, max: 1_000_000 },
+  diagnosticLogSize: { min: 10, max: 1_000_000 },
+} as const satisfies Record<string, { min: number; max: number }>
+
+/** Read settings from disk. Returns empty object if file doesn't exist or is invalid. */
+export function loadSettings(): MeridianSettings {
+  const file = settingsFile()
+  try {
+    if (!existsSync(file)) return {}
+    return JSON.parse(readFileSync(file, "utf-8"))
+  } catch {
+    return {}
+  }
+}
+
+/** Write settings to disk. Merges with existing settings (doesn't clobber unknown keys). */
+export function saveSettings(patch: Partial<MeridianSettings>): MeridianSettings {
+  const file = settingsFile()
+  const current = loadSettings()
+  const merged = { ...current, ...patch }
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify(merged, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 })
+  return merged
+}
+
+/** Get a single setting value, or undefined if not set. */
+export function getSetting<K extends keyof MeridianSettings>(key: K): MeridianSettings[K] {
+  return loadSettings()[key]
+}
+
+/** Update a single setting. */
+export function setSetting<K extends keyof MeridianSettings>(key: K, value: MeridianSettings[K]): MeridianSettings {
+  return saveSettings({ [key]: value })
+}

@@ -1,5 +1,8 @@
-import Database from "libsql"
-import type { RequestMetric, TelemetrySummary, ITelemetryStore, IDiagnosticLogStore, DiagnosticLog } from "./types"
+// Shared qualified runtime engine: graph @aleksei/meridian-hub #304/#305.
+import { NativeDatabase as Database } from "../proxy/session/bookkeeping/nativeDatabase"
+import type { SqlValue } from "../proxy/session/bookkeeping/types"
+import { statSync } from "node:fs"
+import type { RequestMetric, TelemetrySummary, ITelemetryStore, IDiagnosticLogStore, DiagnosticLog, TelemetryRetention } from "./types"
 import { computeSummary } from "./percentiles"
 import { getPricingOverrides } from "./pricingStore"
 
@@ -40,7 +43,14 @@ CREATE TABLE IF NOT EXISTS metrics (
   cache_creation_input_tokens INTEGER,
   cache_hit_rate       REAL,
   profile_id           TEXT,
-  envelope_violations  TEXT
+  envelope_violations  TEXT,
+  route_kind           TEXT,
+  route_group_id       TEXT,
+  route_attempt        INTEGER,
+  route_refused_bucket TEXT,
+  resolved_model       TEXT,
+  reasoning_output_tokens INTEGER,
+  fallback_from_model  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts    ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_model ON metrics(model);
@@ -59,6 +69,13 @@ const METRICS_MIGRATIONS = [
   "ALTER TABLE metrics ADD COLUMN envelope_violations TEXT",
   "ALTER TABLE metrics ADD COLUMN session_queue_wait_ms REAL NOT NULL DEFAULT 0",
   "ALTER TABLE metrics ADD COLUMN sdk_queue_wait_ms REAL NOT NULL DEFAULT 0",
+  "ALTER TABLE metrics ADD COLUMN route_kind TEXT",
+  "ALTER TABLE metrics ADD COLUMN route_group_id TEXT",
+  "ALTER TABLE metrics ADD COLUMN route_attempt INTEGER",
+  "ALTER TABLE metrics ADD COLUMN route_refused_bucket TEXT",
+  "ALTER TABLE metrics ADD COLUMN resolved_model TEXT",
+  "ALTER TABLE metrics ADD COLUMN reasoning_output_tokens INTEGER",
+  "ALTER TABLE metrics ADD COLUMN fallback_from_model TEXT",
 ]
 
 const LOGS_SCHEMA = `
@@ -76,54 +93,82 @@ CREATE INDEX IF NOT EXISTS idx_logs_cat ON diagnostic_logs(category);
 
 const CLEANUP_INTERVAL = 1000
 
-function openDatabase(dbPath: string): Database.Database {
+/**
+ * How long a write waits for another connection's write lock. The old libsql
+ * default was zero, so a row recorded while anything else writes the file - a
+ * second process importing history, an operator's sqlite3 - fails at once and
+ * is dropped, and a migration below fails as if its column already existed.
+ * The driver is synchronous, so the wait blocks the event loop: long enough
+ * for another connection's ordinary transaction. This cap applies to each
+ * write, including diagnostic logs; a held lock can therefore stall every
+ * stream for one second per attempted write and still drop that write.
+ */
+const BUSY_TIMEOUT_MS = 1000
+
+function openDatabase(dbPath: string): Database {
   const db = new Database(dbPath)
-  db.pragma("journal_mode = WAL")
-  db.pragma("synchronous = NORMAL")
-  db.exec(METRICS_SCHEMA)
-  db.exec(LOGS_SCHEMA)
-  // Additive schema migrations for existing DBs. Swallow "duplicate column"
-  // errors so this is safe to rerun on every boot.
-  for (const sql of METRICS_MIGRATIONS) {
-    try { db.exec(sql) } catch { /* column already exists */ }
+  try {
+    db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`)
+    db.pragma("journal_mode = WAL")
+    db.pragma("synchronous = NORMAL")
+    db.exec(METRICS_SCHEMA)
+    db.exec(LOGS_SCHEMA)
+    // Additive schema migrations for existing DBs. Swallow "duplicate column"
+    // errors so this is safe to rerun on every boot.
+    for (const sql of METRICS_MIGRATIONS) {
+      try { db.exec(sql) } catch { /* column already exists */ }
+    }
+    return db
+  } catch (error) {
+    db.close()
+    throw error
   }
-  return db
 }
 
 class SqliteTelemetryStore implements ITelemetryStore {
-  private db: Database.Database
+  private db: Database
   private retentionMs: number
+  private retentionDays: number
   private insertCount = 0
-  private insertStmt: Database.Statement
-  private countStmt: Database.Statement
+  private insertStmt: ReturnType<Database["prepare"]>
+  private countStmt: ReturnType<Database["prepare"]>
+  private oldestStmt: ReturnType<Database["prepare"]>
 
-  constructor(db: Database.Database, retentionDays: number) {
+  constructor(db: Database, retentionDays: number, private readonly dbPath: string) {
     this.db = db
+    this.retentionDays = retentionDays
     this.retentionMs = retentionDays * 24 * 60 * 60 * 1000
 
     this.insertStmt = db.prepare(`
       INSERT INTO metrics (
-        request_id, timestamp, adapter, request_source, model, request_model, mode,
+        request_id, timestamp, adapter, request_source, model, request_model, resolved_model, mode,
         is_resume, is_passthrough, lineage_type,
         has_deferred_tools, deferred_tool_count, tool_count, discovered_tools, session_discovered_count,
         message_count, sdk_session_id,
         status, queue_wait_ms, session_queue_wait_ms, sdk_queue_wait_ms, proxy_overhead_ms, ttfb_ms,
         upstream_duration_ms, total_duration_ms, content_blocks, text_events, error,
         input_tokens, output_tokens, cache_read_input_tokens,
-        cache_creation_input_tokens, cache_hit_rate, profile_id, envelope_violations
+        cache_creation_input_tokens, cache_hit_rate, profile_id, envelope_violations,
+        route_kind, route_group_id, route_attempt, route_refused_bucket,
+        reasoning_output_tokens, fallback_from_model
       ) VALUES (
-        @requestId, @timestamp, @adapter, @requestSource, @model, @requestModel, @mode,
+        @requestId, @timestamp, @adapter, @requestSource, @model, @requestModel, @resolvedModel, @mode,
         @isResume, @isPassthrough, @lineageType,
         @hasDeferredTools, @deferredToolCount, @toolCount, @discoveredTools, @sessionDiscoveredCount,
         @messageCount, @sdkSessionId,
         @status, @queueWaitMs, @sessionQueueWaitMs, @sdkQueueWaitMs, @proxyOverheadMs, @ttfbMs,
         @upstreamDurationMs, @totalDurationMs, @contentBlocks, @textEvents, @error,
         @inputTokens, @outputTokens, @cacheReadInputTokens,
-        @cacheCreationInputTokens, @cacheHitRate, @profileId, @envelopeViolations
+        @cacheCreationInputTokens, @cacheHitRate, @profileId, @envelopeViolations,
+        @routeKind, @routeGroupId, @routeAttempt, @routeRefusedBucket,
+        @reasoningOutputTokens, @fallbackFromModel
       )
-    `)
+    `).validate()
 
-    this.countStmt = db.prepare("SELECT COUNT(*) as cnt FROM metrics")
+    this.countStmt = db.prepare("SELECT COUNT(*) as cnt FROM metrics").validate()
+    // Served by idx_metrics_ts, so this stays a b-tree seek rather than the
+    // table scan a MIN() over an unindexed column would be.
+    this.oldestStmt = db.prepare("SELECT MIN(timestamp) as oldest FROM metrics").validate()
   }
 
   record(metric: RequestMetric): void {
@@ -135,6 +180,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         requestSource: metric.requestSource ?? null,
         model: metric.model,
         requestModel: metric.requestModel ?? null,
+        resolvedModel: metric.resolvedModel ?? null,
         mode: metric.mode,
         isResume: metric.isResume ? 1 : 0,
         isPassthrough: metric.isPassthrough ? 1 : 0,
@@ -167,6 +213,12 @@ class SqliteTelemetryStore implements ITelemetryStore {
         envelopeViolations: metric.envelopeViolations && metric.envelopeViolations.length > 0
           ? JSON.stringify(metric.envelopeViolations)
           : null,
+        routeKind: metric.routeKind ?? null,
+        routeGroupId: metric.routeGroupId ?? null,
+        routeAttempt: metric.routeAttempt ?? null,
+        routeRefusedBucket: metric.routeRefusedBucket ?? null,
+        reasoningOutputTokens: metric.reasoningOutputTokens ?? null,
+        fallbackFromModel: metric.fallbackFromModel ?? null,
       })
     } catch (err) {
       console.error("[telemetry] SQLite write failed, skipping:", err)
@@ -185,10 +237,37 @@ class SqliteTelemetryStore implements ITelemetryStore {
     }
   }
 
+  describe(): TelemetryRetention {
+    let oldestTimestamp: number | null = null
+    try {
+      oldestTimestamp = (this.oldestStmt.get() as { oldest: number | null }).oldest ?? null
+    } catch { /* reported as unknown rather than failing the whole page */ }
+    return {
+      kind: "sqlite",
+      held: this.size,
+      retentionDays: this.retentionDays,
+      dbPath: this.dbPath,
+      dbBytes: this.fileBytes(),
+      oldestTimestamp,
+    }
+  }
+
+  /** Database plus its write-ahead log, which after a busy hour and before a
+   *  checkpoint holds a real share of the bytes on disk. */
+  private fileBytes(): number | undefined {
+    let total: number | undefined
+    for (const suffix of ["", "-wal"]) {
+      try {
+        total = (total ?? 0) + statSync(`${this.dbPath}${suffix}`).size
+      } catch { /* absent: no WAL yet, or the db itself is gone */ }
+    }
+    return total
+  }
+
   getRecent(options: { limit?: number; since?: number; model?: string } = {}): RequestMetric[] {
     const { limit = 50, since, model } = options
     const conditions: string[] = []
-    const params: Record<string, unknown> = { limit }
+    const params: Record<string, SqlValue> = { limit }
 
     if (since !== undefined) {
       conditions.push("timestamp >= @since")
@@ -246,15 +325,15 @@ class SqliteTelemetryStore implements ITelemetryStore {
 }
 
 class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
-  private db: Database.Database
-  private insertStmt: Database.Statement
+  private db: Database
+  private insertStmt: ReturnType<Database["prepare"]>
 
-  constructor(db: Database.Database) {
+  constructor(db: Database) {
     this.db = db
     this.insertStmt = db.prepare(`
       INSERT INTO diagnostic_logs (timestamp, level, category, request_id, message)
       VALUES (@timestamp, @level, @category, @requestId, @message)
-    `)
+    `).validate()
   }
 
   log(entry: Omit<DiagnosticLog, "timestamp">): void {
@@ -286,7 +365,7 @@ class SqliteDiagnosticLogStore implements IDiagnosticLogStore {
   getRecent(options: { limit?: number; since?: number; category?: string } = {}): DiagnosticLog[] {
     const { limit = 100, since, category } = options
     const conditions: string[] = []
-    const params: Record<string, unknown> = { limit }
+    const params: Record<string, SqlValue> = { limit }
 
     if (since !== undefined) {
       conditions.push("timestamp >= @since")
@@ -339,6 +418,7 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
     requestSource: (r.request_source as string) ?? undefined,
     model: r.model as string,
     requestModel: (r.request_model as string) ?? undefined,
+    resolvedModel: (r.resolved_model as string) ?? undefined,
     mode: r.mode as RequestMetric["mode"],
     isResume: r.is_resume === 1,
     isPassthrough: r.is_passthrough === 1,
@@ -368,14 +448,25 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
     cacheHitRate: (r.cache_hit_rate as number) ?? undefined,
     profileId: (r.profile_id as string) ?? undefined,
     envelopeViolations: parseEnvelopeViolations(r.envelope_violations),
+    routeKind: (r.route_kind as RequestMetric["routeKind"]) ?? undefined,
+    routeGroupId: (r.route_group_id as string) ?? undefined,
+    routeAttempt: (r.route_attempt as number) ?? undefined,
+    routeRefusedBucket: (r.route_refused_bucket as string) ?? undefined,
+    reasoningOutputTokens: (r.reasoning_output_tokens as number) ?? undefined,
+    fallbackFromModel: (r.fallback_from_model as string) ?? undefined,
   }
 }
 
 export function createSqliteStores(dbPath: string, retentionDays: number) {
   const db = openDatabase(dbPath)
-  return {
-    telemetry: new SqliteTelemetryStore(db, retentionDays) as ITelemetryStore,
-    diagnostics: new SqliteDiagnosticLogStore(db) as IDiagnosticLogStore,
-    close: () => { try { db.close() } catch { /* ignore */ } },
+  try {
+    return {
+      telemetry: new SqliteTelemetryStore(db, retentionDays, dbPath) as ITelemetryStore,
+      diagnostics: new SqliteDiagnosticLogStore(db) as IDiagnosticLogStore,
+      close: () => { try { db.close() } catch { /* ignore */ } },
+    }
+  } catch (error) {
+    db.close()
+    throw error
   }
 }

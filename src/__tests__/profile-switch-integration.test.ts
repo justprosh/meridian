@@ -4,13 +4,16 @@
  * Tests the profile switch API, session isolation across profiles,
  * and settings persistence contract.
  */
+import { installModelsMock } from "./modelsMock"
 import { describe, test, expect, beforeEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
 import { mock } from "bun:test"
 
 // Mock the SDK before importing server
 import { resolveMockSdkSessionId } from "./helpers"
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: { options?: { sessionId?: string } }) => {
     return (async function* () {
       yield {
@@ -24,22 +27,19 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "profile-switch-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-// Pass through the real resolveSdkModelDefaults — mock.module is process-global
-// in Bun, and stubbing it as () => ({}) leaks to proxy-env-stripping.test.ts.
-import { resolveSdkModelDefaults } from "../proxy/models"
+// Unspecified model exports retain their real implementation.
 
 // Mock models to avoid real auth checks
-mock.module("../proxy/models", () => ({
+installModelsMock(() => ({
   mapModelToClaudeModel: () => "sonnet",
   resolveClaudeExecutableAsync: async () => "claude",
-  resolveSdkModelDefaults,
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, email: "test@test.com", subscriptionType: "max" }),
   getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
   hasExtendedContext: () => false,
@@ -53,12 +53,12 @@ const { createProxyServer } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
 const { storeSession, lookupSession, clearSessionCache } = await import("../proxy/session/cache")
 
-beforeEach(() => {
+beforeEach(async () => {
   resetActiveProfile()
-  clearSessionCache()
+  await clearSessionCache()
 })
 
-function createTestApp(profiles?: Array<{ id: string; claudeConfigDir?: string }>) {
+function createTestApp(profiles?: Array<{ id: string; claudeConfigDir?: string; aliases?: string[] }>) {
   const { app } = createProxyServer({
     port: 0,
     host: "127.0.0.1",
@@ -153,28 +153,83 @@ describe("Profile switch API", () => {
   })
 })
 
-describe("Session cache eviction on profile switch", () => {
+describe("Profile rename API", () => {
+  const profiles = [
+    { id: "personal", claudeConfigDir: "/home/.claude" },
+    { id: "employer", claudeConfigDir: "/home/.claude-work", aliases: ["work"] },
+  ]
+
+  // Only the paths that refuse BEFORE touching disk are exercised here: the
+  // route writes to the real ~/.config/meridian/profiles.json, which no test
+  // may touch. Everything past the refusals is unit-tested against a temp dir
+  // in profile-rename.test.ts.
+  test("POST /profiles/rename requires both names", async () => {
+    const app = createTestApp(profiles)
+
+    const res = await app.fetch(req("/profiles/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "personal" }),
+    }))
+    expect(res.status).toBe(400)
+    const body = await res.json() as { error: string }
+    expect(body.error).toContain("'from' or 'to'")
+  })
+
+  test("POST /profiles/rename rejects a malformed body", async () => {
+    const app = createTestApp(profiles)
+
+    const res = await app.fetch(req("/profiles/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{ not json",
+    }))
+    expect(res.status).toBe(400)
+  })
+
+  test("POST /profiles/rename refuses when credentials are read-only", async () => {
+    const app = createTestApp(profiles)
+    process.env.MERIDIAN_CREDENTIALS_READONLY = "1"
+    try {
+      const res = await app.fetch(req("/profiles/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: "personal", to: "renamed" }),
+      }))
+      expect(res.status).toBe(403)
+      const body = await res.json() as { error: string }
+      expect(body.error).toContain("MERIDIAN_CREDENTIALS_READONLY")
+    } finally {
+      delete process.env.MERIDIAN_CREDENTIALS_READONLY
+    }
+  })
+
+  test("GET /profiles/list surfaces the names a rename left behind", async () => {
+    const app = createTestApp(profiles)
+
+    const res = await app.fetch(req("/profiles/list"))
+    const body = await res.json() as { profiles: Array<{ id: string; aliases?: string[] }> }
+    expect(body.profiles.find(p => p.id === "employer")!.aliases).toEqual(["work"])
+    expect(body.profiles.find(p => p.id === "personal")!.aliases).toBeUndefined()
+  })
+})
+
+describe("Session mappings across a profile switch", () => {
   const profiles = [
     { id: "personal", claudeConfigDir: "/home/.claude" },
     { id: "work", claudeConfigDir: "/home/.claude-work" },
   ]
 
-  test("switching profile clears session cache", async () => {
+  test("switching profile keeps profile-scoped sessions resumable", async () => {
     const app = createTestApp(profiles)
 
-    // Store a session in the cache
     const msgs = [
       { role: "user", content: "a" },
       { role: "assistant", content: "b" },
       { role: "user", content: "c" },
     ]
-    storeSession("test-session-123", msgs, "claude-abc")
+    storeSession("personal:test-session-123", msgs, "claude-abc")
 
-    // Verify session exists
-    const before = lookupSession("test-session-123", msgs)
-    expect(before.type).not.toBe("new")
-
-    // Switch profile via API
     const res = await app.fetch(req("/profiles/active", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -182,26 +237,8 @@ describe("Session cache eviction on profile switch", () => {
     }))
     expect(res.status).toBe(200)
 
-    // Session should be gone — new lookup returns diverged (sessionId known but no cache entry)
-    const after = lookupSession("test-session-123", msgs)
-    expect(after.type).toBe("diverged")
-  })
-
-  test("switching to same profile still clears cache", async () => {
-    const app = createTestApp(profiles)
-
-    const msgs = [{ role: "user", content: "x" }]
-    storeSession("session-same", msgs, "claude-same")
-
-    // Switch to first profile (already active)
-    await app.fetch(req("/profiles/active", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profile: "personal" }),
-    }))
-
-    const after = lookupSession("session-same", msgs)
-    expect(after.type).toBe("diverged")
+    const after = lookupSession("personal:test-session-123", [...msgs, { role: "assistant", content: "d" }, { role: "user", content: "e" }])
+    expect(after.type).toBe("continuation")
   })
 })
 

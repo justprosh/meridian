@@ -71,6 +71,17 @@ export const piAdapter: AgentAdapter = {
   name: "pi",
 
   /**
+   * NOTE: agent-specific (pi) — Oh My Pi drives one conversation from several callers at once, the main
+   * turn, title generation, and side questions asked mid-turn, and they all
+   * carry the same `metadata.user_id.session_id`. Whichever one commits first
+   * advances the mapping, so the other arrives holding a branch that no longer
+   * matches and used to be refused with a 400 (#870). Its own history is
+   * complete, so it is answered by fresh replay: one prompt-cache miss instead
+   * of a failed turn that pushes the client onto a fallback model.
+   */
+  runsConcurrentTurnsPerSessionKey: true,
+
+  /**
    * Pi itself sends no session header — continuity normally comes from the
    * fingerprint cache. Orchestrators driving the pi runtime (pylon) can opt
    * into explicit, collision-proof session keys via x-session-affinity;
@@ -106,6 +117,16 @@ export const piAdapter: AgentAdapter = {
   extractWorkingDirectory(body: any): string | undefined {
     return extractPiCwd(body)
   },
+
+  /**
+   * NOTE: agent-specific (pi) — pi hosts routinely run somewhere other than
+   * the meridian process: orchestrators spawn per-task pi sessions rooted in
+   * other checkouts, sometimes with no system prompt (and therefore no cwd
+   * line) at all. Neither lexical path equality nor the proxy's fallback
+   * directory may be read as the client's environment. Mirrors
+   * claudecode/opencode/polytoken.
+   */
+  clientEnvironmentMayDifferFromProxy: true,
 
   /**
    * Pi normally runs on the same host as the proxy, so the SDK subprocess

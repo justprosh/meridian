@@ -20,6 +20,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -35,13 +38,14 @@ afterEach(async () => {
   await Bun.sleep(25)
   rmSync(isolatedSessionDir, { recursive: true, force: true })
 })
-import { makeRequest, parseSSE, resolveMockSdkSessionId } from "./helpers"
+import { makeRequest, parseSSE, resolveMockSdkSessionId, streamEvent } from "./helpers"
 
 const PASSTHROUGH_PREFIX = "mcp__oc__"
 
 let mockTurns: any[] = []
 let capturedController: AbortController | undefined
 let capturedResume: string | undefined
+let abortCompletesNormally = false
 
 function toolTurn(toolId: string, toolName: string, input: Record<string, unknown>) {
   return {
@@ -110,7 +114,7 @@ function streamMessageStart() {
 // turn's PreToolUse hook fires after the turn is yielded, and an aborted
 // controller terminates the query with an abort-shaped error (the real
 // subprocess is SIGTERMed and surfaces "aborted by user").
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedController = opts?.options?.abortController
     capturedResume = opts?.options?.resume
@@ -119,6 +123,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
       const sessionId = resolveMockSdkSessionId(opts?.options, "test-session")
       for (const turn of mockTurns) {
         if (capturedController?.signal.aborted) {
+          if (abortCompletesNormally) return
           throw new Error("Claude Code process aborted by user")
         }
         // The real SDK honors Options.sessionId for a fork. Keep this mock
@@ -132,6 +137,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           }
         }
         if (capturedController?.signal.aborted) {
+          if (abortCompletesNormally) return
           throw new Error("Claude Code process aborted by user")
         }
       }
@@ -143,14 +149,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     instance: { tool: () => {}, registerTool: () => ({}) },
   }),
   tool: () => ({}),
-}))
+}), "proxy-passthrough-deny-abort.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -204,7 +210,7 @@ describe("Passthrough deny aborts the nested SDK session on loop detection", () 
   // "parallel same-tool calls" describe below. The legacy path remains
   // reachable via the MERIDIAN_PASSTHROUGH_EARLY_STOP=0 kill switch and
   // must keep working for operators who disable early stop.
-  beforeEach(() => {
+  beforeEach(async () => {
     origEnv = process.env.MERIDIAN_PASSTHROUGH
     origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
@@ -212,7 +218,8 @@ describe("Passthrough deny aborts the nested SDK session on loop detection", () 
     mockTurns = []
     capturedController = undefined
     capturedResume = undefined
-    clearSessionCache()
+    abortCompletesNormally = false
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -270,6 +277,56 @@ describe("Passthrough deny aborts the nested SDK session on loop detection", () 
       .filter((e: any) => e.event === "content_block_start" && e.data?.content_block?.type === "tool_use")
       .map((e: any) => e.data.content_block.id)
     expect(toolStartIds).toEqual(["toolu_s1"])
+  })
+
+  it("stream: treats a normally completed self-abort as a recoverable tool handoff", async () => {
+    // The SDK can finish its iterator cleanly after Meridian aborts it. The
+    // final-envelope guard then throws its own error; that error must identify
+    // the self-abort so the existing captured-call recovery can run (#1095).
+    abortCompletesNormally = true
+    mockTurns = [
+      streamMessageStart(),
+      toolTurn("toolu_s1", "get_weather", { city: "SF" }),
+      toolTurn("toolu_s2", "get_weather", { city: "LA" }),
+    ]
+    const app = createProxyServer({ port: 0, host: "127.0.0.1" }).app
+
+    const response = await post(app, true)
+    const events = await readSSE(response)
+    expect(capturedController?.signal.aborted).toBe(true)
+    expect(events.filter(event => event.event === "error")).toHaveLength(0)
+    expect(events.filter(event => event.event === "message_stop")).toHaveLength(1)
+    expect(events.filter(event => event.event === "message_delta")
+      .map(event => (event.data.delta as { stop_reason?: string }).stop_reason))
+      .toContain("tool_use")
+    expect(events.filter(event => event.event === "content_block_start" &&
+      (event.data.content_block as { type?: string })?.type === "tool_use")
+      .map(event => (event.data.content_block as { id?: string }).id))
+      .toEqual(["toolu_s1"])
+  })
+
+  it("retains buffered numeric arguments when recovery closes a dangling tool block", async () => {
+    mockTurns = [
+      streamMessageStart(),
+      streamEvent({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_buffered", name: `${PASSTHROUGH_PREFIX}measure`, input: {} } }),
+      streamEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"timeout":60}' } }),
+      toolTurn("toolu_buffered", "measure", { timeout: 60 }),
+      toolTurn("toolu_repeat", "measure", { timeout: 30 }),
+    ]
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const response = await app.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(makeRequest({ stream: true, tools: [{ name: "measure", input_schema: {
+        type: "object", properties: { timeout: { type: "number" } }, required: ["timeout"],
+      } }] })),
+    }))
+    const events = await readSSE(response)
+    expect(events.some(event => event.event === "error")).toBe(false)
+    const args = events.filter(event => event.event === "content_block_delta")
+      .map(event => (event.data.delta as { partial_json: string }).partial_json).join("")
+    expect(JSON.parse(args || "{}")).toEqual({ timeout: 60 })
+    expect(events.filter(event => event.event === "content_block_stop")).toHaveLength(1)
+    expect(events.filter(event => event.event === "message_stop")).toHaveLength(1)
   })
 
   it("closes a dangling tool_use content block before the recovery message_stop (#552 red reads)", async () => {
@@ -372,7 +429,7 @@ describe("parallel same-tool calls are captured and forwarded (#552 kabo regress
   let origEnv: string | undefined
   let origEarlyStop: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     origEnv = process.env.MERIDIAN_PASSTHROUGH
     origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
@@ -380,7 +437,7 @@ describe("parallel same-tool calls are captured and forwarded (#552 kabo regress
     mockTurns = []
     capturedController = undefined
     capturedResume = undefined
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -565,7 +622,7 @@ describe("dropped calls must not leak to the client (truth-divergence guard)", (
   let origEnv: string | undefined
   let origEarlyStop: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     origEnv = process.env.MERIDIAN_PASSTHROUGH
     origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
@@ -573,7 +630,7 @@ describe("dropped calls must not leak to the client (truth-divergence guard)", (
     mockTurns = []
     capturedController = undefined
     capturedResume = undefined
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -642,13 +699,13 @@ describe("envelope integrity tripwire", () => {
   let origEnv: string | undefined
   let origEarlyStop: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     origEnv = process.env.MERIDIAN_PASSTHROUGH
     origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
     process.env.MERIDIAN_PASSTHROUGH = "1"
     mockTurns = []
     capturedController = undefined
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   afterEach(() => {
@@ -710,4 +767,122 @@ describe("envelope integrity tripwire", () => {
     const after = (await (await app.fetch(new Request("http://localhost/telemetry/summary"))).json() as any).envelopeViolationCount ?? 0
     expect(after - before).toBe(0)
   })
+})
+
+describe("dropped duplicate tool_use is excluded from persisted checkpoint", () => {
+  let origEnv: string | undefined
+  let origEarlyStop: string | undefined
+
+  beforeEach(async () => {
+    origEnv = process.env.MERIDIAN_PASSTHROUGH
+    origEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
+    process.env.MERIDIAN_PASSTHROUGH = "1"
+    delete process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP // early stop ON (default)
+    mockTurns = []
+    capturedController = undefined
+    capturedResume = undefined
+    await clearSessionCache()
+  })
+
+  afterEach(() => {
+    if (origEnv === undefined) delete process.env.MERIDIAN_PASSTHROUGH
+    else process.env.MERIDIAN_PASSTHROUGH = origEnv
+    if (origEarlyStop === undefined) delete process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
+    else process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = origEarlyStop
+  })
+
+  function streamEvent(event: Record<string, unknown>) {
+    return { type: "stream_event", event, parent_tool_use_id: null, uuid: crypto.randomUUID(), session_id: "test-session" }
+  }
+
+  function duplicateTurn() {
+    // Two tool_use blocks: same name + same input → second is an exact duplicate
+    const turn = toolTurn("toolu_d1", "read", { filePath: "a.txt" })
+    turn.message.content = [
+      { type: "tool_use", id: "toolu_d1", name: `${PASSTHROUGH_PREFIX}read`, input: { filePath: "a.txt" } },
+      { type: "tool_use", id: "toolu_d2", name: `${PASSTHROUGH_PREFIX}read`, input: { filePath: "a.txt" } },
+    ]
+    return turn
+  }
+
+  function denyUser(ids: string[]) {
+    return {
+      type: "user",
+      message: {
+        role: "user",
+        content: ids.map((id) => ({
+          type: "tool_result",
+          tool_use_id: id,
+          is_error: true,
+          content: "This tool call has been forwarded to the client for execution. " +
+            "The result will be delivered in a future turn. " +
+            "Do not retry, do not call additional tools, and do not generate further text — end your turn now.",
+        })),
+      },
+      parent_tool_use_id: null,
+      uuid: crypto.randomUUID(),
+      session_id: "test-session",
+    }
+  }
+
+  for (const stream of [false, true]) {
+  it(`checkpoint matches the visible calls and resumes (stream=${stream})`, async () => {
+    // First turn: model emits two reads, second is an exact duplicate.
+    // The hook drops toolu_d2 (isExactDuplicate) → added to droppedToolUseIds.
+    // Non-stream hides d2; streaming already delivered both. Match that set.
+    mockTurns = [
+      ...(stream ? [streamMessageStart(), ...["toolu_d1", "toolu_d2"].flatMap((id, index) => [
+        streamEvent({ type: "content_block_start", index, content_block: { type: "tool_use", id, name: `${PASSTHROUGH_PREFIX}read`, input: {} } }),
+        streamEvent({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: '{"filePath":"a.txt"}' } }),
+        streamEvent({ type: "content_block_stop", index }),
+      ]), streamEvent({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 30 } })] : []),
+      duplicateTurn(),
+      denyUser(["toolu_d1", "toolu_d2"]),
+      { type: "assistant", message: {
+        id: "msg_digest", type: "message", role: "assistant",
+        content: [{ type: "text", text: "hidden digest" }],
+        model: "claude-sonnet-4-5-20250929", stop_reason: "end_turn",
+        usage: { input_tokens: 10, output_tokens: 10 },
+      }, parent_tool_use_id: null, uuid: crypto.randomUUID(), session_id: "test-session" },
+      { type: "result", subtype: "success", is_error: false, session_id: "test-session" },
+    ]
+    const app = createProxyServer({ port: 0, host: "127.0.0.1" }).app
+    const first = await post(app, stream)
+    expect(first.status).toBe(200)
+
+    const firstRaw = await first.text()
+    const visibleIds = stream
+      ? firstRaw.split("\n").filter(line => line.startsWith("data:")).map(line => JSON.parse(line.slice(5)))
+        .filter(event => event.type === "content_block_start" && event.content_block?.type === "tool_use")
+        .map(event => event.content_block.id)
+      : JSON.parse(firstRaw).content.filter((block: { type: string }) => block.type === "tool_use").map((block: { id: string }) => block.id)
+    expect(visibleIds).toEqual(stream ? ["toolu_d1", "toolu_d2"] : ["toolu_d1"])
+    const { lookupSharedSession } = await import("../proxy/sessionStore")
+    const stored = lookupSharedSession("deny-abort-session")
+    expect(stored?.passthroughToolCallIds).toEqual(visibleIds)
+
+    // Follow-up: client sends back the real result for toolu_d1 only.
+    // If the checkpoint incorrectly included toolu_d2, isCompleteToolResultContinuation
+    // would fail (expected size 2, actual size 1) and the request would fresh-replay.
+    mockTurns = [
+      { type: "assistant", message: {
+        id: "msg_final", type: "message", role: "assistant",
+        content: [{ type: "text", text: "File read successfully." }],
+        model: "claude-sonnet-4-5-20250929", stop_reason: "end_turn",
+        usage: { input_tokens: 10, output_tokens: 10 },
+      }, parent_tool_use_id: null, uuid: crypto.randomUUID(), session_id: "test-session" },
+    ]
+    capturedResume = undefined
+    const second = await post(app, stream, [
+      { role: "user", content: "Do the thing." },
+      { role: "assistant", content: visibleIds.map((id: string) => ({ type: "tool_use", id, name: "read", input: { filePath: "a.txt" } })) },
+      { role: "user", content: visibleIds.map((id: string) => ({ type: "tool_result", tool_use_id: id, content: "contents of a.txt" })) },
+    ])
+    expect(second.status).toBe(200)
+    await second.text()
+    // Must resume — if the checkpoint included toolu_d2, this would fresh-replay
+    expect(stored?.claudeSessionId).toBeDefined()
+    expect(capturedResume ?? "(not resumed)").toBe(stored?.claudeSessionId ?? "(missing mapping)")
+  })
+  }
 })

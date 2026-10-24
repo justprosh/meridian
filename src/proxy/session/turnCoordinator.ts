@@ -8,6 +8,8 @@ export interface SessionTurnLease {
    */
   advancedWhileWaiting(scopeKey: string): boolean
   markCommitted(scopeKey: string): void
+  /** Undo this lease's commit after an exact durable rollback restores arrival state. */
+  markRolledBack(scopeKey: string): void
   release(): void
 }
 
@@ -41,6 +43,11 @@ export class SessionTurnCoordinator {
 
   get size(): number {
     return this.turns.size
+  }
+
+  /** True from a request's arrival until the last lease for the key is released. */
+  isActive(key: string): boolean {
+    return this.turns.has(key)
   }
 
   acquire(key: string, signal?: AbortSignal): Promise<SessionTurnLease> {
@@ -104,6 +111,12 @@ export class SessionTurnCoordinator {
         if (released || committedScopes.has(scopeKey)) return
         committedScopes.add(scopeKey)
         state.versions.set(scopeKey, (state.versions.get(scopeKey) ?? 0) + 1)
+      },
+      markRolledBack: (scopeKey: string) => {
+        if (released || !committedScopes.delete(scopeKey)) return
+        const current = state.versions.get(scopeKey) ?? 0
+        if (current <= 1) state.versions.delete(scopeKey)
+        else state.versions.set(scopeKey, current - 1)
       },
       release: () => {
         if (released) return

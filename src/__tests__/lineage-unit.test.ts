@@ -16,6 +16,7 @@ import {
   normalizeContextUsage,
   withClientAssistantUuid,
   reconcileReturnedSessionUuids,
+  inheritSdkUuids,
   MIN_SUFFIX_FOR_COMPACTION,
   type SessionState,
 } from "../proxy/session/lineage"
@@ -309,8 +310,8 @@ describe("verifyLineage", () => {
     expect(result.type).toBe("continuation")
   })
 
-  it("returns undo when same count but last message replaced", () => {
-    // Same message count with last message changed = user replaced last message (undo + retype)
+  it("replays a replacement assistant tail instead of dropping it", () => {
+    // An assistant-tail rewrite is not a new user turn to send after rollback.
     const msgs = [
       msg("user", "a"), msg("assistant", "b"),
       msg("user", "c"), msg("assistant", "d"),
@@ -322,13 +323,13 @@ describe("verifyLineage", () => {
       messageHashes: hashes,
       sdkMessageUuids: [null, "uuid-1", null, "uuid-2"],
     })
-    // Same count, but last message changed — this is undo + new message
+    // The replacement assistant content must survive the replay.
     const modified = [
       msg("user", "a"), msg("assistant", "b"),
       msg("user", "c"), msg("assistant", "d-modified"),
     ]
     const result = verifyLineage(session, modified)
-    expect(result.type).toBe("undo")
+    expect(result).toMatchObject({ type: "diverged", reason: "undo-gap" })
   })
 
   it("returns undo when fewer messages", () => {
@@ -390,7 +391,7 @@ describe("verifyLineage", () => {
     expect(result.type).toBe("continuation")
   })
 
-  it("returns compaction when suffix matches on long conversation", () => {
+  it("replays a summarized head and preserves the legacy opt-in", () => {
     // Need >= 6 stored messages and >= MIN_SUFFIX_FOR_COMPACTION suffix overlap
     const msgs = [
       msg("user", "a"), msg("assistant", "b"),
@@ -411,15 +412,48 @@ describe("verifyLineage", () => {
       msg("user", "e"), msg("assistant", "f"), // preserved suffix
       msg("assistant", "new response"), msg("user", "continue"),
     ]
-    const result = verifyLineage(session, compacted)
-    expect(result.type).toBe("compaction")
-    if (result.type === "compaction") {
-      expect(result.resumeFrom).toBe(3)
-      expect(result.suffixOverlap).toBe(2)
+    expect(verifyLineage(session, compacted)).toEqual({ type: "diverged", reason: "compaction" })
+    const legacy = verifyLineage(session, compacted, { compactionSurvival: true })
+    expect(legacy.type).toBe("compaction")
+    if (legacy.type === "compaction") {
+      expect(legacy.resumeFrom).toBe(3)
+      expect(legacy.suffixOverlap).toBe(2)
     }
     expect(session.messageCount).toBe(msgs.length)
     expect(session.lineageHash).toBe(originalLineageHash)
     expect(session.messageHashes).toEqual(originalMessageHashes)
+  })
+
+  it("replays a shortened head so the client's summary reaches the SDK", () => {
+    const stored = [
+      msg("user", "a"), msg("assistant", "b"),
+      msg("user", "c"), msg("assistant", "d"),
+      msg("user", "e"), msg("assistant", "f"),
+    ]
+    const session = makeSession({
+      lineageHash: computeLineageHash(stored),
+      messageCount: stored.length,
+      messageHashes: computeMessageHashes(stored),
+    })
+    const incoming = [msg("user", "Summary of a through d"), ...stored.slice(-2), msg("user", "continue")]
+    expect(verifyLineage(session, incoming)).toEqual({ type: "diverged", reason: "compaction" })
+  })
+
+  it("keeps an equal-length pruned head on the stored checkpoint", () => {
+    const stored = [
+      msg("user", "a"), msg("assistant", "b"),
+      msg("user", "large tool result"), msg("assistant", "d"),
+      msg("user", "e"), msg("assistant", "f"),
+    ]
+    const session = makeSession({
+      lineageHash: computeLineageHash(stored),
+      messageCount: stored.length,
+      messageHashes: computeMessageHashes(stored),
+    })
+    const incoming = [...stored]
+    incoming[2] = msg("user", "pruned tool result")
+    incoming.push(msg("user", "continue"))
+    expect(verifyLineage(session, incoming)).toMatchObject({ type: "compaction", resumeFrom: 6 })
   })
 
   it("does not false-detect compaction when suffix hashes appear at wrong positions (regression #283)", () => {
@@ -644,23 +678,26 @@ describe("formatLineageMismatch", () => {
   })
 })
 
-describe("verifyLineage append-only tool-result extension", () => {
-  const toolResult = (id: string, content: string) => ({
-    type: "tool_result",
-    tool_use_id: id,
-    content,
+// Shared by the block-level suites below, which need a session whose per-block
+// hashes were recorded — that is what makes block-granular classification
+// possible, and a session without them is expected to keep replaying.
+const toolResult = (id: string, content: string) => ({
+  type: "tool_result",
+  tool_use_id: id,
+  content,
+})
+
+function sessionWithBlockHashes(messages: Array<{ role: string; content: any }>): SessionState {
+  return makeSession({
+    lastAccess: 0,
+    lineageHash: computeLineageHash(messages),
+    messageCount: messages.length,
+    messageHashes: computeMessageHashes(messages),
+    messageBlockHashes: computeMessageBlockHashes(messages),
   })
+}
 
-  function sessionFor(messages: Array<{ role: string; content: any }>): SessionState {
-    return makeSession({
-      lastAccess: 0,
-      lineageHash: computeLineageHash(messages),
-      messageCount: messages.length,
-      messageHashes: computeMessageHashes(messages),
-      messageBlockHashes: computeMessageBlockHashes(messages),
-    })
-  }
-
+describe("verifyLineage append-only tool-result extension", () => {
   it("resumes from only the newly appended parallel tool result", () => {
     const stored = [
       { role: "user", content: [{ type: "text", text: "run both" }] },
@@ -683,9 +720,9 @@ describe("verifyLineage append-only tool-result extension", () => {
       { role: "user", content: [toolResult("call-c", "c-result")] },
     ]
 
-    expect(verifyLineage(sessionFor(stored), incoming)).toEqual({
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming)).toEqual({
       type: "continuation",
-      session: sessionFor(stored),
+      session: sessionWithBlockHashes(stored),
       resumeFrom: 2,
       resumeContentFrom: 1,
     })
@@ -725,7 +762,7 @@ describe("verifyLineage append-only tool-result extension", () => {
     ]
     expect(incoming.length).toBe(53)
 
-    const result = verifyLineage(sessionFor(stored), incoming)
+    const result = verifyLineage(sessionWithBlockHashes(stored), incoming)
     expect(result.type).toBe("continuation")
     if (result.type === "continuation") {
       expect(result.resumeFrom).toBe(50)
@@ -781,7 +818,7 @@ describe("verifyLineage append-only tool-result extension", () => {
       { role: "assistant", content: "next" },
     ]
 
-    expect(verifyLineage(sessionFor(stored), incoming)).toMatchObject({
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming)).toMatchObject({
       type: "diverged",
       reason: "modified-history",
       prefixOverlap: 2,
@@ -800,7 +837,7 @@ describe("verifyLineage append-only tool-result extension", () => {
       { role: "assistant", content: "next" },
     ]
 
-    expect(verifyLineage(sessionFor(stored), incoming).type).toBe("diverged")
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).toBe("diverged")
   })
 
   it("still diverges when a prior tool result is appended again", () => {
@@ -815,7 +852,158 @@ describe("verifyLineage append-only tool-result extension", () => {
       { role: "assistant", content: "next" },
     ]
 
-    expect(verifyLineage(sessionFor(stored), incoming).type).toBe("diverged")
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).toBe("diverged")
+  })
+
+  // #767: OpenCode appends reminder/notification text after the tool results of
+  // a turn, so the trailing user message grows from [tool_result, ...] to
+  // [tool_result, ..., text, ...]. Before this, the appended text failed the
+  // "every appended block is a new tool_result" test and the whole turn
+  // diverged as modified-history with prefix overlap exactly messageCount - 1.
+  it("continues when the trailing tool-result turn gains appended text blocks", () => {
+    const stored = [
+      { role: "user", content: [{ type: "text", text: "do the thing" }] },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "call-a", name: "bash", input: { command: "a" } },
+        { type: "tool_use", id: "call-b", name: "bash", input: { command: "b" } },
+      ] },
+      { role: "user", content: [toolResult("call-a", "a-result"), toolResult("call-b", "b-result")] },
+    ]
+    const incoming = [
+      stored[0]!,
+      stored[1]!,
+      { role: "user", content: [
+        toolResult("call-a", "a-result"),
+        toolResult("call-b", "b-result"),
+        { type: "text", text: "<system-reminder>agent usage</system-reminder>" },
+        { type: "text", text: "continue" },
+      ] },
+    ]
+
+    const result = verifyLineage(sessionWithBlockHashes(stored), incoming)
+    expect(result.type).toBe("continuation")
+    if (result.type === "continuation") {
+      expect(result.resumeFrom).toBe(2)
+      expect(result.resumeContentFrom).toBe(2)
+    }
+  })
+
+  it("does not resume when an appended tool_result repeats a stored tool_use_id", () => {
+    const stored = [
+      { role: "user", content: [{ type: "text", text: "do the thing" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call-a", name: "bash", input: { command: "a" } }] },
+      { role: "user", content: [toolResult("call-a", "a-result")] },
+    ]
+    const incoming = [
+      stored[0]!,
+      stored[1]!,
+      { role: "user", content: [
+        toolResult("call-a", "a-result"),
+        { type: "text", text: "note" },
+        toolResult("call-a", "a-result-again"),
+      ] },
+    ]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).not.toBe("continuation")
+  })
+})
+
+describe("verifyLineage rejects raw dropped blocks without adapter canonicalization", () => {
+  const hookBlock = {
+    type: "text",
+    text: "<user-prompt-submit-hook>\n{\"continue\":true}\n</user-prompt-submit-hook>",
+  }
+  const userText = { type: "text", text: "Read data.txt and tell me the third line." }
+
+  // The core cannot infer that a removed block was transient. Recognized
+  // OpenCode hook envelopes are normalized in the adapter before hashing;
+  // adapter tests cover that positive behavior separately.
+  it("replays when a raw hook block is dropped from the first user message", () => {
+    const stored = [{ role: "user", content: [hookBlock, userText] }]
+    const incoming = [
+      { role: "user", content: [userText] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call-a", name: "read", input: {} }] },
+      { role: "user", content: [toolResult("call-a", "alpha\nbravo\ncharlie")] },
+    ]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).toBe("diverged")
+  })
+
+  it("replays when a raw dropped block sat between two surviving blocks", () => {
+    const before = { type: "text", text: "before" }
+    const after = { type: "text", text: "after" }
+    const stored = [{ role: "user", content: [before, hookBlock, after] }]
+    const incoming = [
+      { role: "user", content: [before, after] },
+      { role: "assistant", content: "ok" },
+    ]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).toBe("diverged")
+  })
+
+  // Edits, removals, and reordering all invalidate the stored history proof.
+  it("does not resume when a surviving block was edited rather than dropped", () => {
+    const stored = [{ role: "user", content: [hookBlock, userText] }]
+    const incoming = [
+      { role: "user", content: [{ type: "text", text: "a different question entirely" }] },
+      { role: "assistant", content: "ok" },
+    ]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).not.toBe("continuation")
+  })
+
+  it("does not resume when the survivors came back out of order", () => {
+    const first = { type: "text", text: "first" }
+    const second = { type: "text", text: "second" }
+    const stored = [{ role: "user", content: [first, second, hookBlock] }]
+    const incoming = [
+      { role: "user", content: [second, first] },
+      { role: "assistant", content: "ok" },
+    ]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).not.toBe("continuation")
+  })
+
+  it("does not resume when an assistant turn lost blocks", () => {
+    const stored = [
+      { role: "user", content: [userText] },
+      { role: "assistant", content: [
+        { type: "text", text: "thinking out loud" },
+        { type: "tool_use", id: "call-a", name: "read", input: {} },
+      ] },
+    ]
+    const incoming = [
+      { role: "user", content: [userText] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call-a", name: "read", input: {} }] },
+      { role: "user", content: [toolResult("call-a", "x")] },
+    ]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).not.toBe("continuation")
+  })
+
+  it("does not resume when the conversation did not move forward", () => {
+    // Same length: an undo or a retype, not a continuation.
+    const stored = [{ role: "user", content: [hookBlock, userText] }]
+    const incoming = [{ role: "user", content: [userText] }]
+
+    expect(verifyLineage(sessionWithBlockHashes(stored), incoming).type).not.toBe("continuation")
+  })
+
+  it("does not resume a session stored without block hashes", () => {
+    const stored = [{ role: "user", content: [hookBlock, userText] }]
+    const legacy = makeSession({
+      lastAccess: 0,
+      lineageHash: computeLineageHash(stored),
+      messageCount: stored.length,
+      messageHashes: computeMessageHashes(stored),
+      // messageBlockHashes absent — pre-1.61.0 cache entry.
+    })
+    const incoming = [
+      { role: "user", content: [userText] },
+      { role: "assistant", content: "ok" },
+    ]
+
+    expect(verifyLineage(legacy, incoming).type).not.toBe("continuation")
   })
 })
 
@@ -909,10 +1097,10 @@ describe("verifyLineage compaction that reaches the end of the incoming array", 
     if (result.type === "diverged") expect(result.reason).toBe("modified-history")
   })
 
-  it("still detects a real compaction that appends a new turn", () => {
+  it("replays a real compaction that appends a new turn", () => {
     // The genuine shape: a long head replaced by a short summary, preserved
-    // tail intact, and the new turn appended after it. resumeFrom stays inside
-    // the array, so this must keep resuming — the fix must not cost it.
+    // tail intact, and the new turn appended after it. The shorter head
+    // carries a summary that must replace the stored SDK context.
     const compacted = [
       msg("user", "summary of earlier"),
       ...stored.slice(-3),
@@ -920,8 +1108,7 @@ describe("verifyLineage compaction that reaches the end of the incoming array", 
       msg("user", "a brand new turn"),
     ]
     const result = verifyLineage(session, compacted)
-    expect(result.type).toBe("compaction")
-    if (result.type === "compaction") expect(result.resumeFrom).toBeLessThan(compacted.length)
+    expect(result).toEqual({ type: "diverged", reason: "compaction" })
   })
 })
 
@@ -946,14 +1133,24 @@ describe("withClientAssistantUuid", () => {
 })
 
 describe("reconcileReturnedSessionUuids", () => {
-  it("clears copied UUIDs after an observed session change and keeps the current output", () => {
+  it("retains copied prefix UUIDs across a managed fork and trims stale tail slots (#1371)", () => {
     expect(reconcileReturnedSessionUuids(
-      [null, "copied-assistant", null, "current-assistant"],
+      [null, "copied-assistant", null, "current-assistant", "stale-tail"],
       3,
       "current-assistant",
       "source-session",
       "fork-session",
-    )).toEqual([null, null, null, "current-assistant"])
+    )).toEqual([null, "copied-assistant", null, "current-assistant"])
+  })
+
+  it("pads missing client slots before recording the current assistant UUID on a fork (#1371)", () => {
+    expect(reconcileReturnedSessionUuids(
+      [null, "copied-assistant"],
+      3,
+      "current-assistant",
+      "source-session",
+      "fork-session",
+    )).toEqual([null, "copied-assistant", null, "current-assistant"])
   })
 
   it("keeps the UUID map when the SDK returns the resumed session", () => {
@@ -1004,5 +1201,95 @@ describe("fork-remapped undo boundaries", () => {
       prefixOverlap: 6,
       rollbackUuid: "new-fork-output-uuid",
     })
+  })
+})
+
+describe("inheritSdkUuids (#1371)", () => {
+  const baseMessages = [
+    msg("user", "u0"),
+    msg("assistant", "a1"),
+    msg("user", "u2"),
+    msg("assistant", "a3"),
+    msg("user", "u4"),
+    msg("assistant", "a5"),
+  ]
+  const baseSession = makeSession({
+    messageCount: baseMessages.length,
+    lineageHash: computeLineageHash(baseMessages),
+    messageHashes: computeMessageHashes(baseMessages),
+    sdkMessageUuids: [null, "uuid-1", null, "uuid-3", null, "uuid-5"],
+  })
+
+  it("returns empty array on diverged lineage", () => {
+    const incoming = [msg("user", "unrelated")]
+    const lineage = verifyLineage(baseSession, incoming)
+    expect(lineage.type).toBe("diverged")
+    expect(inheritSdkUuids(baseSession, lineage, incoming)).toEqual([])
+  })
+
+  it("slices to prefixOverlap on undo so stale tail UUIDs are dropped", () => {
+    const incoming = [...baseMessages.slice(0, 4), msg("user", "revised u4")]
+    const lineage = verifyLineage(baseSession, incoming)
+    expect(lineage).toMatchObject({ type: "undo", prefixOverlap: 4, rollbackUuid: "uuid-3" })
+    expect(inheritSdkUuids(baseSession, lineage, incoming)).toEqual([null, "uuid-1", null, "uuid-3"])
+  })
+
+  it("copies all stored UUIDs on ordinary continuation and truncates on in-place block continuation", () => {
+    const incoming = [...baseMessages, msg("user", "u6")]
+    const lineage = verifyLineage(baseSession, incoming)
+    expect(lineage.type).toBe("continuation")
+    expect(inheritSdkUuids(baseSession, lineage, incoming)).toEqual([null, "uuid-1", null, "uuid-3", null, "uuid-5"])
+
+    const inPlaceLineage = {
+      type: "continuation" as const,
+      session: baseSession,
+      resumeFrom: 2,
+      resumeContentFrom: 1,
+    }
+    expect(inheritSdkUuids(baseSession, inPlaceLineage, baseMessages.slice(0, 3))).toEqual([null, "uuid-1", null])
+  })
+
+  it("re-aligns prefix and suffix UUIDs across compaction and nulls compacted slots", () => {
+    const storedMsgs = [
+      msg("user", "u0"),
+      msg("assistant", "a1"),
+      msg("user", "u2"),
+      msg("assistant", "a3"),
+      msg("user", "u4"),
+      msg("assistant", "a5"),
+      msg("user", "u6"),
+      msg("assistant", "a7"),
+    ]
+    const session = makeSession({
+      messageCount: storedMsgs.length,
+      lineageHash: computeLineageHash(storedMsgs),
+      messageHashes: computeMessageHashes(storedMsgs),
+      sdkMessageUuids: [null, "uuid-1", null, "uuid-3", null, "uuid-5", null, "uuid-7", "uuid-8"],
+    })
+    // Equal-length head replacement (indices 0..1 intact, 2..3 replaced in-place, 4..7 preserved suffix, 8 new user)
+    const incoming = [
+      storedMsgs[0]!,
+      storedMsgs[1]!,
+      msg("user", "compacted summary u2"),
+      msg("assistant", "compacted summary a3"),
+      storedMsgs[4]!,
+      storedMsgs[5]!,
+      storedMsgs[6]!,
+      storedMsgs[7]!,
+      msg("user", "u8"),
+    ]
+    const lineage = verifyLineage(session, incoming)
+    expect(lineage.type).toBe("compaction")
+    expect(inheritSdkUuids(session, lineage, incoming)).toEqual([
+      null,
+      "uuid-1",
+      null,
+      null,
+      null,
+      "uuid-5",
+      null,
+      "uuid-7",
+      null,
+    ])
   })
 })

@@ -8,6 +8,15 @@
 import type { Context } from "hono"
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk"
 
+export type RoutingTurnIdentity = Readonly<{
+  readonly kind: "human"
+  /** Fixed-width, session-bound digest of the host's genuine human message ID. */
+  readonly turnId: string
+  /** Signed wall-clock issue time used as a durable anti-replay high-water mark. */
+  readonly issuedAt: number
+  readonly generation: "opencode-v1" | "opencode-v2-beta-18314" | "opencode-v2-2.0.16"
+}>
+
 /**
  * Core identity of an agent — detection, session tracking, CWD extraction.
  * This is the minimal interface for agent recognition. Behavioral customization
@@ -24,10 +33,74 @@ export interface AgentIdentity {
   getSessionId(c: Context, body?: unknown): string | undefined
 
   /**
+   * Optional IMMEDIATE parent session key, for clients that declare a subagent
+   * tree (Prime Agent's RLM children stamp it in `metadata.user_id`).
+   *
+   * Two rules make this safe to consume:
+   *   - the value must be a key `getSessionId` could itself have produced, so
+   *     the returned string is directly comparable to another request's key;
+   *   - it must never alter this request's own key.
+   *
+   * Deeper trees name one level each, so consumers walk the chain. Returning
+   * undefined (the default) means the client declares no lineage, which is what
+   * keeps parent→child cancellation inert for every other client.
+   */
+  getParentSessionId?(c: Context, body?: unknown): string | undefined
+
+  /**
+   * Optional key of the conversation this request belongs to, for clients
+   * whose subagents carry session keys of their own. Requests under one root
+   * share account routing — the sticky assignment and the priority
+   * assignment — so a subagent lands on its parent's account.
+   *
+   * Everything else stays on `getSessionId`: the session mapping, lineage,
+   * the turn lease, the session tree, the durable priority route (coupled to
+   * one session mapping) and the `[1m]` rate-limit bench (scoped per session
+   * so one limited flow never downgrades its siblings).
+   *
+   * Must return a key `getSessionId` produces for the root's own requests.
+   * Undefined, or no method, means the request is its own root.
+   */
+  getRootSessionId?(c: Context, body?: unknown): string | undefined
+
+  /**
    * Optional client-declared agent mode. Adapters own their header/protocol
    * details; the proxy uses the normalized value for model-tier selection.
    */
   getAgentMode?(c: Context, body?: unknown): string | undefined
+
+  /**
+   * True when the client is known to run several turns concurrently under one
+   * session key. Turn coordination still serializes them; what changes is the
+   * loser of a commit race. It is reclassified (`diverged`) and answered from
+   * its own body instead of refused with a 400 (#870). The pattern predates
+   * turn coordination and the upstream API answers both turns.
+   *
+   * Set this only for clients whose protocol makes the sharing unavoidable.
+   * For everyone else, a key that advanced under a waiting request carries a
+   * stale branch, and refusing it is what stops two histories from merging.
+   */
+  readonly runsConcurrentTurnsPerSessionKey?: boolean
+
+  /**
+   * True when this request is a client side call that carries the
+   * conversation's session key without being a turn of that conversation.
+   *
+   * Such a request skips lineage lookup and never publishes, evicts or
+   * recovers the session mapping, and never takes the session turn lease: it
+   * has no turn to serialize. Undefined or false keeps normal session handling, which is
+   * what every client that separates its side calls by key already gets.
+   */
+  isAuxiliaryRequest?(c: Context, body?: unknown): boolean
+
+  /**
+   * Optional trusted identity for a visible human turn.
+   *
+   * This is deliberately a positive, normalized assertion. Callers must treat
+   * undefined as ineligible for user-turn routing changes. An adapter must not
+   * return raw client-declared kind/ID headers without authenticating them.
+   */
+  getRoutingTurnIdentity?(c: Context, body?: unknown): RoutingTurnIdentity | undefined
 
   /**
    * Extract the SDK subprocess working directory from the request body.
@@ -63,6 +136,14 @@ export interface AgentIdentity {
   extractClientWorkingDirectory?(body: any): string | undefined
 
   /**
+   * Whether the client's environment may be independent of the proxy-side SDK
+   * subprocess even when both report the same path text. When true, query
+   * construction keeps the client/proxy environment distinction explicit
+   * instead of treating lexical path equality as proof of one execution locus.
+   */
+  readonly clientEnvironmentMayDifferFromProxy?: boolean
+
+  /**
    * Content normalization — convert message content to a stable string
    * for hashing. Agents may send content in different formats.
    */
@@ -83,6 +164,32 @@ export interface AgentIdentity {
    * Tools are registered as `mcp__{name}__{tool}`.
    */
   getMcpServerName(): string
+
+  /**
+   * The namespace the CLIENT'S tools are nested under in passthrough mode,
+   * where they appear to the model as `mcp__{name}__{tool}`.
+   *
+   * Deliberately NOT `getMcpServerName()`, which names the server Meridian
+   * registers in INTERNAL mode. Reusing that would rename every OpenCode
+   * client tool from `mcp__oc__read` to `mcp__opencode__read`, moving the
+   * model-visible prompt — and so the prompt cache — for the entire existing
+   * user base, and colliding with the `mcp__opencode__*` names
+   * `passthroughEarlyStop` excludes precisely because they are internal.
+   *
+   * Defaults to `oc` when unset, which is what every adapter used before this
+   * existed. Override it only where the default actively misleads: `oc` reads
+   * as "opencode" to a model on an adapter that is not OpenCode (#893).
+   */
+  getPassthroughMcpName?(): string
+}
+
+/** The account-routing key for a request: its declared root, else its own session key. */
+export function rootSessionIdOf(
+  adapter: Pick<AgentIdentity, "getSessionId" | "getRootSessionId">,
+  c: Context,
+  body?: unknown,
+): string | undefined {
+  return adapter.getRootSessionId?.(c, body) ?? adapter.getSessionId(c, body)
 }
 
 /**
@@ -174,19 +281,19 @@ export interface AgentAdapter extends AgentIdentity {
   getCoreToolNames?(): readonly string[]
 
   /**
-   * SDK setting sources to load for this agent.
+   * SDK setting sources for SDK-owned tool execution.
    *
    * Controls whether CLAUDE.md files, user settings, and project settings
-   * are loaded by the SDK subprocess. This is what makes Claude "know"
-   * about your project instructions and personal preferences.
+   * are loaded by the SDK subprocess outside passthrough. Passthrough always
+   * uses an empty list because client-owned tools and instructions must not
+   * inherit executable integrations or guidance from the proxy host.
    *
    * - `['user', 'project']` — load ~/.claude/CLAUDE.md and .claude/CLAUDE.md
    * - `['project']` — load only project-level CLAUDE.md
    * - `[]` or undefined — isolation mode (no filesystem settings loaded)
    *
-   * Agents that manage their own context (OpenCode, ForgeCode) should return
-   * empty/undefined. Agents that want full Claude Code behavior (Crush, Pi)
-   * should return `['user', 'project']`.
+   * This preference and the claudeMd feature selection are ignored during
+   * client-owned passthrough; explicit SDK hooks and memory settings remain.
    */
   getSettingSources?(): SettingSource[]
 

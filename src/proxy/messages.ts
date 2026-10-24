@@ -75,12 +75,13 @@ export const HASH_SERIALIZED_BLOCK_TYPES = new Set([
 ])
 
 /**
- * Normalize message content to a string for hashing and comparison.
+ * Legacy content rendering used for adapter compatibility and diagnostics.
  * Handles both string content and array content (Anthropic content blocks).
- * Strips cache_control metadata to ensure hash stability across requests.
+ * Omits cache_control metadata and opaque thinking blocks.
  *
- * Used only for lineage hashing — see {@link HASH_IGNORED_BLOCK_TYPES}, which
- * drops content a display-oriented normalizer would need to keep.
+ * This representation is ambiguous across block types and boundaries. Never
+ * use it to prove lineage: session/lineage.ts uses structured domain-separated
+ * hashes instead.
  *
  * NOTE: OpenCode sends content as a string on the first request but as
  * an array on subsequent ones. This normalizer handles both formats.
@@ -137,13 +138,39 @@ export function stripAdvisorTools(tools: unknown[]): unknown[] {
 }
 
 /**
- * Extract only the last user message (for session resume — SDK already has history).
+ * Extract the current user turn (for session resume — SDK already has history).
  */
 export function getLastUserMessage(messages: Array<{ role: string; content: any }>): Array<{ role: string; content: any }> {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return [messages[i]!]
+  // Coalescing applies to an incoming user tail. Keep the existing last-user
+  // fallback when a history ends with an assistant/prefill instead; treating
+  // that assistant text as new user input changes an unrelated resume path.
+  if (messages[messages.length - 1]?.role !== "user") {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === "user") return [messages[i]!]
+    }
+    return messages.slice(-1)
   }
-  return messages.slice(-1)
+  // Everything after the last assistant turn is the current turn. A client may
+  // send several consecutive user messages (memory, question, runtime context);
+  // returning only the last one treated the rest as history and dropped their
+  // content. Merging the content blocks also keeps a tool_result that is
+  // followed by a reminder user message from being displaced by that reminder —
+  // the SDK sees one user turn with the result, so the model answers instead of
+  // re-requesting the same tool.
+  let start = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") { start = i + 1; break }
+  }
+  const tail = messages.slice(start).filter((message) => message && message.role === "user")
+  if (tail.length === 0) return messages.slice(-1)
+  if (tail.length === 1) return tail
+  const content: any[] = []
+  for (const message of tail) {
+    if (typeof message.content === "string") content.push({ type: "text", text: message.content })
+    else if (Array.isArray(message.content)) content.push(...message.content)
+    else if (message.content != null) content.push(message.content)
+  }
+  return [{ role: "user", content }]
 }
 
 /**
@@ -162,21 +189,30 @@ export function getLastUserMessage(messages: Array<{ role: string; content: any 
  * and histories that don't end with a user turn are returned as a plain
  * join (nothing to separate).
  */
+export const REPLAY_CONTEXT_OPEN = `<conversation_history>\n`
+export const REPLAY_CONTEXT_CLOSE = `\n</conversation_history>\n\n` +
+  `The above is a replay of your prior conversation with this user — the original session could not be resumed. ` +
+  `It is context only: do not continue or imitate its transcript format, do not write "[Assistant: ...]" markers, ` +
+  `and never invent tool output — use your actual tools when action is needed. ` +
+  `Respond only as the assistant to the user's message below.\n\n`
+
 export function frameReplayTurns(turns: Array<{ role: string; text: string }>): string {
   const nonEmpty = turns.filter((t) => t.text)
   const joined = nonEmpty.map((t) => t.text).join("\n\n")
   if (nonEmpty.length < 2) return joined
-  const last = nonEmpty[nonEmpty.length - 1]!
-  if (last.role !== "user") return joined
-  const history = nonEmpty.slice(0, -1).map((t) => t.text).join("\n\n")
-  return (
-    `<conversation_history>\n${history}\n</conversation_history>\n\n` +
-    `The above is a replay of your prior conversation with this user — the original session could not be resumed. ` +
-    `It is context only: do not continue or imitate its transcript format, do not write "[Assistant: ...]" markers, ` +
-    `and never invent tool output — use your actual tools when action is needed. ` +
-    `Respond only as the assistant to the user's message below.\n\n` +
-    last.text
-  )
+  // The current turn is everything after the last assistant turn. Several
+  // consecutive user messages belong to it together; treating only the last one
+  // as live pushed the rest into history, so the model answered as if that
+  // content had never arrived.
+  let lastAssistant = -1
+  for (let i = nonEmpty.length - 1; i >= 0; i--) {
+    if (nonEmpty[i]!.role === "assistant") { lastAssistant = i; break }
+  }
+  const current = nonEmpty.slice(lastAssistant + 1)
+  if (current.length === 0) return joined
+  const history = nonEmpty.slice(0, lastAssistant + 1)
+  if (history.length === 0) return current.map((t) => t.text).join("\n\n")
+  return REPLAY_CONTEXT_OPEN + history.map((t) => t.text).join("\n\n") + REPLAY_CONTEXT_CLOSE + current.map((t) => t.text).join("\n\n")
 }
 
 /**
