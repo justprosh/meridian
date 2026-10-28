@@ -316,6 +316,26 @@ const CONTEXT_OVERFLOW_SIGNALS: readonly RegExp[] = OVERFLOW_PHRASES.map(
 )
 
 /**
+ * Wordings of a login the CLI can no longer use. The last one is what the CLI
+ * prints once its own refresh of an expired session is refused:
+ * `Failed to authenticate: OAuth session expired and could not be refreshed`.
+ */
+const LOGIN_EXPIRED_PHRASES: readonly string[] = [
+  "oauth token has expired",
+  "not logged in",
+  "oauth session expired",
+]
+
+function isLoginExpiredText(lower: string): boolean {
+  return LOGIN_EXPIRED_PHRASES.some(phrase => lower.includes(phrase))
+}
+
+/** The one message a lost login is reported with. Priority routing keys its
+ *  failover on it (see isAccountFailoverError), so it must not be reused by
+ *  the generic authentication branch, which also says authentication_error. */
+export const LOGIN_EXPIRED_MESSAGE = "Claude OAuth token has expired and could not be refreshed automatically. Run 'claude login' in your terminal to re-authenticate."
+
+/**
  * Detect specific SDK errors and return helpful messages to the client.
  *
  * `model` is the resolved variant for this request, used only to target the
@@ -326,11 +346,11 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
   const lower = errMsg.toLowerCase()
 
   // Expired OAuth token (more specific than the generic auth check below)
-  if (lower.includes("oauth token has expired") || lower.includes("not logged in")) {
+  if (isLoginExpiredText(lower)) {
     return {
       status: 401,
       type: "authentication_error",
-      message: "Claude OAuth token has expired and could not be refreshed automatically. Run 'claude login' in your terminal to re-authenticate."
+      message: LOGIN_EXPIRED_MESSAGE,
     }
   }
 
@@ -569,7 +589,7 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
  */
 export function isExpiredTokenError(errMsg: string): boolean {
   const lower = errMsg.toLowerCase()
-  if (lower.includes("oauth token has expired") || lower.includes("not logged in")) return true
+  if (isLoginExpiredText(lower)) return true
   if (lower.includes("invalid_token") || lower.includes("token_expired")) return true
   if (lower.includes("401") && (lower.includes("authentication") || lower.includes("unauthorized") || lower.includes("invalid"))) return true
   return false
@@ -649,11 +669,12 @@ export function isRateLimitError(errMsg: string): boolean {
  * account that raised them and neither can succeed on a retry there, which is
  * exactly what makes another account worth trying.
  *
- * Deliberately absent: `authentication_error`, which the token refresh already
- * recovers in place, and the account-blind failures (`api_error`,
- * `overloaded_error`, `timeout_error`) — those say nothing about entitlement,
- * and failing over on them would spend the whole pool on one upstream hiccup
- * and leave every account marked exhausted for something none of them did.
+ * Deliberately absent: `authentication_error` in general, and the
+ * account-blind failures (`api_error`, `overloaded_error`, `timeout_error`) —
+ * those say nothing about entitlement, and failing over on them would spend
+ * the whole pool on one upstream hiccup and leave every account marked
+ * exhausted for something none of them did. The one authentication failure
+ * that does qualify is a lost login (see isLoginExpiredRefusal).
  */
 const ACCOUNT_FAILOVER_ERROR_TYPES: ReadonlySet<string> = new Set([
   "rate_limit_error",
@@ -661,11 +682,36 @@ const ACCOUNT_FAILOVER_ERROR_TYPES: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Whether a classified error type means "this account cannot serve the
- * request, another one might". Used by priority routing to decide failover.
+ * Whether a refusal says this account's login is gone. The request has
+ * already tried one token refresh in place before this surfaces, so another
+ * attempt on the same account fails the same way while any other account in
+ * the pool may still answer. Keyed on the exact message, not on the type:
+ * the generic authentication branch also says `authentication_error` for
+ * prose that merely mentions credentials.
  */
-export function isAccountFailoverError(errorType: string | null | undefined): errorType is string {
-  return typeof errorType === "string" && ACCOUNT_FAILOVER_ERROR_TYPES.has(errorType)
+export function isLoginExpiredRefusal(errorType: string | null | undefined, message: unknown): boolean {
+  return errorType === "authentication_error" && message === LOGIN_EXPIRED_MESSAGE
+}
+
+/**
+ * Whether a classified error means "this account cannot serve the request,
+ * another one might". Used by priority routing to decide failover.
+ */
+export function isAccountFailoverError(errorType: string | null | undefined, message?: unknown): errorType is string {
+  return typeof errorType === "string"
+    && (ACCOUNT_FAILOVER_ERROR_TYPES.has(errorType) || isLoginExpiredRefusal(errorType, message))
+}
+
+/** The error a telemetry row records: a lost login gets a name of its own,
+ *  so a route chain tells that hop apart from any other authentication error. */
+export function telemetryErrorType(classified: { type: string; message: string }): string {
+  return isLoginExpiredRefusal(classified.type, classified.message) ? "login_expired" : classified.type
+}
+
+/** The `error.message` of an Anthropic error envelope, if it has one. */
+export function errorEnvelopeMessage(payload: unknown): unknown {
+  const error = payload !== null && typeof payload === "object" && "error" in payload ? payload.error : null
+  return error !== null && typeof error === "object" && "message" in error ? error.message : undefined
 }
 
 /**
