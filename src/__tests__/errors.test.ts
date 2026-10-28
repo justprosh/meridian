@@ -2,7 +2,7 @@
  * Unit tests for classifyError — pure function, no mocks needed.
  */
 import { describe, it, expect } from "bun:test"
-import { canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
+import { canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isLoginExpiredRefusal, isExpiredTokenError, telemetryErrorType, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
 
 describe("classifyError", () => {
   describe("authentication errors", () => {
@@ -1274,3 +1274,36 @@ describe("isQuotaRefusal", () => {
     expect(isAccountFailoverError("billing_error") && !isQuotaRefusal("billing_error")).toBe(true)
   })
 })
+
+describe("lost login", () => {
+  const STAGING = "Claude Code returned an error result: Failed to authenticate: OAuth session expired and could not be refreshed"
+
+  it.each([
+    ["the CLI's refused session refresh", STAGING],
+    ["an expired OAuth token", "OAuth token has expired"],
+    ["a missing login", "Not logged in · Please run /login"],
+  ])("classifies %s as a lost login that fails over", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.status).toBe(401)
+    expect(r.type).toBe("authentication_error")
+    expect(isLoginExpiredRefusal(r.type, r.message)).toBe(true)
+    expect(isAccountFailoverError(r.type, r.message)).toBe(true)
+    expect(telemetryErrorType(r)).toBe("login_expired")
+  })
+
+  it("asks for the in-request refresh first", () => {
+    expect(isExpiredTokenError(STAGING)).toBe(true)
+  })
+
+  it("does not fail over on a generic authentication error", () => {
+    const r = classifyError("bad credentials provided")
+    expect(r.type).toBe("authentication_error")
+    expect(isAccountFailoverError(r.type, r.message)).toBe(false)
+    expect(telemetryErrorType(r)).toBe("authentication_error")
+  })
+
+  it("is not a quota refusal", () => {
+    expect(isQuotaRefusal("authentication_error")).toBe(false)
+  })
+})
+

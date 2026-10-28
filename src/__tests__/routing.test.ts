@@ -17,6 +17,7 @@ import {
   choosePriorityProfile,
   chooseActivePriorityCandidates,
   ProfileExhaustion,
+  LoginLapses,
   RENDEZVOUS_STABLE_GUARD,
   AssignmentStore,
   resolveCooldownUntil,
@@ -485,3 +486,29 @@ describe("chooseActivePriorityCandidates", () => {
     expect(new Set(candidates).size).toBe(candidates.length)
   })
 })
+
+describe("LoginLapses", () => {
+  it("holds while the credential is unchanged and has no clock", () => {
+    let now = 1_800_000_000_000
+    const lapses = new LoginLapses(() => now)
+    lapses.mark("work", "present:1:2")
+    now += 30 * 86_400_000
+    expect(lapses.holds("work", "present:1:2")).toBe(true)
+    expect(lapses.snapshot()).toEqual([{ id: "work", since: 1_800_000_000_000 }])
+  })
+
+  it("drops the mark once the credential changes", () => {
+    const lapses = new LoginLapses()
+    lapses.mark("work", "present:1:2")
+    expect(lapses.holds("work", "present:3:4")).toBe(false)
+    expect(lapses.has("work")).toBe(false)
+  })
+
+  it("forgets on request", () => {
+    const lapses = new LoginLapses()
+    lapses.mark("work", "x")
+    lapses.forget("work")
+    expect(lapses.holds("work", "x")).toBe(false)
+  })
+})
+

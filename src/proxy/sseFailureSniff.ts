@@ -1,4 +1,4 @@
-import { isAccountFailoverError } from "./errors"
+import { errorEnvelopeMessage, isAccountFailoverError } from "./errors"
 import { parseRetryAfterMs } from "./retryAfter"
 
 /**
@@ -331,7 +331,7 @@ export async function relayStreamAttempt(
         payload = { type: "error", error: { type: "api_error", message: `Expected an SSE response; upstream returned status ${inner.status}` } }
       }
       const frame = new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`)
-      if (!inner.ok && isAccountFailoverError(errorType)) {
+      if (!inner.ok && isAccountFailoverError(errorType, errorEnvelopeMessage(payload))) {
         transferred = true
         return { kind: "suppressed", errorPayload: payload, errorType, held: [frame], discard }
       }
@@ -367,7 +367,7 @@ export async function relayStreamAttempt(
         const frame = scanner.next()
         if (!frame) break
         if (frame.kind === "keepalive") continue
-        if (frame.kind === "error" && isAccountFailoverError(frame.errorType)) {
+        if (frame.kind === "error" && isAccountFailoverError(frame.errorType, errorEnvelopeMessage(frame.payload))) {
           transferred = true
           return { kind: "suppressed", errorPayload: frame.payload, errorType: frame.errorType, held, discard }
         }
