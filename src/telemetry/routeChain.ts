@@ -102,7 +102,7 @@ function collapseGroup(hops: RequestMetric[]): RequestMetric {
  * blame an account for an outage — the exact misattribution this tally exists
  * to prevent. Matches the set the pool router itself fails over on.
  */
-const ACCOUNT_REFUSALS: ReadonlySet<string> = new Set(["rate_limit_error", "billing_error"])
+const ACCOUNT_REFUSALS: ReadonlySet<string> = new Set(["rate_limit_error", "billing_error", "login_expired"])
 
 /**
  * Tally where a window's requests went and which accounts refused them.
