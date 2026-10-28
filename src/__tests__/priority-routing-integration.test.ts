@@ -72,6 +72,8 @@ let capturedEnvs: string[] = []
 let capturedSdkCalls: CapturedSdkCall[] = []
 let capturePhase = 0
 let failingDirs = new Set<string>()
+// Accounts whose login is gone: the CLI's refresh of the session was refused.
+let loginLapsedDirs = new Set<string>()
 // Accounts that fail only AFTER streaming some content — the error frame then
 // lands behind message_start, where the sniffer must not touch it.
 let failAfterContentDirs = new Set<string>()
@@ -111,6 +113,8 @@ const UPSTREAM_HICCUP = "Claude Code returned an error result: upstream is overl
 const INCIDENTAL_BILLING_WORD =
   "Claude Code returned an error result: Reached maximum number of turns (3) while editing subscription.ts"
 let failureMessage = DEFAULT_FAILURE
+// Verbatim from a staging account whose refresh token had lapsed.
+const LOGIN_LAPSE = "Claude Code returned an error result: Failed to authenticate: OAuth session expired and could not be refreshed"
 
 installSdkMock(() => ({
   query: (params: any) => {
@@ -221,6 +225,9 @@ installSdkMock(() => ({
             await new Promise(resolve => setTimeout(resolve, 300))
           }
           throw new Error(failureMessage)
+        }
+        if ([...loginLapsedDirs].some((f) => dir.includes(f))) {
+          throw new Error(LOGIN_LAPSE)
         }
         if ([...failingDirs].some((f) => dir.includes(f))) {
           throw new Error(failureMessage)
@@ -507,6 +514,7 @@ let savedPriorityFailbackSetting: PriorityFailbackPolicy | undefined
 // still win for those tests.
 beforeEach(() => {
   failureMessage = DEFAULT_FAILURE
+  loginLapsedDirs = new Set()
   failAfterContentDirs = new Set()
   preludePingDirs = new Set()
   preludePingSucceedDirs = new Set()
@@ -3350,3 +3358,159 @@ describe("re-authenticated profile unbenching (#1385)", () => {
     expect(stillBenched.spent.map((s) => s.profileId)).toEqual(["work"])
   }, 20_000)
 })
+
+describe("priority routing past a lost login", () => {
+  const THREE = [
+    { id: "work", claudeConfigDir: "/tmp/meridian-test-prof-work" },
+    { id: "personal", claudeConfigDir: "/tmp/meridian-test-prof-personal" },
+    { id: "spare", claudeConfigDir: "/tmp/meridian-test-prof-spare" },
+  ]
+  let storeOverride: { mockRestore(): void } | undefined
+
+  function createPoolApp(): TestApp {
+    return createProxyServer({ port: 0, host: "127.0.0.1", profiles: THREE, defaultProfile: "work", silent: true }).app
+  }
+
+  beforeEach(async () => {
+    resetProcessSdkSemaphoreForTests()
+    capturedEnvs = []
+    failingDirs = new Set()
+    await clearSessionCache()
+    resetActiveProfile()
+    rateLimitStore.clear()
+    telemetryStore.clear()
+    for (const key of ["MERIDIAN_ROUTING", "MERIDIAN_PROFILE_ORDER", "MERIDIAN_PRIORITY_FAILBACK", "CLAUDE_CONFIG_DIR"]) {
+      savedEnv[key] = process.env[key]
+    }
+    delete process.env.CLAUDE_CONFIG_DIR
+    delete process.env.MERIDIAN_PRIORITY_FAILBACK
+    process.env.MERIDIAN_ROUTING = "priority"
+    process.env.MERIDIAN_PROFILE_ORDER = "work,personal,spare"
+  })
+
+  afterEach(async () => {
+    storeOverride?.mockRestore()
+    storeOverride = undefined
+    const { resetAuthRenewalCache } = await import("../proxy/tokenRefresh")
+    resetAuthRenewalCache()
+    rateLimitStore.clear()
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+
+  function recordSpentWindow(profileId: string, resetsAt: number): void {
+    rateLimitStore.record(profileId, { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+  }
+
+  it("moves past a lost login in the middle of the queue within the same request", async () => {
+    failingDirs.add("prof-work")
+    loginLapsedDirs.add("prof-personal")
+    const res = await post(createPoolApp(), {}, "lost login mid-queue")
+    expect(res.status).toBe(200)
+    const body = await res.json() as { content: Array<{ text: string }> }
+    expect(body.content[0]?.text).toContain("prof-spare")
+  }, 30_000)
+
+  it("streams past a lost login too", async () => {
+    loginLapsedDirs.add("prof-work")
+    const res = await postStream(createPoolApp(), { content: "lost login stream" })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain("prof-personal")
+    expect(text).not.toContain("authentication_error")
+  }, 30_000)
+
+  it("answers 429 with the pool's earliest reset when quota and a lost login exhaust it", async () => {
+    const soon = Date.now() + 30 * 60_000
+    recordSpentWindow("work", Date.now() + 4 * 60 * 60_000)
+    recordSpentWindow("spare", soon)
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-spare")
+    loginLapsedDirs.add("prof-personal")
+    const res = await post(createPoolApp(), {}, "quota and lost login")
+    expect(res.status).toBe(429)
+    const body = await res.json() as { error: { type: string } }
+    expect(body.error.type).toBe("rate_limit_error")
+    const retryAfter = Number(res.headers.get("retry-after"))
+    expect(retryAfter).toBeGreaterThan(25 * 60)
+    expect(retryAfter).toBeLessThanOrEqual(30 * 60)
+  }, 30_000)
+
+  it("answers 429, not the login error, when the lost login is the last one asked", async () => {
+    recordSpentWindow("work", Date.now() + 60 * 60_000)
+    recordSpentWindow("personal", Date.now() + 20 * 60_000)
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-personal")
+    loginLapsedDirs.add("prof-spare")
+    const res = await post(createPoolApp(), {}, "lost login last")
+    expect(res.status).toBe(429)
+    expect((await res.json() as { error: { type: string } }).error.type).toBe("rate_limit_error")
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(20 * 60)
+  }, 30_000)
+
+  it("keeps billing semantics when no account refused on quota", async () => {
+    failureMessage = SUBSCRIPTION_REFUSAL
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-personal")
+    loginLapsedDirs.add("prof-spare")
+    const res = await post(createPoolApp(), {}, "billing and lost login")
+    expect(res.status).toBe(401)
+    expect((await res.json() as { error: { type: string } }).error.type).toBe("authentication_error")
+  }, 30_000)
+
+  it("leaves a lost login out of later requests and names its hop in the route chain", async () => {
+    loginLapsedDirs.add("prof-work")
+    const app = createPoolApp()
+    expect((await post(app, {}, "first after lost login")).status).toBe(200)
+    const rows = await (await app.fetch(new Request("http://localhost/telemetry/requests"))).json() as TelemetryRow[]
+    expect(rows[0]!.routeChain).toEqual([
+      { profileId: "work", ok: false, status: 401, error: "login_expired" },
+      { profileId: "personal", ok: true, status: 200, error: null },
+    ])
+    const health = await (await app.fetch(new Request("http://localhost/profiles/health"))).json() as {
+      exhausted: unknown[]; loginLapsed: Array<{ id: string }>
+    }
+    expect(health.exhausted).toEqual([])
+    expect(health.loginLapsed.map(entry => entry.id)).toEqual(["work"])
+
+    capturedEnvs = []
+    expect((await post(app, {}, "second after lost login")).status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+  }, 30_000)
+
+  it("does not fail over on a generic authentication error", async () => {
+    failureMessage = "authentication failed"
+    failingDirs.add("prof-work")
+    const res = await post(createPoolApp(), {}, "generic auth error")
+    expect(res.status).toBe(401)
+    expect(capturedEnvs.every(dir => dir.includes("prof-work"))).toBe(true)
+  }, 30_000)
+
+  it("skips a profile whose stored refresh deadline has passed without trying it", async () => {
+    const tokens = await import("../proxy/tokenRefresh")
+    tokens.resetAuthRenewalCache()
+    storeOverride = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options => {
+      const dir = options?.claudeConfigDir ?? "default"
+      return {
+        refreshKey: `deadline-test:${dir}`,
+        read: async () => ({
+          claudeAiOauth: {
+            accessToken: "fake-access",
+            refreshToken: "fake-refresh",
+            expiresAt: Date.now() + 3_600_000,
+            refreshTokenExpiresAt: dir.includes("prof-work") ? Date.now() - 60_000 : Date.now() + 86_400_000,
+          },
+        }),
+        write: async () => false,
+      }
+    })
+    const res = await post(createPoolApp(), {}, "refresh deadline passed")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+  }, 30_000)
+})
+

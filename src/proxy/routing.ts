@@ -298,6 +298,46 @@ export class ProfileExhaustion {
 }
 
 /**
+ * Profiles whose login was refused after the in-request token refresh, each
+ * remembered with a fingerprint of the stored credential at the time. Unlike
+ * an exhaustion mark this has no clock: a lost login does not come back on
+ * its own, so the mark stands until the credential itself changes (a new
+ * login or a successful refresh rewrites it) or the login route forgets it.
+ */
+export class LoginLapses {
+  private readonly marks = new Map<string, { fingerprint: string; at: number }>()
+  constructor(private readonly now: () => number = Date.now) {}
+
+  mark(id: string, fingerprint: string): void {
+    this.marks.set(id, { fingerprint, at: this.now() })
+  }
+
+  /** Whether the mark still holds for the credential as it reads now. A
+   *  different credential drops the mark: it may be a working login. */
+  holds(id: string, fingerprint: string): boolean {
+    const entry = this.marks.get(id)
+    if (!entry) return false
+    if (entry.fingerprint !== fingerprint) {
+      this.marks.delete(id)
+      return false
+    }
+    return true
+  }
+
+  has(id: string): boolean {
+    return this.marks.has(id)
+  }
+
+  forget(id: string): void {
+    this.marks.delete(id)
+  }
+
+  snapshot(): Array<{ id: string; since: number }> {
+    return [...this.marks].map(([id, entry]) => ({ id, since: entry.at }))
+  }
+}
+
+/**
  * Session-to-profile assignments with LRU eviction.
  *
  * A JS Map preserves insertion order and a bare `set()` on an EXISTING key

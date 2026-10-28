@@ -856,6 +856,14 @@ function startAuthStatusRefresh(
   return state
 }
 
+/** A profile's latest `claude auth status` answer and when it was taken,
+ *  without starting a check. `status` is null when there is no fresh answer
+ *  (never checked, or the last check failed). */
+export function peekClaudeAuthStatus(profileId: string): { status: ClaudeAuthStatus | null; at: number } {
+  const cache = profileAuthCaches.get(profileId)
+  return { status: cache?.status ?? null, at: cache?.at ?? 0 }
+}
+
 /** The auth-status refresh currently in flight, if any - for testing only. */
 export function pendingAuthStatusRefresh(profileId?: string): Promise<ClaudeAuthStatus | null> | null {
   if (!profileId) return cachedAuthStatusPromise

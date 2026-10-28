@@ -113,7 +113,7 @@ import { LRUMap } from "../utils/lruMap"
 import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics, resolveTelemetryConfig, telemetryEnvSources, diagnosticLogCapacity } from "../telemetry"
 import { detectSupervision } from "./supervision"
 import type { RequestMetric } from "../telemetry"
-import { canRecoverCapturedToolUses, uncapturedRecoveryVeto, streamedToolBlockVeto, cliRejectedToolResults, type StreamedToolBlockRecord, type UncapturedDeliveryVeto, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
+import { canRecoverCapturedToolUses, uncapturedRecoveryVeto, streamedToolBlockVeto, cliRejectedToolResults, type StreamedToolBlockRecord, type UncapturedDeliveryVeto, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isLoginExpiredRefusal, errorEnvelopeMessage, telemetryErrorType, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
 import { createSseRelayStream, relayStreamAttempt } from "./sseFailureSniff"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, readStoredCredentialSnapshot, getAuthRenewalStatus, getStoredPlanFields, renewalStatusFor, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
 import { planAllowance } from "./planAllowance"
@@ -136,7 +136,7 @@ import { buildRuntime } from "./buildRuntime"
 import { checkPluginsNow, getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { getPluginUpdates, trackPlugins } from "./pluginUpdateCheck"
 import { createAuthStatusOwner } from "./authStatusOwnership"
-import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
+import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, peekClaudeAuthStatus, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
@@ -182,6 +182,7 @@ import {
   ACTIVE_PRIORITY,
   ROUTING_MODES,
   ProfileExhaustion,
+  LoginLapses,
   AssignmentStore,
   resolveCooldownUntil,
   cooldownCapMs,
@@ -487,6 +488,13 @@ function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | 
   return createPlatformCredentialStore(
     profile.env.CLAUDE_CONFIG_DIR ? { claudeConfigDir: profile.env.CLAUDE_CONFIG_DIR } : undefined
   )
+}
+
+/** Identifies the credential a login verdict was reached on: a new login or
+ *  a successful refresh rewrites at least one of these fields. */
+async function credentialFingerprint(store: CredentialStore): Promise<string> {
+  const snapshot = await readStoredCredentialSnapshot(store)
+  return `${snapshot.presence}:${snapshot.accessTokenExpiresAt ?? ""}:${snapshot.refreshTokenExpiresAt ?? ""}`
 }
 
 async function ensureFreshTokenForProfiles(config: ProxyConfig): Promise<void> {
@@ -1513,6 +1521,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // deadlock the pool whenever MERIDIAN_MAX_CONCURRENT is 1. State is per
   // proxy instance.
   const priorityExhaustion = new ProfileExhaustion()
+  // Lost logins, kept apart from exhaustion: they have no reset to wait for.
+  const loginLapses = new LoginLapses()
   const PRIORITY_ASSIGNMENTS_MAX = 5000
   const priorityAssignments = new AssignmentStore(PRIORITY_ASSIGNMENTS_MAX)
   // The per-window reset cap lives in routing.ts (cooldownCapMs): a single
@@ -1714,9 +1724,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     if (isEventStream(res) || res.ok) {
       return { failed: false, errorPayload: null, errorType: null, response: res }
     }
-    const body = await res.clone().json().catch(() => null) as { error?: { type?: string } } | null
+    const body = await res.clone().json().catch(() => null) as { error?: { type?: string; message?: unknown } } | null
     const errorType = body?.error?.type
-    if (isAccountFailoverError(errorType)) {
+    if (isAccountFailoverError(errorType, body?.error?.message)) {
       return { failed: true, errorPayload: body, errorType, response: res }
     }
     return { failed: false, errorPayload: null, errorType: null, response: res }
@@ -1756,7 +1766,47 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return { inner, exposure }
   }
 
-  function markPriorityFailure(candidate: string, reason: string): number {
+  async function markLoginLapse(candidate: string): Promise<void> {
+    const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, candidate)
+    const store = resolved.id === candidate ? credentialStoreForProfile(resolved) : undefined
+    loginLapses.mark(candidate, store ? await credentialFingerprint(store) : "none")
+    claudeLog("priority.login_lapsed", { profile: candidate })
+  }
+
+  /** Pool candidates whose login is gone, read without starting a check: a
+   *  login refusal still stands for the credential as it reads now, the
+   *  latest `claude auth status` said loggedIn=false, or the stored refresh
+   *  deadline (the end of the login the CLI itself counts down to) has passed. */
+  async function priorityLostLogins(ids: readonly string[]): Promise<Set<string>> {
+    const lost = new Set<string>()
+    const now = Date.now()
+    await Promise.all(ids.map(async id => {
+      const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, id)
+      if (resolved.id !== id || resolved.type !== "claude-max") return
+      if (peekClaudeAuthStatus(id).status?.loggedIn === false) {
+        lost.add(id)
+        return
+      }
+      const store = credentialStoreForProfile(resolved)
+      if (!store) return
+      if (loginLapses.has(id) && loginLapses.holds(id, await credentialFingerprint(store))) {
+        lost.add(id)
+        return
+      }
+      const { refreshTokenExpiresAt } = await getAuthRenewalStatus(store)
+        .catch((): { refreshTokenExpiresAt?: number } => ({}))
+      if (refreshTokenExpiresAt !== undefined && refreshTokenExpiresAt <= now) lost.add(id)
+    }))
+    return lost
+  }
+
+  /** Mark a refused candidate. Returns when it may be tried again, or null for
+   *  a lost login, which has no such time (see LoginLapses). */
+  async function markPriorityFailure(candidate: string, reason: string, message?: unknown): Promise<number | null> {
+    if (isLoginExpiredRefusal(reason, message)) {
+      await markLoginLapse(candidate)
+      return null
+    }
     const quotaRefusal = isQuotaRefusal(reason)
     const until = quotaRefusal
       ? priorityCooldownUntil(candidate, Date.now())
@@ -1795,6 +1845,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       previous: string | null
       previousReason: string
       earliestPoolReset: number | null
+      quotaError: unknown
     },
   ): Promise<Response> {
     const encoder = new TextEncoder()
@@ -1824,7 +1875,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
         let lastInner: Response | null = null
         try {
-          let { lastError, previous, previousReason, earliestPoolReset } = start
+          let { lastError, previous, previousReason, earliestPoolReset, quotaError } = start
           for (let attempt = start.attempt; attempt < options.candidateIds.length; attempt++) {
             const candidate = options.candidateIds[attempt]!
             const handed = attempt === start.attempt
@@ -1843,9 +1894,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               await verdict.discard()
               await responseCompletions.get(inner)?.catch(() => {})
               const reason = verdict.errorType
-              const cooldownUntil = markPriorityFailure(candidate, reason)
+              const cooldownUntil = await markPriorityFailure(candidate, reason, errorEnvelopeMessage(verdict.errorPayload))
               if (isCancelled()) break
-              earliestPoolReset = Math.min(earliestPoolReset ?? cooldownUntil, cooldownUntil)
+              if (cooldownUntil !== null) earliestPoolReset = Math.min(earliestPoolReset ?? cooldownUntil, cooldownUntil)
+              if (isQuotaRefusal(reason)) quotaError = verdict.errorPayload
               lastError = verdict.errorPayload
               previous = candidate
               previousReason = reason
@@ -1920,6 +1972,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           if (!isCancelled() && !await settle("release")) {
             await enqueue(unavailableFrame())
             return
+          }
+          if (quotaError !== null) {
+            // A spent account outranks the rest: waiting for it is a way to
+            // be served, which a lost login or another refusal is not.
+            lastError = quotaError
+            previousReason = "rate_limit_error"
           }
           if (!isCancelled() && lastError !== null) {
             if (isQuotaRefusal(previousReason) && typeof lastError === "object") {
@@ -2034,6 +2092,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // frees up, not the last one tried. Tracked across the loop so the caller's
     // Retry-After names the pool's earliest opening (#901).
     let earliestPoolReset: number | null = null
+    // The latest quota refusal, which answers the client once the pool is out
+    // even when a different refusal came last.
+    let quotaError: unknown = null
     for (const [attempt, candidate] of options.candidateIds.entries()) {
       const { inner, exposure } = await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken)
       // A non-SSE answer is decided here and keeps its HTTP status. Once an
@@ -2041,7 +2102,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // tried inside the stream.
       if (options.wantsStream && isEventStream(inner)) {
         return streamPriorityDispatch(options, attemptOwnerToken, settleAttempt, {
-          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset,
+          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset, quotaError,
         })
       }
       const sniffed = await sniffAccountFailure(inner)
@@ -2080,10 +2141,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const reason = sniffed.errorType
       // Only a quota refusal has a reset to look up. Both cooldown tiers read
       // the account's five-hour window, which says nothing about entitlement.
-      const cooldownUntil = markPriorityFailure(candidate, reason)
-      if (earliestPoolReset === null || cooldownUntil < earliestPoolReset) {
+      const cooldownUntil = await markPriorityFailure(candidate, reason, errorEnvelopeMessage(sniffed.errorPayload))
+      if (cooldownUntil !== null && (earliestPoolReset === null || cooldownUntil < earliestPoolReset)) {
         earliestPoolReset = cooldownUntil
       }
+      if (isQuotaRefusal(reason)) quotaError = sniffed.errorPayload
       lastError = sniffed.errorPayload
       lastStatus = inner.status
       previous = candidate
@@ -2114,7 +2176,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // before the client can retry; failure stays fail-closed and never advances
     // to another account or returns a retryable account-shaped response.
     if (!await settleAttempt("release")) return unavailableAttemptResponse()
-    // Surface the LAST tried profile's error (owner decision).
+    // Surface the LAST tried profile's error (owner decision), unless an
+    // account refused on quota: waiting for it is a way to be served, which a
+    // lost login or another refusal is not, so that is the honest answer.
+    if (quotaError !== null) {
+      lastError = quotaError
+      lastStatus = 429
+    }
     // The wait belongs to the POOL, not to the last account tried: the caller
     // can proceed as soon as ANY candidate frees up. `earliestPoolReset` is a
     // real observed boundary when a quota refusal supplied one and the
@@ -2669,13 +2737,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 assignment = priorityAssignments.get(sessionKey)
               }
 
+              // Candidates whose login is gone are left out like exhausted ones.
+              const lostLogins = await priorityLostLogins(order)
+              const unusable = (id: string) => priorityExhaustion.isExhausted(id) || lostLogins.has(id)
               const shouldPromote = assignment !== undefined
                 && durableRoute !== undefined
                 && routeMappingIsCurrent
                 && assignment.profileId !== preferred
                 && order.includes(assignment.profileId)
-                && !priorityExhaustion.isExhausted(assignment.profileId)
-                && !priorityExhaustion.isExhausted(preferred)
+                && !unusable(assignment.profileId)
+                && !unusable(preferred)
                 && shouldPromotePriorityAssignment({
                   policy: failbackPolicy,
                   assignment,
@@ -2685,7 +2756,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const assignedProfile = assignment?.profileId
               const assignmentIsHealthy = assignedProfile !== undefined
                 && order.includes(assignedProfile)
-                && !priorityExhaustion.isExhausted(assignedProfile)
+                && !unusable(assignedProfile)
               const retainOnlyProfile = durableRoute && !promotionTurn
                 ? assignedProfile
                 : undefined
@@ -2703,11 +2774,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   : chooseActivePriorityCandidates(
                       activeId,
                       order,
-                      id => priorityExhaustion.isExhausted(id),
+                      unusable,
                       assignedProfile,
                     )
               } else {
-                const pick = choosePriorityProfile(order, id => priorityExhaustion.isExhausted(id))
+                const pick = choosePriorityProfile(order, unusable)
                 const first = retainOnlyProfile
                   ?? (shouldPromote
                     ? preferred
@@ -2719,7 +2790,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 // that the durable route has no authenticated authority to adopt.
                 candidates = retainOnlyProfile
                   ? [retainOnlyProfile]
-                  : [first, ...order.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
+                  : [first, ...order.filter(id => id !== first && !unusable(id))]
               }
               return dispatchPriority({
                 context: c,
@@ -6108,7 +6179,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 proxyOverheadMs: Math.max(0, totalMs - queueWaitMs - requestMeta.sdkActiveDurationMs),
                 ttfbMs: requestMeta.ttfbMs ?? null, upstreamDurationMs: requestMeta.sdkActiveDurationMs,
                 totalDurationMs: totalMs, contentBlocks: contentBlocksForwarded,
-                textEvents: textEventsForwarded, error: classified.type,
+                textEvents: textEventsForwarded, error: telemetryErrorType(classified),
               }))
               if (messageStartEmitted) {
                 flushOpenClientBlocks("handler_error", observeStreamFailure)
@@ -8472,7 +8543,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 totalDurationMs: streamErrTotalMs,
                 contentBlocks: contentBlocksForwarded,
                 textEvents: textEventsForwarded,
-                error: streamErr.type,
+                error: telemetryErrorType(streamErr),
               })
 
               // If we already emitted message_start, close the message cleanly so
@@ -8683,7 +8754,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           totalDurationMs: errorTotalMs,
           contentBlocks: 0,
           textEvents: 0,
-          error: classified.type,
+          error: telemetryErrorType(classified),
         })
 
         return new Response(
@@ -10258,6 +10329,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // empty stored OAuth grant cannot invalidate those credentials.
       const stored = profileStore ? await readStoredCredentialSnapshot(profileStore) : undefined
       const presence = stored?.presence ?? "unknown"
+      // A login refused after its refresh stays "needs sign-in" until the
+      // stored credential changes, whatever `claude auth status` says.
+      const loginLapsed = profileStore !== undefined && loginLapses.has(p.id)
+        && loginLapses.holds(p.id, await credentialFingerprint(profileStore))
       // Only claude-max profiles have an OAuth account to ask about, and only
       // their credentials are a directory this can name — an API-key profile
       // would otherwise be looked up against the host's own ~/.claude and
@@ -10288,7 +10363,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         planLabel: allowance.label,
         accountType: allowance.accountType,
         planName: allowance.planName,
-        loggedIn: presence === "absent" ? false : (auth?.loggedIn ?? false),
+        loggedIn: presence === "absent" || loginLapsed ? false : (auth?.loggedIn ?? false),
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,
         // Additive: which reading the three fields above came from. A failed
@@ -10404,6 +10479,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       activeProfile: getActiveProfileId() || finalConfig.defaultProfile || undefined,
       spent: spentProfiles.snapshot(),
       exhausted: priorityExhaustion.snapshot(),
+      loginLapsed: loginLapses.snapshot(),
       asOf: Date.now(),
     })
   })
@@ -10858,6 +10934,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // or restarting Meridian (#1385).
   function clearStaleProfileHealth(profileId: string): void {
     priorityExhaustion.forget(profileId)
+    loginLapses.forget(profileId)
     spentProfiles.forget(profileId)
     rateLimitStore.clear(profileId)
     clearOAuthUsageForProfile(profileId)
