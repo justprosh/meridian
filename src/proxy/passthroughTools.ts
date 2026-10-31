@@ -265,15 +265,8 @@ export function autoDeferDecision(
 }
 
 /**
- * Resolve the auto-defer decision for a tool set, client-managed deferral
- * included.
- *
- * A client that marks any tool `defer_loading: true` manages deferral itself:
- * it already decided which tools are loaded, so auto-deferring the rest on top
- * would hide tools the client sent deliberately. Otherwise the session-pinned
- * decision (#861) wins, and a session without one decides from the live tool
- * count. Both `createPassthroughMcpServer` and the live flip log in server.ts
- * consult this one resolver, so they can never disagree.
+ * Resolve the auto-defer decision: a client that defers any tool manages
+ * deferral itself; otherwise the session pin (#861) wins over the live count.
  */
 export function resolveAutoDeferDecision(
   tools: ReadonlyArray<{ name: string; defer_loading?: boolean }>,
@@ -282,6 +275,62 @@ export function resolveAutoDeferDecision(
 ): boolean {
   if (tools.some(tool => tool.defer_loading === true)) return false
   return pinnedAutoDefer ?? autoDeferDecision(getAutoDeferThreshold(), coreToolNames, tools.length)
+}
+
+/** Protocol convention (Claude Code): the client brings its own tool search
+ *  when it defers tools and also sends a loaded tool named exactly `ToolSearch`. */
+export function clientOwnsToolSearch(
+  tools: ReadonlyArray<{ name: string; defer_loading?: boolean }>,
+): boolean {
+  return tools.some(tool => tool.defer_loading === true)
+    && tools.some(tool => tool.defer_loading !== true && tool.name === "ToolSearch")
+}
+
+/** The tools a client-side tool search has named through `tool_reference`
+ *  blocks in user tool results. Malformed input contributes nothing. */
+export function referencedToolNames(messages: unknown): Set<string> {
+  const names = new Set<string>()
+  if (!Array.isArray(messages)) return names
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue
+    const { role, content } = message as { role?: unknown; content?: unknown }
+    if (role !== "user" || !Array.isArray(content)) continue
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue
+      const { type, content: inner } = block as { type?: unknown; content?: unknown }
+      if (type !== "tool_result" || !Array.isArray(inner)) continue
+      for (const part of inner) {
+        if (!part || typeof part !== "object") continue
+        const { type: partType, tool_name } = part as { type?: unknown; tool_name?: unknown }
+        if (partType === "tool_reference" && typeof tool_name === "string") names.add(tool_name)
+      }
+    }
+  }
+  return names
+}
+
+/**
+ * The registration view of a client-owned-tool-search request: a deferred tool
+ * the conversation never referenced is invisible to the model, so it is not
+ * registered, and a referenced one is registered eagerly. Under the API's
+ * semantics a deferred tool becomes callable exactly when a tool_reference
+ * names it, so this is the whole set the client can act on.
+ */
+export function clientSearchRegistrationTools(
+  tools: ReadonlyArray<{ name: string; defer_loading?: boolean }>,
+  referenced: ReadonlySet<string>,
+): Array<{ name: string; defer_loading?: boolean }> {
+  const registered: Array<{ name: string; defer_loading?: boolean }> = []
+  for (const tool of tools) {
+    if (tool.defer_loading !== true) {
+      registered.push(tool)
+      continue
+    }
+    if (!referenced.has(tool.name)) continue
+    const { defer_loading: _omitted, ...eager } = tool
+    registered.push(eager)
+  }
+  return registered
 }
 
 /**

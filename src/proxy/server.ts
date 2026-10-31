@@ -99,7 +99,7 @@ import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
 import { parseToolInputObject } from "./toolInputJson"
-import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, resolveAutoDeferDecision } from "./passthroughTools"
+import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, resolveAutoDeferDecision, clientOwnsToolSearch, referencedToolNames, clientSearchRegistrationTools } from "./passthroughTools"
 import { describeLocalBootIdentity } from "./session/processIncarnation"
 import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
 import { getOpenCodeSourceFeatureOverrides } from "./adapters/opencodeSourceFeatures"
@@ -566,7 +566,11 @@ function flattenUserContentParts(
       if (typeof inner === "string") flat = inner
       else if (Array.isArray(inner)) {
         flat = inner
-          .map((ib: any) => (ib?.type === "text" && ib.text ? ib.text : ""))
+          .map((ib: any) => {
+            if (ib?.type === "text" && ib.text) return ib.text
+            if (ib?.type === "tool_reference" && typeof ib.tool_name === "string") return `[Tool reference: ${ib.tool_name}]`
+            return ""
+          })
           .filter(Boolean)
           .join("\n")
       }
@@ -4057,9 +4061,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // NOTE: agent-specific MCP namespace comes from the selected adapter.
       const passthroughMcpName = adapter.getPassthroughMcpName?.() ?? PASSTHROUGH_MCP_NAME
       const clientToolPrefix = passthroughMcpPrefix(passthroughMcpName)
+      // A client that brings its own tool search registers only the tools its
+      // conversation has referenced; the rest of its set stays unregistered.
+      const clientToolSearch = passthrough && clientOwnsToolSearch(requestTools)
+      const registrationTools = clientToolSearch
+        ? clientSearchRegistrationTools(requestTools, referencedToolNames(body.messages))
+        : requestTools
       const renderReplayToolName = passthrough
         ? createPassthroughReplayToolNameRenderer(
-          requestTools.flatMap((tool: { name?: unknown }) => typeof tool?.name === "string" ? [tool.name] : []),
+          registrationTools.flatMap((tool: { name?: unknown }) => typeof tool?.name === "string" ? [tool.name] : []),
           passthroughMcpName,
         )
         : undefined
@@ -4100,7 +4110,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     stripCacheControlDeep(m.content),
                     Boolean(passthroughToolCallAssistantUuid),
                     undefined,
-                    renderReplayToolName,
+                    clientToolSearch ? undefined : renderReplayToolName,
                   ) },
                   parent_tool_use_id: null,
                 })
@@ -4117,7 +4127,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     stripCacheControlDeep(m.content),
                     Boolean(passthroughToolCallAssistantUuid),
                     undefined,
-                    renderReplayToolName,
+                    clientToolSearch ? undefined : renderReplayToolName,
                   ) },
                   parent_tool_use_id: null,
                 })
@@ -4360,32 +4370,35 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // Tool cache: if the client omits tools on a continuation request but
       // previously sent them, reuse the cached set to preserve prompt cache.
       let passthroughMcp: ReturnType<typeof createPassthroughMcpServer> | undefined
-      if (passthrough && requestTools.length > 0) {
-        const toolSetKey = computeToolSetKey(requestTools)
+      if (passthrough && registrationTools.length > 0) {
+        const toolSetKey = computeToolSetKey(registrationTools)
         // An auxiliary request runs beside the working turn and may carry a
         // different tool set, so it neither reads nor replaces the session's
         // cached tool definitions and never sets its defer pin; both stay
         // with the working turns.
         const mcpCacheKey = independentCause === "auxiliary-request" ? undefined : profileSessionId
         const cachedMcp = mcpCacheKey ? sessionMcpCache.get(mcpCacheKey) : undefined
-        const coreNamesForDefer = pipelineCtx.coreToolNames ? [...pipelineCtx.coreToolNames] : undefined
+        const coreNamesForDefer = clientToolSearch
+          ? undefined
+          : pipelineCtx.coreToolNames ? [...pipelineCtx.coreToolNames] : undefined
         // Consulted even when the MCP server is rebuilt: a changed tool set
         // already costs one cache miss, and re-deciding on top of it would ALSO
         // flip maxTurns mid-session. The suppressed flip is logged whenever the
         // live count would decide differently, which is the observability the
-        // issue asked for regardless of which fix landed. The live decision is
-        // resolved by the same rule as the build, so a client-deferring request
-        // never reads as a suppressed flip.
-        const pinnedDefer = profileSessionId ? sessionDeferPin.get(profileSessionId) : undefined
-        const liveDefer = resolveAutoDeferDecision(requestTools, coreNamesForDefer, undefined)
-        if (pinnedDefer !== undefined && pinnedDefer !== liveDefer) {
-          plog(`[PROXY] ${requestMeta.requestId} defer_flip suppressed: session pinned autoDefer=${pinnedDefer}, live tool count ${requestTools.length} would give ${liveDefer}`)
-          claudeLog("passthrough.defer_flip_suppressed", { pinned: pinnedDefer, live: liveDefer, toolCount: requestTools.length })
+        // issue asked for regardless of which fix landed.
+        const pinnedDefer = clientToolSearch
+          ? undefined
+          : profileSessionId ? sessionDeferPin.get(profileSessionId) : undefined
+        const liveDefer = resolveAutoDeferDecision(registrationTools, coreNamesForDefer, undefined)
+        const buildDefer = resolveAutoDeferDecision(registrationTools, coreNamesForDefer, pinnedDefer)
+        if (buildDefer !== liveDefer) {
+          plog(`[PROXY] ${requestMeta.requestId} defer_flip suppressed: session pinned autoDefer=${pinnedDefer}, live tool count ${registrationTools.length} would give ${liveDefer}`)
+          claudeLog("passthrough.defer_flip_suppressed", { pinned: pinnedDefer, live: liveDefer, toolCount: registrationTools.length })
         }
         if (cachedMcp && cachedMcp.key === toolSetKey) {
           passthroughMcp = cachedMcp.mcp
         } else {
-          passthroughMcp = sharedPassthroughMcpServer(requestTools, coreNamesForDefer, passthroughMcpName, pinnedDefer)
+          passthroughMcp = sharedPassthroughMcpServer(registrationTools, coreNamesForDefer, passthroughMcpName, pinnedDefer)
           if (mcpCacheKey) {
             sessionMcpCache.set(mcpCacheKey, { key: toolSetKey, mcp: passthroughMcp })
             if (cachedMcp) {
@@ -4393,10 +4406,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             }
           }
         }
-        // First request in the session decides; later ones inherit. The pin
-        // holds the AUTO-defer answer, not hasDeferredTools: a client that
-        // defers its own tools runs below the threshold without pinning a
-        // deferral that never happened.
+        // Pin the auto-defer answer, not explicit client deferral.
         if (mcpCacheKey && !sessionDeferPin.has(mcpCacheKey)) {
           sessionDeferPin.set(mcpCacheKey, passthroughMcp.autoDefer)
         }
@@ -4435,9 +4445,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           cacheKeepalive.forget(cacheKeepaliveKey)
         }
       }
-      // Deferred definitions are exactly the ones registered without
-      // alwaysLoad; a client-deferring request that auto-defers nothing
-      // therefore counts only what the client itself marked.
+      // Deferred definitions are exactly those registered without alwaysLoad.
       const coreNames = pipelineCtx.coreToolNames ? [...pipelineCtx.coreToolNames] : undefined
       const deferredToolCount = passthroughMcp?.deferredToolNames.length ?? 0
       if (hasDeferredTools) {
@@ -4455,8 +4463,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
       // Track tools discovered via ToolSearch (deferred tools that get called)
       const discoveredTools = new Set<string>()
-      // The registered SDK names that really are deferred, matching the raw
-      // PreToolUse `tool_name`; a discovered tool is recorded only from here.
+      // Registered SDK names, which is what the raw PreToolUse tool_name holds.
       const deferredSdkToolNames = new Set(passthroughMcp?.deferredToolNames ?? [])
       // Client tool calls captured for the client, not the dropped repeats. A
       // lifted turn budget ends the query after the batch holding one
@@ -4505,9 +4512,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   return {}
                 }
                 markPriorityAttemptExposure("tool_use")
-                // Track deferred tools that were discovered via ToolSearch.
-                // The raw tool_name is the registered SDK name, which is what
-                // deferredToolNames holds.
+                // Track deferred tools that were discovered via ToolSearch
                 const toolName = resolveClientToolName(input.tool_name, passthroughMcp?.clientNameByAlias, passthroughMcpName)
                 if (deferredSdkToolNames.has(input.tool_name)) {
                   discoveredTools.add(toolName)
