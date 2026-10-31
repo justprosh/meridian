@@ -27,6 +27,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
 // ─── SDK mock ────────────────────────────────────────────────────────────────
 let mockMessages: SDKMessage[] = []
 let capturedQueryParams: any = {}
+let capturedMcpRegistrations: Array<{ name: string; tools: Array<Record<string, unknown>> }> = []
 
 installSdkMock(() => ({
   query: (opts: any) => {
@@ -37,11 +38,14 @@ installSdkMock(() => ({
       }
     })()
   },
-  createSdkMcpServer: () => ({
-    type: "sdk",
-    name: "test",
-    instance: { tool: () => {}, registerTool: () => ({}) },
-  }),
+  createSdkMcpServer: (opts: { name: string; tools: Array<Record<string, unknown>> }) => {
+    capturedMcpRegistrations.push(opts)
+    return {
+      type: "sdk",
+      name: opts.name,
+      instance: { tool: () => {}, registerTool: () => ({}) },
+    }
+  },
 }), "deferred-tool-loading.test.ts")
 
 installLoggerMock(() => ({
@@ -89,6 +93,7 @@ beforeEach(async () => {
   await clearSessionCache()
   mockMessages = []
   capturedQueryParams = {}
+  capturedMcpRegistrations = []
   savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
   savedThreshold = process.env.MERIDIAN_DEFER_TOOL_THRESHOLD
   process.env.MERIDIAN_PASSTHROUGH = "1"
@@ -328,5 +333,53 @@ describe("deferred tool loading — ToolSearch exempted from PreToolUse block", 
     // The actual tool should be captured and forwarded
     expect(toolNames).toContain("custom_lint")
     expect(body.stop_reason).toBe("tool_use")
+  })
+})
+
+describe("defer pin — a client that defers its own tools (#861)", () => {
+  // Claude Code with tool search on sends its loaded tools plus a
+  // defer_loading placeholder. That request defers nothing itself, so the
+  // session pin must hold the auto-defer answer false — not hasDeferredTools —
+  // and a later tool set that crosses the threshold must stay eager.
+  it("does not pin auto-defer=true from a client-deferring request", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+    // One server for both turns: the defer pin lives per server instance.
+    const server = app()
+    const metadata = { user_id: JSON.stringify({ session_id: "defer-pin-client-defer" }) }
+    const post = (tools: Array<Record<string, unknown>>) => server.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "user-agent": "claude-cli/2.1.290 (external, cli)" },
+      body: JSON.stringify(makeRequest({
+        stream: false,
+        tools,
+        messages: [{ role: "user", content: "hi" }],
+        metadata,
+      })),
+    }))
+
+    await post([
+      ...makeTools(12),
+      {
+        name: "DeferredToolPlaceholder",
+        description: "t",
+        input_schema: { type: "object", properties: {} },
+        defer_loading: true,
+      },
+    ])
+    await post(makeTools(20))
+
+    // Still eager: no tool search, no ToolSearch in the built-in catalog, and
+    // (with deferral off) no alwaysLoad markers — nothing was deferred.
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
+    expect(capturedQueryParams.options.tools).toEqual([])
+    const registration = capturedMcpRegistrations.at(-1)
+    expect(registration?.name).toBe("oc")
+    const definitions = registration?.tools ?? []
+    expect(definitions).toHaveLength(20)
+    const alwaysLoadCount = definitions.filter(definition =>
+      (definition._meta as Record<string, unknown> | undefined)?.["anthropic/alwaysLoad"] === true
+    ).length
+    expect(alwaysLoadCount).toBe(0)
   })
 })

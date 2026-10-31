@@ -88,6 +88,18 @@ Contract*, *Cancellation Contract*; public routes and headers are in
   (not whole-server memory): built sets from about 20 MiB per session to one
   shared set; the remaining per-session heap from about 1 MiB to about 80 KiB. Shared values are read-only; each query still
   builds its own MCP server from them.
+- **The auto-defer decision is taken once per session, and a client that
+  defers its own tools is never auto-deferred.** The first turn of a keyed
+  session pins the AUTO-defer answer (#861) so a tool count crossing
+  `MERIDIAN_DEFER_TOOL_THRESHOLD` later cannot re-render the tool block or
+  flip `ENABLE_TOOL_SEARCH`/`maxTurns` mid-session. The pin never records
+  `hasDeferredTools`: a client that marks any tool `defer_loading: true`
+  (Claude Code with its own tool search sends a placeholder beside its loaded
+  tools) manages deferral itself and is not auto-deferred on top, and a
+  request that defers nothing reads as no suppressed flip. `tool_reference`
+  blocks in client tool results are renamed to the registered SDK names at a
+  real checkpoint and render as history text otherwise, so the CLI cannot
+  drop them as tools it does not know.
 - **Transcript retention is opt-in and delegated to Claude Code (#1261,
   owner decision 2026-10-27).** Meridian's empty `settingSources` (#490/#634)
   also skips Claude Code's retention cleanup, so transcripts Meridian's own GC
