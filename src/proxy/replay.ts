@@ -244,25 +244,37 @@ function toolChangeText(block: Record<string, unknown>): string | undefined {
 
 /** Only a real SDK tool checkpoint may receive native tool_result blocks.
  * Fresh replay renders results as history, retaining their payloads and media
- * rather than presenting orphan results for calls absent from the SDK session. */
+ * rather than presenting orphan results for calls absent from the SDK session.
+ * A `tool_reference` names a tool as the CLIENT named it: at a real checkpoint
+ * it is renamed through `renderToolName` to the name the SDK registered, since
+ * the CLI drops references to tools it does not know; in history replay it
+ * becomes a text note carrying the client's name. */
 export function normalizeStructuredUserContent(
   content: unknown,
   preserveToolResultWrapper = false,
   toolIndex?: Map<string, ToolCallInfo>,
+  renderToolName?: (name: string) => string,
 ): unknown {
   if (!Array.isArray(content)) return content
   return content.flatMap(block => {
     if (!record(block)) return []
     const toolChange = toolChangeText(block)
     if (toolChange) return [{ type: "text", text: toolChange }]
+    if (block.type === "tool_reference") {
+      const name = typeof block.tool_name === "string" ? block.tool_name : "unknown"
+      if (preserveToolResultWrapper) {
+        return renderToolName ? [{ ...block, tool_name: renderToolName(name) }] : [block]
+      }
+      return [{ type: "text", text: `[Tool reference: ${name}]` }]
+    }
     if (block.type !== "tool_result") return [block]
     if (preserveToolResultWrapper) {
-      return [{ ...block, content: normalizeStructuredUserContent(block.content, true, toolIndex) }]
+      return [{ ...block, content: normalizeStructuredUserContent(block.content, true, toolIndex, renderToolName) }]
     }
     const info = typeof block.tool_use_id === "string" ? toolIndex?.get(block.tool_use_id) : undefined
     const metadata = { type: "text", text: replayToolResultHeader(block, info) }
     if (Array.isArray(block.content)) {
-      const nested = normalizeStructuredUserContent(block.content, false, toolIndex)
+      const nested = normalizeStructuredUserContent(block.content, false, toolIndex, renderToolName)
       return [metadata, ...(Array.isArray(nested) ? nested : [])]
     }
     return [metadata, { type: "text", text: typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "") }]

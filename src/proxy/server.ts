@@ -99,7 +99,7 @@ import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
 import { parseToolInputObject } from "./toolInputJson"
-import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, describeToolSetDelta, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, autoDeferDecision, getAutoDeferThreshold } from "./passthroughTools"
+import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, describeToolSetDelta, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, resolveAutoDeferDecision } from "./passthroughTools"
 import { describeLocalBootIdentity } from "./session/processIncarnation"
 import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
 import { getOpenCodeSourceFeatureOverrides } from "./adapters/opencodeSourceFeatures"
@@ -619,7 +619,9 @@ function buildFreshPrompt(
       if (m.role !== "assistant") {
         structured.push({
           type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+          message: { role: "user" as const, content: normalizeStructuredUserContent(
+            stripCacheControlDeep(m.content), false, undefined, renderToolName,
+          ) },
           parent_tool_use_id: null,
         })
       } else {
@@ -4176,7 +4178,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   type: "user" as const,
                   message: { role: "user" as const, content: normalizeStructuredUserContent(
                     stripCacheControlDeep(m.content),
-                    Boolean(passthroughToolCallAssistantUuid)
+                    Boolean(passthroughToolCallAssistantUuid),
+                    undefined,
+                    renderReplayToolName,
                   ) },
                   parent_tool_use_id: null,
                 })
@@ -4191,7 +4195,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   type: "user" as const,
                   message: { role: "user" as const, content: normalizeStructuredUserContent(
                     stripCacheControlDeep(m.content),
-                    Boolean(passthroughToolCallAssistantUuid)
+                    Boolean(passthroughToolCallAssistantUuid),
+                    undefined,
+                    renderReplayToolName,
                   ) },
                   parent_tool_use_id: null,
                 })
@@ -4447,9 +4453,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // already costs one cache miss, and re-deciding on top of it would ALSO
         // flip maxTurns mid-session. The suppressed flip is logged whenever the
         // live count would decide differently, which is the observability the
-        // issue asked for regardless of which fix landed.
+        // issue asked for regardless of which fix landed. The live decision is
+        // resolved by the same rule as the build, so a client-deferring request
+        // never reads as a suppressed flip.
         const pinnedDefer = profileSessionId ? sessionDeferPin.get(profileSessionId) : undefined
-        const liveDefer = autoDeferDecision(getAutoDeferThreshold(), coreNamesForDefer, requestTools.length)
+        const liveDefer = resolveAutoDeferDecision(requestTools, coreNamesForDefer, undefined)
         if (pinnedDefer !== undefined && pinnedDefer !== liveDefer) {
           plog(`[PROXY] ${requestMeta.requestId} defer_flip suppressed: session pinned autoDefer=${pinnedDefer}, live tool count ${requestTools.length} would give ${liveDefer}`)
           claudeLog("passthrough.defer_flip_suppressed", { pinned: pinnedDefer, live: liveDefer, toolCount: requestTools.length })
@@ -4466,9 +4474,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             }
           }
         }
-        // First request in the session decides; later ones inherit.
+        // First request in the session decides; later ones inherit. The pin
+        // holds the AUTO-defer answer, not hasDeferredTools: a client that
+        // defers its own tools runs below the threshold without pinning a
+        // deferral that never happened.
         if (mcpCacheKey && !sessionDeferPin.has(mcpCacheKey)) {
-          sessionDeferPin.set(mcpCacheKey, passthroughMcp.hasDeferredTools)
+          sessionDeferPin.set(mcpCacheKey, passthroughMcp.autoDefer)
         }
       }
       const hasDeferredTools = passthroughMcp?.hasDeferredTools ?? false
@@ -4505,12 +4516,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           cacheKeepalive.forget(cacheKeepaliveKey)
         }
       }
-      // Count deferred tools: when auto-defer is active, non-core tools are deferred
+      // Deferred definitions are exactly the ones registered without
+      // alwaysLoad; a client-deferring request that auto-defers nothing
+      // therefore counts only what the client itself marked.
       const coreNames = pipelineCtx.coreToolNames ? [...pipelineCtx.coreToolNames] : undefined
-      const coreSet = coreNames ? new Set(coreNames.map(n => n.toLowerCase())) : undefined
-      const deferredToolCount = hasDeferredTools && requestTools.length > 0
-        ? requestTools.filter((t: any) => t.defer_loading === true || (coreSet && !coreSet.has(String(t.name).toLowerCase()))).length
-        : 0
+      const deferredToolCount = passthroughMcp?.deferredToolNames.length ?? 0
       if (hasDeferredTools) {
         plog(`[PROXY] ${requestMeta.requestId} deferred=${deferredToolCount}/${toolCount} tools (core: ${coreNames?.join(",") ?? "none"})`)
       }
@@ -4526,6 +4536,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
       // Track tools discovered via ToolSearch (deferred tools that get called)
       const discoveredTools = new Set<string>()
+      // The registered SDK names that really are deferred, matching the raw
+      // PreToolUse `tool_name`; a discovered tool is recorded only from here.
+      const deferredSdkToolNames = new Set(passthroughMcp?.deferredToolNames ?? [])
       // Client tool calls captured for the client, not the dropped repeats. A
       // lifted turn budget ends the query after the batch holding one
       // (stopAfterForwardedBatch). A dropped repeat must not end it: when the
@@ -4573,9 +4586,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   return {}
                 }
                 markPriorityAttemptExposure("tool_use")
-                // Track deferred tools that were discovered via ToolSearch
+                // Track deferred tools that were discovered via ToolSearch.
+                // The raw tool_name is the registered SDK name, which is what
+                // deferredToolNames holds.
                 const toolName = resolveClientToolName(input.tool_name, passthroughMcp?.clientNameByAlias, passthroughMcpName)
-                if (hasDeferredTools && coreSet && !coreSet.has(toolName.toLowerCase())) {
+                if (deferredSdkToolNames.has(input.tool_name)) {
                   discoveredTools.add(toolName)
                 }
                 // Normalize parameter names: the SDK system prompt references

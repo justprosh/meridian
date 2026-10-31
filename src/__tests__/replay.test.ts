@@ -149,6 +149,27 @@ describe("faithful tool history rendering", () => {
     ])
   })
 
+  it("renames a tool_reference to the registered SDK name at a real checkpoint", () => {
+    const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "graph_update" },
+    ] }]
+    const rendered = normalizeStructuredUserContent(content, true, undefined, name => `mcp__oc__${name}`)
+    expect(rendered).toEqual([{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "mcp__oc__graph_update" },
+    ] }])
+  })
+
+  it("renders a historical tool_reference as text under the client's name", () => {
+    const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "mcp__graph__graph_update" },
+    ] }]
+    const rendered = normalizeStructuredUserContent(content)
+    expect(rendered).toEqual([
+      expect.objectContaining({ type: "text" }),
+      { type: "text", text: "[Tool reference: mcp__graph__graph_update]" },
+    ])
+  })
+
   it("frames multimodal history before the live turn without changing images or the source", () => {
     const source = [{ message: { content: "earlier question" } }, { message: { content: [image, { type: "text", text: "live question" }] } }]
     const before = structuredClone(source)
