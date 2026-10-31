@@ -383,3 +383,138 @@ describe("defer pin — a client that defers its own tools (#861)", () => {
     expect(alwaysLoadCount).toBe(0)
   })
 })
+
+describe("client-owned tool search — one search path", () => {
+  const placeholderTool = {
+    name: "DeferredToolPlaceholder",
+    description: "t",
+    input_schema: { type: "object", properties: {} },
+    defer_loading: true,
+  }
+
+  function clientSearchPost(server: Awaited<ReturnType<typeof app>>, tools: Array<Record<string, unknown>>, messages?: Array<Record<string, unknown>>) {
+    const metadata = { user_id: JSON.stringify({ session_id: "client-search-single-path" }) }
+    return server.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "user-agent": "claude-cli/2.1.290 (external, cli)" },
+      body: JSON.stringify(makeRequest({
+        stream: false,
+        tools,
+        messages: messages ?? [{ role: "user", content: "hi" }],
+        metadata,
+      })),
+    }))
+  }
+
+  it("registers no client tool search deferred tools and adds no inner ToolSearch", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+    const server = app()
+
+    await clientSearchPost(server, [...makeTools(12), {
+      name: "ToolSearch",
+      description: "The client's own tool search",
+      input_schema: { type: "object", properties: { query: { type: "string" } } },
+    }, placeholderTool])
+
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
+    expect(capturedQueryParams.options.tools).toEqual([])
+    const registration = capturedMcpRegistrations.at(-1)
+    expect(registration?.name).toBe("oc")
+    const definitions = registration?.tools ?? []
+    const names = definitions.map(definition => definition.name)
+    expect(names).not.toContain("DeferredToolPlaceholder")
+    expect(names).toContain("ToolSearch")
+    const alwaysLoadCount = definitions.filter(definition =>
+      (definition._meta as Record<string, unknown> | undefined)?.["anthropic/alwaysLoad"] === true
+    ).length
+    expect(alwaysLoadCount).toBe(0)
+  })
+
+  it("registers a referenced deferred tool eagerly on the follow-up and renders the reference as text", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+    const server = app()
+
+    const loadedTools: Array<Record<string, unknown>> = [
+      ...makeTools(12),
+      {
+        name: "ToolSearch",
+        description: "The client's own tool search",
+        input_schema: { type: "object", properties: { query: { type: "string" } } },
+      },
+      placeholderTool,
+    ]
+    await clientSearchPost(server, loadedTools)
+
+    const history: Array<Record<string, unknown>> = [
+      { role: "assistant", content: [{ type: "tool_use", id: "tu_search_1", name: "ToolSearch", input: { query: "graph" } }] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "tu_search_1", is_error: false, content: [
+          { type: "tool_reference", tool_name: "mcp__graph__graph_update" },
+        ] },
+      ] },
+      { role: "user", content: "now use it" },
+    ]
+    await clientSearchPost(server, [
+      ...loadedTools,
+      {
+        name: "mcp__graph__graph_update",
+        description: "Update the graph",
+        input_schema: { type: "object", properties: { id: { type: "string" } } },
+        defer_loading: true,
+      },
+    ], history)
+
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
+    expect(capturedQueryParams.options.tools).toEqual([])
+    // The replay reaches the SDK without a resumable session here, so the
+    // reference travels as text in the prompt (the wrapper path is covered by
+    // the replay unit tests).
+    expect(JSON.stringify(capturedQueryParams.prompt)).toContain("[Tool reference: mcp__graph__graph_update]")
+    const registration = capturedMcpRegistrations.at(-1)
+    const definitions = registration?.tools ?? []
+    const names = definitions.map(definition => definition.name)
+    expect(names).toContain("mcp__graph__graph_update")
+    expect(names).not.toContain("DeferredToolPlaceholder")
+    const graphTool = definitions.find(definition => definition.name === "mcp__graph__graph_update")
+    expect(graphTool).toBeDefined()
+    expect((graphTool!._meta as Record<string, unknown> | undefined)?.["anthropic/alwaysLoad"]).toBeUndefined()
+  })
+})
+
+describe("generic client deferral — inner search stays on", () => {
+  it("registers the deferred tool without alwaysLoad and enables the inner ToolSearch", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+    const server = app()
+    const metadata = { user_id: JSON.stringify({ session_id: "generic-client-defer" }) }
+
+    await server.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "user-agent": "claude-cli/2.1.290 (external, cli)" },
+      body: JSON.stringify(makeRequest({
+        stream: false,
+        tools: [...makeTools(12), {
+          name: "custom_lint",
+          description: "Run custom linter",
+          input_schema: { type: "object", properties: { file: { type: "string" } } },
+          defer_loading: true,
+        }],
+        messages: [{ role: "user", content: "hi" }],
+        metadata,
+      })),
+    }))
+
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("true")
+    expect(capturedQueryParams.options.tools).toEqual(["ToolSearch"])
+    const registration = capturedMcpRegistrations.at(-1)
+    const definitions = registration?.tools ?? []
+    const isAlwaysLoad = (definition: Record<string, unknown>) =>
+      (definition._meta as Record<string, unknown> | undefined)?.["anthropic/alwaysLoad"] === true
+    const lint = definitions.find(definition => definition.name === "custom_lint")
+    expect(lint).toBeDefined()
+    expect(isAlwaysLoad(lint!)).toBe(false)
+    expect(definitions.filter(isAlwaysLoad).length).toBe(12)
+  })
+})

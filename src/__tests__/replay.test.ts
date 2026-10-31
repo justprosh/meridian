@@ -159,6 +159,17 @@ describe("faithful tool history rendering", () => {
     ] }])
   })
 
+  it("renders a tool_reference as text at a checkpoint when no renderer is supplied", () => {
+    const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "mcp__graph__graph_update" },
+    ] }]
+    expect(normalizeStructuredUserContent(content, true)).toEqual([{
+      type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+        { type: "text", text: "[Tool reference: mcp__graph__graph_update]" },
+      ],
+    }])
+  })
+
   it("renders a historical tool_reference as text under the client's name", () => {
     const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
       { type: "tool_reference", tool_name: "mcp__graph__graph_update" },
