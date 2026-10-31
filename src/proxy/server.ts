@@ -615,9 +615,7 @@ function buildFreshPrompt(
       if (m.role !== "assistant") {
         structured.push({
           type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(
-            stripCacheControlDeep(m.content), false, undefined, renderToolName,
-          ) },
+          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
           parent_tool_use_id: null,
         })
       } else {
@@ -4061,8 +4059,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // NOTE: agent-specific MCP namespace comes from the selected adapter.
       const passthroughMcpName = adapter.getPassthroughMcpName?.() ?? PASSTHROUGH_MCP_NAME
       const clientToolPrefix = passthroughMcpPrefix(passthroughMcpName)
-      // A client that brings its own tool search registers only the tools its
-      // conversation has referenced; the rest of its set stays unregistered.
+      // Client-owned search: register eager tools plus referenced deferred ones.
       const clientToolSearch = passthrough && clientOwnsToolSearch(requestTools)
       const registrationTools = clientToolSearch
         ? clientSearchRegistrationTools(requestTools, referencedToolNames(body.messages))
@@ -4395,8 +4392,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           plog(`[PROXY] ${requestMeta.requestId} defer_flip suppressed: session pinned autoDefer=${pinnedDefer}, live tool count ${registrationTools.length} would give ${liveDefer}`)
           claudeLog("passthrough.defer_flip_suppressed", { pinned: pinnedDefer, live: liveDefer, toolCount: registrationTools.length })
         }
-        // The same definitions can be eager or auto-deferred depending on how
-        // the request reached here, so the mode is part of the cache identity.
+        // Mode is part of the cache identity.
         const cacheKey = `${toolSetKey}|${buildDefer}|${clientToolSearch}`
         if (cachedMcp && cachedMcp.key === cacheKey) {
           passthroughMcp = cachedMcp.mcp
@@ -5247,7 +5243,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   for (const block of message.message.content) {
                     const b = block as unknown as Record<string, unknown>
                     // Filter ToolSearch from non-streaming passthrough responses
-                    // (internal only while the inner tool search is on)
                     if (b.type === "tool_use" && !clientToolSearch && (b as any).name === "ToolSearch") {
                       claudeLog("passthrough.toolsearch_filtered", { mode: "non_stream" })
                       continue

@@ -337,10 +337,6 @@ describe("deferred tool loading — ToolSearch exempted from PreToolUse block", 
 })
 
 describe("defer pin — a client that defers its own tools (#861)", () => {
-  // Claude Code with tool search on sends its loaded tools plus a
-  // defer_loading placeholder. That request defers nothing itself, so the
-  // session pin must hold the auto-defer answer false — not hasDeferredTools —
-  // and a later tool set that crosses the threshold must stay eager.
   it("does not pin auto-defer=true from a client-deferring request", async () => {
     process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
     mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
@@ -369,8 +365,6 @@ describe("defer pin — a client that defers its own tools (#861)", () => {
     ])
     await post(makeTools(20))
 
-    // Still eager: no tool search, no ToolSearch in the built-in catalog, and
-    // (with deferral off) no alwaysLoad markers — nothing was deferred.
     expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
     expect(capturedQueryParams.options.tools).toEqual([])
     const registration = capturedMcpRegistrations.at(-1)
@@ -468,9 +462,7 @@ describe("client-owned tool search — one search path", () => {
 
     expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
     expect(capturedQueryParams.options.tools).toEqual([])
-    // The replay reaches the SDK without a resumable session here, so the
-    // reference travels as text in the prompt (the wrapper path is covered by
-    // the replay unit tests).
+    // No resumable session in the harness: the reference reaches the SDK as replay text.
     expect(JSON.stringify(capturedQueryParams.prompt)).toContain("[Tool reference: mcp__graph__graph_update]")
     const registration = capturedMcpRegistrations.at(-1)
     const definitions = registration?.tools ?? []
@@ -554,13 +546,11 @@ describe("client ToolSearch stays a client tool across modes", () => {
       metadata,
     }))
 
-    // Above the threshold with no client deferral: Meridian auto-defers.
     await post(clientSearchTools())
     expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("true")
     expect(capturedQueryParams.options.tools).toEqual(["ToolSearch"])
 
-    // Same definitions plus an unreferenced placeholder: the client owns the
-    // search now, the registration set is unchanged, and the mode must flip.
+    // Unreferenced placeholder: same registration set, flipped mode.
     await post(clientSearchTools(true))
     expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
     expect(capturedQueryParams.options.tools).toEqual([])

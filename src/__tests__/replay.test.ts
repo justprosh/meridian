@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders, layoutReplayBlocks, type ReplayPart } from "../proxy/replay"
+import { createPassthroughMcpServer, createPassthroughReplayToolNameRenderer } from "../proxy/passthroughTools"
 import { frameReplayTurns } from "../proxy/messages"
 
 describe("trailing system reminders in a live user turn", () => {
@@ -133,13 +134,35 @@ describe("faithful tool history rendering", () => {
   })
 
   it("renames a tool_reference to the registered SDK name at a real checkpoint", () => {
+    const registered = createPassthroughMcpServer([{
+      name: "graph_update", description: "t", input_schema: { type: "object", properties: {} },
+    }]).toolNames
+    expect(registered).toEqual(["mcp__oc__graph_update"])
     const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
       { type: "tool_reference", tool_name: "graph_update" },
     ] }]
-    const rendered = normalizeStructuredUserContent(content, true, undefined, name => `mcp__oc__${name}`)
+    const rendered = normalizeStructuredUserContent(content, true, undefined, createPassthroughReplayToolNameRenderer(["graph_update"]))
     expect(rendered).toEqual([{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
       { type: "tool_reference", tool_name: "mcp__oc__graph_update" },
     ] }])
+  })
+
+  it("renames a tool_reference whose client name collides with the namespace to the aliased registration", () => {
+    const names = ["read", "mcp__oc__read"]
+    const registered = createPassthroughMcpServer(names.map(name => ({
+      name, description: "t", input_schema: { type: "object", properties: {} },
+    }))).toolNames
+    expect(registered).toContain("mcp__oc__read_2")
+    const render = createPassthroughReplayToolNameRenderer(names)
+    expect(render("mcp__oc__read")).toBe("mcp__oc__read_2")
+    const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "mcp__oc__read" },
+    ] }]
+    expect(normalizeStructuredUserContent(content, true, undefined, render)).toEqual([{
+      type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+        { type: "tool_reference", tool_name: "mcp__oc__read_2" },
+      ],
+    }])
   })
 
   it("renders a tool_reference as text at a checkpoint when no renderer is supplied", () => {

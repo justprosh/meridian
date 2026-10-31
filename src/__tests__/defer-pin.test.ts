@@ -62,9 +62,6 @@ describe("autoDeferDecision", () => {
 describe("resolveAutoDeferDecision", () => {
   const t = getAutoDeferThreshold()
 
-  // A client that marks tools defer_loading manages deferral itself: it
-  // already decided which tools are loaded, so auto-defering on top would
-  // hide tools the client sent deliberately.
   it("is false for a client that defers its own tools, even above the threshold", () => {
     expect(resolveAutoDeferDecision(withClientDefer(t + 1), CORE, undefined)).toBe(false)
   })
@@ -123,8 +120,6 @@ describe("createPassthroughMcpServer with a pinned decision", () => {
     expect(over.toolNames).toEqual(under.toolNames)
   })
 
-  // Claude Code with tool search on sends a defer_loading placeholder beside
-  // its loaded tools: Meridian must not auto-defer the loaded ones on top.
   it("reports a client-deferring set above the threshold as not auto-deferred but deferred", () => {
     const mcp = createPassthroughMcpServer(withClientDefer(19), CORE)
     expect(mcp.autoDefer).toBe(false)

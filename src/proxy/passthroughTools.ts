@@ -277,8 +277,8 @@ export function resolveAutoDeferDecision(
   return pinnedAutoDefer ?? autoDeferDecision(getAutoDeferThreshold(), coreToolNames, tools.length)
 }
 
-/** Protocol convention (Claude Code): the client brings its own tool search
- *  when it defers tools and also sends a loaded tool named exactly `ToolSearch`. */
+/** NOTE: agent-specific (Claude Code convention). The client brings its own
+ *  tool search when it defers tools and also sends a loaded `ToolSearch`. */
 export function clientOwnsToolSearch(
   tools: ReadonlyArray<{ name: string; defer_loading?: boolean }>,
 ): boolean {
@@ -310,11 +310,8 @@ export function referencedToolNames(messages: unknown): Set<string> {
 }
 
 /**
- * The registration view of a client-owned-tool-search request: a deferred tool
- * the conversation never referenced is invisible to the model, so it is not
- * registered, and a referenced one is registered eagerly. Under the API's
- * semantics a deferred tool becomes callable exactly when a tool_reference
- * names it, so this is the whole set the client can act on.
+ * The registration view of a client-owned-tool-search request: eager tools
+ * stay, a deferred tool only once the conversation referenced it, eagerly.
  */
 export function clientSearchRegistrationTools(
   tools: ReadonlyArray<{ name: string; defer_loading?: boolean }>,
