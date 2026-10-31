@@ -4475,13 +4475,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           plog(`[PROXY] ${requestMeta.requestId} defer_flip suppressed: session pinned autoDefer=${pinnedDefer}, live tool count ${registrationTools.length} would give ${liveDefer}`)
           claudeLog("passthrough.defer_flip_suppressed", { pinned: pinnedDefer, live: liveDefer, toolCount: registrationTools.length })
         }
-        if (cachedMcp && cachedMcp.key === toolSetKey) {
+        // The same definitions can be eager or auto-deferred depending on how
+        // the request reached here, so the mode is part of the cache identity.
+        const cacheKey = `${toolSetKey}|${buildDefer}|${clientToolSearch}`
+        if (cachedMcp && cachedMcp.key === cacheKey) {
           passthroughMcp = cachedMcp.mcp
         } else {
           passthroughMcp = sharedPassthroughMcpServer(registrationTools, coreNamesForDefer, passthroughMcpName, pinnedDefer)
           if (mcpCacheKey) {
             const toolNames = registrationTools.map((t: { name: string }) => String(t.name)).sort()
-            sessionMcpCache.set(mcpCacheKey, { key: toolSetKey, mcp: passthroughMcp, names: toolNames })
+            sessionMcpCache.set(mcpCacheKey, { key: cacheKey, mcp: passthroughMcp, names: toolNames })
             if (cachedMcp) {
               plog(`[PROXY] ${requestMeta.requestId} tools_changed: tool definitions rebuilt (prompt cache likely invalidates) ${describeToolSetDelta(cachedMcp.names, toolNames)}`)
             }
@@ -4561,7 +4564,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const toolName = input && typeof input === "object"
                 ? Reflect.get(input, "tool_name")
                 : undefined
-              if (toolName !== "ToolSearch") markPriorityAttemptExposure(
+              if (clientToolSearch || toolName !== "ToolSearch") markPriorityAttemptExposure(
                 toolName === "StructuredOutput" ? "structured_output_tool" : "tool_use",
               )
               return {}
@@ -4578,7 +4581,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 // Return {} — NOT undefined. SDK validates hook returns with Zod and
                 // rejects undefined ("expected object, received undefined"), which also
                 // cascades into "Reached maximum number of turns (2)". {} is the no-op.
-                if (input.tool_name === "ToolSearch") return {}
+                if (!clientToolSearch && input.tool_name === "ToolSearch") return {}
                 // StructuredOutput is the SDK-internal tool that implements
                 // native output_config.format — the CLI injects it whenever
                 // outputFormat is set, and schema validation + retry live
@@ -5212,7 +5215,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 // until the full client-visible ID set is covered; internal and
                 // duplicate calls are filtered by noteAssistantMessage.
                 const expectedBefore = earlyStop.expected.size
-                noteAssistantMessage(earlyStop, message, clientToolPrefix)
+                noteAssistantMessage(earlyStop, message, clientToolPrefix, clientToolSearch)
                 assistantAddedForwardedCall = earlyStop.expected.size > expectedBefore
               } else if (passthrough && message.type === "user" && !earlyStopFired) {
                 noteUserContent(earlyStop, (message as any).message?.content)
@@ -5270,7 +5273,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   // The predicate the tracker arms `expected` with, so the two
                   // sets are comparable by construction.
                   const block = event.content_block
-                  if (isClientForwardedToolUse(block, clientToolPrefix)) streamedToolUseIds.add(block.id)
+                  if (isClientForwardedToolUse(block, clientToolPrefix, clientToolSearch)) streamedToolUseIds.add(block.id)
                 }
               }
               if (message.type === "assistant") {
@@ -5325,7 +5328,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   for (const block of message.message.content) {
                     const b = block as unknown as Record<string, unknown>
                     // Filter ToolSearch from non-streaming passthrough responses
-                    if (b.type === "tool_use" && (b as any).name === "ToolSearch") {
+                    // (internal only while the inner tool search is on)
+                    if (b.type === "tool_use" && !clientToolSearch && (b as any).name === "ToolSearch") {
                       claudeLog("passthrough.toolsearch_filtered", { mode: "non_stream" })
                       continue
                     }
@@ -6591,7 +6595,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   let assistantAddedForwardedCall = false
                   if (earlyStopEnabled && message.type === "assistant" && !earlyStopFired) {
                     const expectedBefore = earlyStop.expected.size
-                    noteAssistantMessage(earlyStop, message, clientToolPrefix)
+                    noteAssistantMessage(earlyStop, message, clientToolPrefix, clientToolSearch)
                     assistantAddedForwardedCall = earlyStop.expected.size > expectedBefore
                   } else if (earlyStopEnabled && message.type === "user" && !earlyStopFired) {
                     noteUserContent(earlyStop, (message as any).message?.content)
@@ -6774,7 +6778,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       if (block?.type === "tool_use" && typeof block.name === "string") {
                         // Filter out ToolSearch — handled internally by the SDK
                         // for deferred tool loading, not visible to the client.
-                        if (block.name === "ToolSearch") {
+                        if (!clientToolSearch && block.name === "ToolSearch") {
                           if (eventIndex !== undefined) skipBlockIndices.add(eventIndex)
                           continue
                         }
@@ -7377,7 +7381,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       recoverySessionId = recoveryMessage.session_id
                     }
                     if (recoveryMessage.type === "assistant") {
-                      noteAssistantMessage(recoveryEarlyStop, recoveryMessage, clientToolPrefix)
+                      noteAssistantMessage(recoveryEarlyStop, recoveryMessage, clientToolPrefix, clientToolSearch)
                     } else if (recoveryMessage.type === "user") {
                       noteUserContent(recoveryEarlyStop, recoveryMessage.message?.content)
                     }
@@ -7395,7 +7399,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     if (recoveryEvent.type === "message_start") turnGenerating = true
                     if (
                       recoveryEvent.type === "content_block_start"
-                      && isClientForwardedToolUse(recoveryEvent.content_block, clientToolPrefix)
+                      && isClientForwardedToolUse(recoveryEvent.content_block, clientToolPrefix, clientToolSearch)
                     ) {
                       recoveryStreamedToolUseIds.add(
                         (recoveryEvent.content_block as { id: string }).id,

@@ -518,3 +518,117 @@ describe("generic client deferral — inner search stays on", () => {
     expect(definitions.filter(isAlwaysLoad).length).toBe(12)
   })
 })
+
+describe("client ToolSearch stays a client tool across modes", () => {
+  const clientSearchTools = (placeholder = false): Array<Record<string, unknown>> => [
+    ...makeTools(16),
+    {
+      name: "ToolSearch",
+      description: "The client's own tool search",
+      input_schema: { type: "object", properties: { query: { type: "string" } } },
+    },
+    ...(placeholder ? [{
+      name: "DeferredToolPlaceholder",
+      description: "t",
+      input_schema: { type: "object", properties: {} },
+      defer_loading: true,
+    }] : []),
+  ]
+
+  function claudePost(server: Awaited<ReturnType<typeof app>>, body: Record<string, unknown>) {
+    return server.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "user-agent": "claude-cli/2.1.290 (external, cli)" },
+      body: JSON.stringify(body),
+    }))
+  }
+
+  it("rebuilds the cached server when the deferral mode flips on unchanged definitions", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+    const server = app()
+    const metadata = { user_id: JSON.stringify({ session_id: "cache-mode-flip" }) }
+    const post = (tools: Array<Record<string, unknown>>) => claudePost(server, makeRequest({
+      stream: false, tools,
+      messages: [{ role: "user", content: "hi" }],
+      metadata,
+    }))
+
+    // Above the threshold with no client deferral: Meridian auto-defers.
+    await post(clientSearchTools())
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("true")
+    expect(capturedQueryParams.options.tools).toEqual(["ToolSearch"])
+
+    // Same definitions plus an unreferenced placeholder: the client owns the
+    // search now, the registration set is unchanged, and the mode must flip.
+    await post(clientSearchTools(true))
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
+    expect(capturedQueryParams.options.tools).toEqual([])
+    const names = (capturedMcpRegistrations.at(-1)?.tools ?? []).map(definition => definition.name)
+    expect(names).not.toContain("DeferredToolPlaceholder")
+  })
+
+  it("forwards a bare ToolSearch call to the client in client-search mode (non-streaming)", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([
+      { type: "tool_use", id: "tu_ts_1", name: "ToolSearch", input: { query: "graph" } },
+    ])]
+    const server = app()
+
+    const res = await claudePost(server, makeRequest({
+      stream: false,
+      tools: clientSearchTools(true),
+      messages: [{ role: "user", content: "find the graph tool" }],
+      metadata: { user_id: JSON.stringify({ session_id: "bare-toolsearch-nonstream" }) },
+    }))
+    const body = await res.json() as Record<string, unknown>
+    const content = body.content as Array<Record<string, unknown>>
+    const toolNames = content.filter((b) => b.type === "tool_use").map((b) => b.name)
+    expect(toolNames).toContain("ToolSearch")
+    expect(body.stop_reason).toBe("tool_use")
+  })
+
+  it("forwards a prefixed ToolSearch call under the client's name (non-streaming)", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [assistantMessage([
+      { type: "tool_use", id: "tu_ts_2", name: "mcp__oc__ToolSearch", input: { query: "graph" } },
+    ])]
+    const server = app()
+
+    const res = await claudePost(server, makeRequest({
+      stream: false,
+      tools: clientSearchTools(true),
+      messages: [{ role: "user", content: "find the graph tool" }],
+      metadata: { user_id: JSON.stringify({ session_id: "prefixed-toolsearch-nonstream" }) },
+    }))
+    const body = await res.json() as Record<string, unknown>
+    const content = body.content as Array<Record<string, unknown>>
+    const toolNames = content.filter((b) => b.type === "tool_use").map((b) => b.name)
+    expect(toolNames).toContain("ToolSearch")
+  })
+
+  it("forwards a bare ToolSearch call to the client in client-search mode (streaming)", async () => {
+    process.env.MERIDIAN_DEFER_TOOL_THRESHOLD = "15"
+    mockMessages = [
+      messageStart(),
+      toolUseBlockStart(0, "ToolSearch", "tu_ts_3"),
+      inputJsonDelta(0, '{"query":"graph"}'),
+      blockStop(0),
+      messageDelta("tool_use"),
+      messageStop(),
+    ]
+    const server = app()
+
+    const res = await claudePost(server, makeRequest({
+      stream: true,
+      tools: clientSearchTools(true),
+      messages: [{ role: "user", content: "find the graph tool" }],
+      metadata: { user_id: JSON.stringify({ session_id: "bare-toolsearch-stream" }) },
+    }))
+    const events = parseSSE(await res.text())
+    const toolNames = events
+      .filter((e) => e.event === "content_block_start")
+      .map((e) => (e.data as Record<string, Record<string, unknown>>).content_block?.name)
+    expect(toolNames).toContain("ToolSearch")
+  })
+})

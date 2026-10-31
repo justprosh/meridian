@@ -95,10 +95,12 @@ Contract*, *Cancellation Contract*; public routes and headers are in
   flip `ENABLE_TOOL_SEARCH`/`maxTurns` mid-session, and a client that marks
   any tool `defer_loading: true` is not auto-deferred on top. When that client
   also sends a loaded `ToolSearch` tool (Claude Code with its own tool
-  search), only tools its conversation referenced are registered, eagerly;
-  Meridian enables no inner ToolSearch, and `tool_reference` blocks reach the
-  model as text. Other client-deferral keeps the inner ToolSearch and maps
-  `tool_reference` names to the registered names at a real checkpoint.
+  search), its eager tools stay registered, a deferred tool joins them eagerly
+  once the conversation references it, and unreferenced deferred tools stay
+  unregistered; Meridian enables no inner ToolSearch, and `tool_reference`
+  blocks reach the model as text. Other client-deferral keeps the inner
+  ToolSearch and maps `tool_reference` names to the registered names at a
+  real checkpoint.
 - **Transcript retention is opt-in and delegated to Claude Code (#1261,
   owner decision 2026-10-27).** Meridian's empty `settingSources` (#490/#634)
   also skips Claude Code's retention cleanup, so transcripts Meridian's own GC
