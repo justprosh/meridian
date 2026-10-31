@@ -50,9 +50,8 @@
 const CLIENT_TOOL_PREFIX = "mcp__oc__"
 
 /** Internal SDK tools execute inside the SDK. Their results never require
- *  a client tool_result and must not arm a passthrough checkpoint. ToolSearch
- *  is internal only while the inner tool search is on: a client-owned search
- *  registers ToolSearch as a client tool. */
+ *  a client tool_result and must not arm a passthrough checkpoint.
+ *  ToolSearch is a client tool in client-search mode. */
 const INTERNAL_TOOLS = new Set(["ToolSearch", "StructuredOutput"])
 
 export interface EarlyStopTracker {
