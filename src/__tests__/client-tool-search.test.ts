@@ -1,8 +1,9 @@
 /**
  * Client-owned tool search: a client that defers tools and also sends a loaded
- * `ToolSearch` tool gets the only search path. Meridian registers only what
- * that client's conversation has referenced, eagerly, and adds no inner
- * ToolSearch of its own.
+ * `ToolSearch` tool gets the only search path. Meridian keeps that client's
+ * eager tools registered, registers a deferred tool eagerly once the
+ * conversation references it, leaves unreferenced deferred tools unregistered,
+ * and adds no inner ToolSearch of its own.
  */
 
 import { describe, it, expect } from "bun:test"
