@@ -539,16 +539,18 @@ function stripCacheControlDeep(content: any): any {
 function flattenUserContent(
   content: any,
   sanitizeOpts: import("./sanitize").SanitizeOptions = {},
-  toolIndex?: Map<string, import("./messages").ToolCallInfo>
+  toolIndex?: Map<string, import("./messages").ToolCallInfo>,
+  renderToolName?: (name: string) => string,
 ): string {
-  return flattenUserContentParts(content, sanitizeOpts, toolIndex).map((part) => part.text).join("\n")
+  return flattenUserContentParts(content, sanitizeOpts, toolIndex, renderToolName).map((part) => part.text).join("\n")
 }
 
 /** flattenUserContent, one part per non-empty content block. */
 function flattenUserContentParts(
   content: any,
   sanitizeOpts: import("./sanitize").SanitizeOptions = {},
-  toolIndex?: Map<string, import("./messages").ToolCallInfo>
+  toolIndex?: Map<string, import("./messages").ToolCallInfo>,
+  renderToolName?: (name: string) => string,
 ): ReplayPart[] {
   if (typeof content === "string") return [{ text: sanitizeTextContent(content, sanitizeOpts), clientMarked: false }]
   if (!Array.isArray(content)) return [{ text: String(content ?? ""), clientMarked: false }]
@@ -568,7 +570,9 @@ function flattenUserContentParts(
         flat = inner
           .map((ib: any) => {
             if (ib?.type === "text" && ib.text) return ib.text
-            if (ib?.type === "tool_reference" && typeof ib.tool_name === "string") return `[Tool reference: ${ib.tool_name}]`
+            if (ib?.type === "tool_reference" && typeof ib.tool_name === "string") {
+              return `[Tool reference: ${renderToolName ? renderToolName(ib.tool_name) : ib.tool_name}]`
+            }
             return ""
           })
           .filter(Boolean)
@@ -615,7 +619,7 @@ function buildFreshPrompt(
       if (m.role !== "assistant") {
         structured.push({
           type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content), false, undefined, renderToolName) },
           parent_tool_use_id: null,
         })
       } else {
@@ -648,7 +652,7 @@ function buildFreshPrompt(
         const assistantText = flattenAssistantContent(m.content, renderToolName)
         return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
       }
-      return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
+      return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex, renderToolName) }
     })
   )
 }
@@ -4107,7 +4111,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     stripCacheControlDeep(m.content),
                     Boolean(passthroughToolCallAssistantUuid),
                     undefined,
-                    clientToolSearch ? undefined : renderReplayToolName,
+                    renderReplayToolName,
+                    !clientToolSearch,
                   ) },
                   parent_tool_use_id: null,
                 })
@@ -4124,7 +4129,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     stripCacheControlDeep(m.content),
                     Boolean(passthroughToolCallAssistantUuid),
                     undefined,
-                    clientToolSearch ? undefined : renderReplayToolName,
+                    renderReplayToolName,
+                    !clientToolSearch,
                   ) },
                   parent_tool_use_id: null,
                 })
@@ -4177,7 +4183,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
                 return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
               }
-              return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
+              return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex, renderReplayToolName) }
             })
           // Fresh (non-resume) replays get the #619 anti-self-play envelope:
           // history framed as context-only, the live user message terminal.
@@ -4194,7 +4200,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             // `env`, which only the CLI resolves; skip the breakpoint then.
             && settingSources.length === 0) {
             const blocks = layoutReplayBlocks(replayMessages.map((m: { role: string; content: any }) => {
-              if (m.role !== "assistant") return { role: m.role, parts: flattenUserContentParts(m.content, sanitizeOpts, toolIndex) }
+              if (m.role !== "assistant") return { role: m.role, parts: flattenUserContentParts(m.content, sanitizeOpts, toolIndex, renderReplayToolName) }
               const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
               const clientMarked = Array.isArray(m.content) && m.content.some((block: any) => Boolean(block?.cache_control))
               return { role: "assistant", parts: assistantText ? [{ text: `[Assistant: ${assistantText}]`, clientMarked }] : [] }

@@ -176,6 +176,32 @@ describe("faithful tool history rendering", () => {
     }])
   })
 
+  it("renders a tool_reference as text under the registered name when the CLI keeps no references", () => {
+    const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "mcp__graph__graph_update" },
+    ] }]
+    const render = createPassthroughReplayToolNameRenderer(["ToolSearch", "mcp__graph__graph_update"])
+    expect(normalizeStructuredUserContent(content, true, undefined, render, false)).toEqual([{
+      type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+        { type: "text", text: "[Tool reference: mcp__oc__mcp__graph__graph_update]" },
+      ],
+    }])
+  })
+
+  it("renders a historical tool_reference under the registered name when a renderer is supplied", () => {
+    const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
+      { type: "tool_reference", tool_name: "mcp__graph__graph_update" },
+      { type: "tool_reference", tool_name: "never_sent" },
+    ] }]
+    const render = createPassthroughReplayToolNameRenderer(["mcp__graph__graph_update"])
+    expect(normalizeStructuredUserContent(content, false, undefined, render)).toEqual([
+      expect.objectContaining({ type: "text" }),
+      { type: "text", text: "[Tool reference: mcp__oc__mcp__graph__graph_update]" },
+      // A tool the request does not register keeps its own name: nothing callable is implied.
+      { type: "text", text: "[Tool reference: never_sent]" },
+    ])
+  })
+
   it("renders a historical tool_reference as text under the client's name", () => {
     const content = [{ type: "tool_result", tool_use_id: call.id, is_error: false, content: [
       { type: "tool_reference", tool_name: "mcp__graph__graph_update" },

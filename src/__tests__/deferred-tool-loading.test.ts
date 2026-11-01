@@ -462,8 +462,11 @@ describe("client-owned tool search — one search path", () => {
 
     expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
     expect(capturedQueryParams.options.tools).toEqual([])
-    // No resumable session in the harness: the reference reaches the SDK as replay text.
-    expect(JSON.stringify(capturedQueryParams.prompt)).toContain("[Tool reference: mcp__graph__graph_update]")
+    // No resumable session in the harness: the reference reaches the SDK as
+    // replay text naming the registered tool, never the bare client name (#1107).
+    const prompt = JSON.stringify(capturedQueryParams.prompt)
+    expect(prompt).toContain("[Tool reference: mcp__oc__mcp__graph__graph_update]")
+    expect(prompt).not.toContain("[Tool reference: mcp__graph__graph_update]")
     const registration = capturedMcpRegistrations.at(-1)
     const definitions = registration?.tools ?? []
     const names = definitions.map(definition => definition.name)
