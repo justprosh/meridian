@@ -657,6 +657,27 @@ function resolveSystemPrompt(
   return { systemPrompt: { type: "preset", preset: "claude_code", append: tailNotes } }
 }
 
+/**
+ * The model the primary query names when an explicit pin meets a [1m] alias.
+ *
+ * explicitModelPin leaves extended context to the alias: the CLI resolves
+ * `fable[1m]` to `<pin>[1m]` itself — but only for models it already knows.
+ * A model newer than the bundled CLI (claude-fable-5-2 on 2.1.296) loses the
+ * suffix and runs at 200k, so the primary query names `<pin>[1m]` directly.
+ * The tier pin itself stays bare: native Task agents ride the base alias
+ * through it and must keep the base window. Computed from the alias this
+ * query sends, so a fallback that strips [1m] also drops the explicit window.
+ */
+export function primaryModelWithWindow(
+  model: string,
+  envOverrides: Record<string, string | undefined> | undefined,
+): string {
+  if (!model.endsWith("[1m]")) return model
+  const pin = envOverrides?.[`ANTHROPIC_DEFAULT_${model.slice(0, -"[1m]".length).toUpperCase()}_MODEL`]
+  if (!pin) return model
+  return pin.endsWith("[1m]") ? pin : `${pin}[1m]`
+}
+
 export function buildQueryOptions(ctx: QueryContext, abortController?: AbortController): BuildQueryResult {
   const {
     prompt, model, workingDirectory, clientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
@@ -720,7 +741,7 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       executable: "node" as const,
       maxTurns,
       cwd: workingDirectory,
-      model,
+      model: primaryModelWithWindow(model, ctx.envOverrides),
       pathToClaudeCodeExecutable: claudeExecutable,
       ...(abortController ? { abortController } : {}),
       // Passthrough needs them on BOTH paths, not just streaming: the deny-hold
