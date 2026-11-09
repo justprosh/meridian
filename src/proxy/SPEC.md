@@ -91,6 +91,13 @@ Contract*, *Cancellation Contract*; public routes and headers are in
   (Mythos follows Fable). Values are normalized; an unrecognized value warns
   once and keeps the default, because with Extra Usage enabled a silent 1M
   choice is silently billed. A generic multi-tier switch was rejected.
+- **An explicit pin names the primary query's window.** When a fully-versioned
+  id pins its tier (#631) and the query's alias is `[1m]`, the primary query
+  runs as `<pin>[1m]`: the CLI applies the alias suffix only to models it
+  knows, so a model newer than the bundled CLI would otherwise run at 200k.
+  The tier pin stays bare, so native Task agents on the base alias keep the
+  base window. Each query derives it from its alias, so stripping `[1m]` on
+  fallback drops the explicit window too.
 - **Passthrough tool sets are shared by content, never by lifetime.** Sessions
   sending identical tools share one built definition set (#1410) and one raw
   tool list (#1444), found through process-wide indexes keyed by a digest of

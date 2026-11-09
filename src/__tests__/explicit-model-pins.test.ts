@@ -74,12 +74,14 @@ describe("canonical fable pin", () => {
 // ---------- integration: pins reach the SDK subprocess env ----------
 
 let queryEnvs: Array<Record<string, string | undefined>> = []
+let queryModels: Array<string | undefined> = []
 
 import { resolveMockSdkSessionId } from "./helpers"
 
 installSdkMock(() => ({
   query: (opts: any) => {
     queryEnvs.push(opts.options?.env || {})
+    queryModels.push(opts.options?.model)
     return (async function* () {
       yield {
         type: "assistant",
@@ -126,6 +128,7 @@ describe("explicit model pins reach the subprocess env (#631)", () => {
   beforeEach(async () => {
     await clearSessionCache()
     queryEnvs = []
+    queryModels = []
   })
 
   it("claude-sonnet-5-5 pins the sonnet tier for the request", async () => {
@@ -147,6 +150,14 @@ describe("explicit model pins reach the subprocess env (#631)", () => {
     const res = await post(app, "claude-opus-4-7")
     expect(res.status).toBe(200)
     expect(queryEnvs[0]!.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-4-7")
+  })
+
+  it("a fable id newer than the bundled CLI names its 1M window on the primary query", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, "claude-fable-5-2")
+    expect(res.status).toBe(200)
+    expect(queryModels[0]).toBe("claude-fable-5-2[1m]")
+    expect(queryEnvs[0]!.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5-2")
   })
 
   it("bare sonnet resolves via the canonical pin (now Sonnet 5.5)", async () => {

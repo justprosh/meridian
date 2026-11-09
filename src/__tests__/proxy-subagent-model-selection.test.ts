@@ -132,7 +132,7 @@ describe("Subagent model selection", () => {
 
   it("primary agent with opus gets opus[1m]", async () => {
     await post({ ...BASE_REQUEST, model: "claude-opus-4-6" }, { "x-opencode-agent-mode": "primary" })
-    expect(capturedModel).toBe("opus[1m]")
+    expect(capturedModel).toBe("claude-opus-4-6[1m]")
   })
 
   it("a generic subagent source selects base opus without the OpenCode mode header", async () => {
@@ -156,7 +156,7 @@ describe("Subagent model selection", () => {
       "x-session-affinity": "pi-compaction-session",
       "x-meridian-source": SIDE_CALL_SOURCE,
     })
-    expect(capturedModel).toBe("opus[1m]")
+    expect(capturedModel).toBe("claude-opus-4-6[1m]")
   })
 
   it("keeps an OpenCode V2 attached compaction on the conversation's 1M tier", async () => {
@@ -165,7 +165,7 @@ describe("Subagent model selection", () => {
     const headers: Record<string, string> = {}
     applyMeridianV2Headers(headers, { sessionID: "ses_long", agent: "compaction", traits: fallbackAgentTraits("compaction"), kind: "compaction" })
     await post({ ...BASE_REQUEST, model: "claude-opus-4-6" }, headers)
-    expect(capturedModel).toBe("opus[1m]")
+    expect(capturedModel).toBe("claude-opus-4-6[1m]")
   })
 
   it("preserves the legacy OpenCode mode header on non-OpenCode adapters", async () => {
@@ -189,7 +189,7 @@ describe("Subagent model selection", () => {
       "x-opencode-agent-mode": "primary",
     })
     if (response.status !== 200) throw new Error(await response.text())
-    expect(capturedModel).toBe("opus[1m]")
+    expect(capturedModel).toBe("claude-opus-4-6[1m]")
     expect(Object.keys(capturedOptions.agents).length).toBeGreaterThan(0)
     for (const def of Object.values(capturedOptions.agents) as any[]) {
       expect(def.model).toBe("opus")

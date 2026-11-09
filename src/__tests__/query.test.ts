@@ -118,6 +118,30 @@ describe("buildQueryOptions", () => {
     expect(result.options.env?.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("0")
   })
 
+  describe("explicit pin under an extended-context alias", () => {
+    const built = (model: string, envOverrides?: Record<string, string>) =>
+      buildQueryOptions(makeContext({ model, envOverrides })).options
+
+    it("names the pinned model and its 1M window, which a CLI that predates the model would drop", () => {
+      const options = built("fable[1m]", { ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-2" })
+      expect(options.model).toBe("claude-fable-5-2[1m]")
+      expect(built("opus[1m]", { ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5" }).model).toBe("claude-opus-5-5[1m]")
+    })
+
+    it("keeps the tier pin bare, so base-alias Task agents keep the base window", () => {
+      const options = built("fable[1m]", { ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-2" })
+      expect(options.env?.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5-2")
+    })
+
+    it("keeps the alias at the base window, without a pin, or with another tier's pin", () => {
+      expect(built("fable", { ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-2" }).model).toBe("fable")
+      expect(built("fable[1m]").model).toBe("fable[1m]")
+      expect(built("fable[1m]", { ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5" }).model).toBe("fable[1m]")
+      expect(built("fable[1m]", { ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-2[1m]" }).model)
+        .toBe("claude-fable-5-2[1m]")
+    })
+  })
+
   it("keeps the quiet defaults in passthrough mode", () => {
     const env = buildQueryOptions(makeContext({ passthrough: true })).options.env ?? {}
     expect(env.DISABLE_TELEMETRY).toBe("1")
