@@ -350,7 +350,7 @@ describe("client stop on /v1/messages", () => {
 
     expect(calls[2]!.resume).toBeUndefined()
     expect(JSON.stringify(calls[2]!.prompt)).toContain("<conversation_history>")
-    expect(requestLine).toContain("lineage=continuation session=new replay=unproved-sdk-prefix")
+    expect(requestLine).toMatch(/lineage=continuation(?: conv=\S+)? session=new replay=unproved-sdk-prefix/)
   })
 
   it("resumes normally once the interrupted turn is decided", async () => {
