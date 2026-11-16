@@ -5,7 +5,10 @@
  * would invalidate the copy oc-codex-multi-auth holds and permanently break
  * that account with `refresh_token_reused`, requiring the operator to log in
  * again by hand. The same applies to writing the pool file: it is another
- * process's state, and Meridian is only a reader of it.
+ * process's state, and Meridian is only a reader of it. Redeeming a banked
+ * rate-limit reset (`resetCredit.ts`) is the one sanctioned mutation: an
+ * explicit, operator-requested state change at chatgpt.com's consume endpoint
+ * that touches neither the pool nor any token endpoint.
  *
  * These are the tests that make that guarantee structural rather than a matter
  * of remembering. They scan the integration's own source, so a future change
@@ -124,13 +127,21 @@ describe("the Codex integration cannot refresh a token", () => {
     }
   })
 
-  test("issues no mutating HTTP method", () => {
+  test("issues no mutating HTTP method outside the reset-credit redeem", () => {
+    // The one sanctioned mutation is redeeming a banked rate-limit reset
+    // (resetCredit.ts) against the fixed chatgpt.com consume endpoint — an
+    // account-held state change the operator asks for explicitly, never a
+    // pool write or a token exchange. Every other module in this folder stays
+    // read-only, and resetCredit.ts carries exactly one POST.
     for (const { name, text } of codexSources()) {
+      if (name === "resetCredit.ts") continue
       const source = withoutComments(text)
       for (const verb of ["POST", "PUT", "PATCH", "DELETE"]) {
         expect(`${name}:${source.includes(`"${verb}"`)}`).toBe(`${name}:false`)
       }
     }
+    const redeem = withoutComments(readFileSync(join(CODEX_DIR, "resetCredit.ts"), "utf-8"))
+    expect(redeem.split(`"POST"`).length - 1).toBe(1)
   })
 
   test("addresses only the fixed ChatGPT origin", () => {
