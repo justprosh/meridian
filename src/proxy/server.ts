@@ -11977,7 +11977,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       return c.json({ code: "invalid_request", error: "Explicit profile, grantId and requestId are required" }, 400)
     }
     const body = parsed.data
-    // The grant's shape names the provider: a `CodexRateLimitResetCredit_…` id
+    // The grant's shape names the provider: a `RateLimitResetCredit_…` id
     // redeems a ChatGPT seat's banked reset, anything else goes to Anthropic.
     // Neither shape can reach the other provider.
     if (CODEX_RESET_CREDIT_ID_PATTERN.test(body.grantId)) {

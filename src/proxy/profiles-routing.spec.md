@@ -185,7 +185,7 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
   `requestId` redeems one. Meridian never redeems automatically (not on a
   refusal, failover, cooldown or poll) and never retries the mutation: a reset
   spends a scarce grant, and Anthropic does not promise to deduplicate it.
-  The grant's shape names the provider: a `CodexRateLimitResetCredit_<32 hex>`
+  The grant's shape names the provider: a `RateLimitResetCredit_<32 hex>`
   id redeems a ChatGPT seat's banked reset on the same route (chatgpt-backend
   spec) and can never reach Anthropic, nor a Claude grant a seat.
 - **One redemption per profile, remembered per request ID.** While a

@@ -28,7 +28,7 @@ import type { CodexPoolAccount } from "../proxy/codex/pool"
 const ACCOUNT_ID = "aaaaaaaa-1111-4111-8111-aaaaaaa1b2c3"
 const USER_ID = "user-ABC"
 const ACCOUNT_USER_ID = `${USER_ID}__${ACCOUNT_ID}`
-const CREDIT_ID = `CodexRateLimitResetCredit_${"a1b2".repeat(8)}`
+const CREDIT_ID = `RateLimitResetCredit_${"a1b2".repeat(8)}`
 const INPUT = { creditId: CREDIT_ID, requestId: "Request-1" }
 
 function makeToken(overrides: Record<string, unknown> = {}, expSeconds = Math.floor(Date.now() / 1000) + 3600): string {
@@ -233,21 +233,21 @@ describe("the credit list the route's ids come from", () => {
           available_count: 2,
           credits: [
             { id: CREDIT_ID, reset_type: "codex_rate_limits", is_supported_by_plan: true, status: "available", granted_at: "2026-11-01T00:00:00Z", expires_at: later, title: "Full reset", description: "Resets your rate limits" },
-            { id: `CodexRateLimitResetCredit_${"f".repeat(32)}`, status: "redeemed", expires_at: soonest, title: "Full reset" },
-            { id: `CodexRateLimitResetCredit_${"e".repeat(32)}`, status: "available", expires_at: soonest },
+            { id: `RateLimitResetCredit_${"f".repeat(32)}`, status: "redeemed", expires_at: soonest, title: "Full reset" },
+            { id: `RateLimitResetCredit_${"e".repeat(32)}`, status: "available", expires_at: soonest },
           ],
         }))
     const result = await fetchCodexAccountUsage(credentials(), { fetchImpl: impl })
     expect(result.usage?.resetCredits?.credits).toEqual([
-      { status: "available", id: `CodexRateLimitResetCredit_${"e".repeat(32)}`, title: null, expiresAt: Date.parse(soonest) },
+      { status: "available", id: `RateLimitResetCredit_${"e".repeat(32)}`, title: null, expiresAt: Date.parse(soonest) },
       { status: "available", id: CREDIT_ID, title: "Full reset", expiresAt: Date.parse(later) },
     ])
   })
 
   test("the pattern the route accepts matches exactly the vendor's id shape", () => {
     expect(CODEX_RESET_CREDIT_ID_PATTERN.test(CREDIT_ID)).toBe(true)
-    expect(CODEX_RESET_CREDIT_ID_PATTERN.test(`CodexRateLimitResetCredit_${"A1".repeat(16)}`)).toBe(false)
-    expect(CODEX_RESET_CREDIT_ID_PATTERN.test(`CodexRateLimitResetCredit_${"a".repeat(31)}`)).toBe(false)
+    expect(CODEX_RESET_CREDIT_ID_PATTERN.test(`RateLimitResetCredit_${"A1".repeat(16)}`)).toBe(false)
+    expect(CODEX_RESET_CREDIT_ID_PATTERN.test(`RateLimitResetCredit_${"a".repeat(31)}`)).toBe(false)
     expect(CODEX_RESET_CREDIT_ID_PATTERN.test("grant_1")).toBe(false)
   })
 })
@@ -317,7 +317,7 @@ describe("single-flight and request-ID replay", () => {
   test("a repeated request ID with a different credit is a conflict and sends nothing", async () => {
     const { impl, calls } = consumeFetch(() => consume({ outcome: "nothing_to_reset" }))
     await redeemCodexResetCreditOnce("seat-a", INPUT, credentials(), { fetchImpl: impl })
-    const conflict = await redeemCodexResetCreditOnce("seat-a", { ...INPUT, creditId: `CodexRateLimitResetCredit_${"b".repeat(32)}` }, credentials(), { fetchImpl: impl })
+    const conflict = await redeemCodexResetCreditOnce("seat-a", { ...INPUT, creditId: `RateLimitResetCredit_${"b".repeat(32)}` }, credentials(), { fetchImpl: impl })
     expect(conflict).toEqual({ kind: "request_id_conflict" })
     expect(calls).toHaveLength(1)
   })

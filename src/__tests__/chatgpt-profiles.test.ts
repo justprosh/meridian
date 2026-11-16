@@ -271,10 +271,10 @@ describe("banked resets on the card", () => {
     const view = chatGptResetsView(resets({
       availableCount: 2,
       listedCount: 2,
-      credits: [credit("CodexRateLimitResetCredit_" + "a".repeat(32), NOW + 5, "Full reset"), credit(null, NOW + 9)],
+      credits: [credit("RateLimitResetCredit_" + "a".repeat(32), NOW + 5, "Full reset"), credit(null, NOW + 9)],
     }))
     expect(view?.credits).toEqual([
-      { id: `CodexRateLimitResetCredit_${"a".repeat(32)}`, expiresAt: NOW + 5, title: "Full reset" },
+      { id: `RateLimitResetCredit_${"a".repeat(32)}`, expiresAt: NOW + 5, title: "Full reset" },
       { id: null, expiresAt: NOW + 9, title: null },
     ])
   })
@@ -392,7 +392,7 @@ describe("list entries", () => {
       entry("user-a__ws-aaaaaa", {
         fetchedAt: NOW - 20_000,
         workspaceName: "Acme Workspace",
-        resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", id: "CodexRateLimitResetCredit_" + "c".repeat(32), title: null, expiresAt: NOW + 13 * 86_400_000 }], error: null },
+        resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", id: "RateLimitResetCredit_" + "c".repeat(32), title: null, expiresAt: NOW + 13 * 86_400_000 }], error: null },
       }),
       entry("user-b__ws-bbbbbb", { error: "token_expired", failure: { reason: "token_expired", consecutiveFailures: 3, lastFailureAt: NOW - 5_000 } }),
       entry("user-c__ws-cccccc", { error: "unauthorized" }),
@@ -452,7 +452,7 @@ describe("quota entries", () => {
 
   it("carries the seat's banked resets with their ids, and none for a seat whose list is unknown", () => {
     const resetCredits = { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, error: null,
-      credits: [{ status: "available", id: "CodexRateLimitResetCredit_0123456789abcdef0123456789abcdef", title: "Full reset", expiresAt: NOW + 86_400_000 }] }
+      credits: [{ status: "available", id: "RateLimitResetCredit_0123456789abcdef0123456789abcdef", title: "Full reset", expiresAt: NOW + 86_400_000 }] }
     const [a, b] = createChatGptProfileSurface({
       source: { mode: "follow-external", seats: () => seats } as unknown as ChatGptCredentialSource,
       observed: () => new Map() as never,
@@ -460,7 +460,7 @@ describe("quota entries", () => {
       reserved: () => new Set(), names: () => undefined, activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
     }).quotaEntries()
     expect(a!.resets).toEqual({ available: 1, expiresAt: [NOW + 86_400_000],
-      credits: [{ id: "CodexRateLimitResetCredit_0123456789abcdef0123456789abcdef", title: "Full reset", expiresAt: NOW + 86_400_000 }] })
+      credits: [{ id: "RateLimitResetCredit_0123456789abcdef0123456789abcdef", title: "Full reset", expiresAt: NOW + 86_400_000 }] })
     expect(b!.resets).toBeNull()
   })
 

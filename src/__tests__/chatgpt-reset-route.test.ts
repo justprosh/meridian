@@ -30,7 +30,7 @@ installLoggerMock(() => ({
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-const CREDIT_ID = `CodexRateLimitResetCredit_${"a1b2".repeat(8)}`
+const CREDIT_ID = `RateLimitResetCredit_${"a1b2".repeat(8)}`
 const ACCOUNT_ID = "aaaaaaaa-1111-4111-8111-aaaaaaa1b2c3"
 const SEAT = `user-ABC__${ACCOUNT_ID}`
 const CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"

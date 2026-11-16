@@ -520,11 +520,11 @@ export interface FetchOAuthUsageOpts {
 
 export const quotaResetBody = z.object({
   profile: z.string().min(1),
-  // A Claude grant id, or a ChatGPT reset credit's — `CodexRateLimitResetCredit_`
+  // A Claude grant id, or a ChatGPT reset credit's — `RateLimitResetCredit_`
   // plus 32 hex digits (codex/resetCredit.ts). The shape alone does not decide
   // the provider: the route checks the grant against the profile's provider
   // before dispatch, so a credit id cannot reach Anthropic and vice versa.
-  grantId: z.string().regex(/^(?:[a-z0-9_-]{1,40}|CodexRateLimitResetCredit_[0-9a-f]{32})$/),
+  grantId: z.string().regex(/^(?:[a-z0-9_-]{1,40}|RateLimitResetCredit_[0-9a-f]{32})$/),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
 }).strict()
 
