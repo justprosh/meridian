@@ -242,23 +242,45 @@ describe("banked resets on the card", () => {
   const resets = (extra: Partial<NonNullable<CodexUsageEntry["resetCredits"]>>) => ({
     availableCount: null, applicableAvailableCount: null, listedCount: null, credits: null, error: null, ...extra,
   })
+  const credit = (id: string | null, expiresAt: number | null, title: string | null = null) => ({ status: "available", id, title, expiresAt })
 
   it("is unknown without a count, and zero is a count", () => {
     expect(chatGptResetsView(null)).toBeNull()
     expect(chatGptResetsView(resets({}))).toBeNull()
     expect(chatGptResetsView(resets({ availableCount: 1.5 }))).toBeNull()
-    expect(chatGptResetsView(resets({ availableCount: 0, listedCount: 0, credits: [] }))).toEqual({ available: 0, expiresAt: [] })
+    expect(chatGptResetsView(resets({ availableCount: 0, listedCount: 0, credits: [] }))).toEqual({ available: 0, expiresAt: [], credits: [] })
   })
 
   it("prefers the credit list's count and lists one expiry per reset, soonest first", () => {
-    const credits = [{ status: "available", expiresAt: NOW + 11 }, { status: "available", expiresAt: null }, { status: "available", expiresAt: NOW + 3 }]
-    expect(chatGptResetsView(resets({ availableCount: 1, listedCount: 3, credits }))).toEqual({ available: 3, expiresAt: [NOW + 3, NOW + 11, null] })
-    expect(chatGptResetsView(resets({ listedCount: 2, credits }))).toEqual({ available: 2, expiresAt: [NOW + 3, NOW + 11] })
-    expect(chatGptResetsView(resets({ listedCount: 2, credits: [credits[2]!] }))).toEqual({ available: 2, expiresAt: [NOW + 3, null] })
+    const named = (id: string | null, expiresAt: number | null) => ({ id, expiresAt, title: null })
+    const credits = [credit("c-11", NOW + 11), credit(null, null), credit("c-03", NOW + 3)]
+    expect(chatGptResetsView(resets({ availableCount: 1, listedCount: 3, credits }))).toEqual({
+      available: 3, expiresAt: [NOW + 3, NOW + 11, null],
+      credits: [named("c-03", NOW + 3), named("c-11", NOW + 11), named(null, null)],
+    })
+    expect(chatGptResetsView(resets({ listedCount: 2, credits }))).toEqual({
+      available: 2, expiresAt: [NOW + 3, NOW + 11],
+      credits: [named("c-03", NOW + 3), named("c-11", NOW + 11)],
+    })
+    expect(chatGptResetsView(resets({ listedCount: 2, credits: [credits[2]!] }))).toEqual({
+      available: 2, expiresAt: [NOW + 3, null], credits: [named("c-03", NOW + 3)],
+    })
+  })
+
+  it("carries each credit's id and title so a redemption can name one", () => {
+    const view = chatGptResetsView(resets({
+      availableCount: 2,
+      listedCount: 2,
+      credits: [credit("CodexRateLimitResetCredit_" + "a".repeat(32), NOW + 5, "Full reset"), credit(null, NOW + 9)],
+    }))
+    expect(view?.credits).toEqual([
+      { id: `CodexRateLimitResetCredit_${"a".repeat(32)}`, expiresAt: NOW + 5, title: "Full reset" },
+      { id: null, expiresAt: NOW + 9, title: null },
+    ])
   })
 
   it("falls back to the usage payload's count when the credit list could not be read", () => {
-    expect(chatGptResetsView(resets({ availableCount: 2, error: "upstream_error" }))).toEqual({ available: 2, expiresAt: null })
+    expect(chatGptResetsView(resets({ availableCount: 2, error: "upstream_error" }))).toEqual({ available: 2, expiresAt: null, credits: null })
   })
 })
 
@@ -370,7 +392,7 @@ describe("list entries", () => {
       entry("user-a__ws-aaaaaa", {
         fetchedAt: NOW - 20_000,
         workspaceName: "Acme Workspace",
-        resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", expiresAt: NOW + 13 * 86_400_000 }], error: null },
+        resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", id: "CodexRateLimitResetCredit_" + "c".repeat(32), title: null, expiresAt: NOW + 13 * 86_400_000 }], error: null },
       }),
       entry("user-b__ws-bbbbbb", { error: "token_expired", failure: { reason: "token_expired", consecutiveFailures: 3, lastFailureAt: NOW - 5_000 } }),
       entry("user-c__ws-cccccc", { error: "unauthorized" }),

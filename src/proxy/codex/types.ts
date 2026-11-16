@@ -87,6 +87,14 @@ export interface CodexPlan {
 export interface CodexResetCredit {
   /** Vendor status; only "available" credits are listed. */
   status: string
+  /**
+   * The vendor's credit id — the `credit_id` a redemption consumes. Null when
+   * the list omitted it; such a credit still counts towards what the seat
+   * holds, but cannot be redeemed by name.
+   */
+  id: string | null
+  /** The vendor's display title, e.g. "Full reset"; null when absent. */
+  title: string | null
   /** Epoch milliseconds, or null when unparseable. */
   expiresAt: number | null
 }

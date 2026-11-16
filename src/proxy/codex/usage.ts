@@ -38,10 +38,8 @@ const DEFAULT_TIMEOUT_MS = 10_000
 const WORKSPACE_NAME_MAX_CHARS = 64
 
 /**
- * The client identity oc-codex-multi-auth's `createCodexHeaders` sends to
- * these endpoints - originator, beta flag and Codex user agent - so Meridian
- * reads usage and reset credits exactly as `codex-reset status` does. The
- * version is the plugin's own default (`DEFAULT_CODEX_CLIENT_VERSION`).
+ * The Codex CLI version the client identity below names. It is the plugin's
+ * own default (`DEFAULT_CODEX_CLIENT_VERSION`).
  */
 const CODEX_CLIENT_VERSION = "0.155.0"
 const PLATFORM_LABELS: Record<string, string> = { win32: "Windows", darwin: "Mac OS", linux: "Linux" }
@@ -192,9 +190,11 @@ type UsableToken = { token: string; claims: CodexTokenClaims } | { error: CodexU
  * The access token, when it may be sent at all: present, decodable, not
  * expired, and filed under the account it claims. Checked before the
  * credential leaves the process - if the token belongs to a different account
- * than the pool record says, no request is made.
+ * than the pool record says, no request is made. The reset-credit redeem
+ * (`resetCredit.ts`) runs the same check before it will dispatch, since a
+ * redemption against the wrong account is a misfire, not a failure.
  */
-function usableToken(credentials: CodexCredentials, now: number): UsableToken {
+export function usableToken(credentials: CodexCredentials, now: number): UsableToken {
   const token = credentials.accessToken
   if (!token) return { error: "no_token" }
   const claims = decodeCodexToken(token)
@@ -215,13 +215,15 @@ interface JsonResult {
   error: CodexRemoteError | null
 }
 
-async function getJson(
-  doFetch: typeof fetch,
-  url: string,
-  token: string,
-  accountId: string | null,
-  timeoutMs: number | undefined,
-): Promise<JsonResult> {
+/**
+ * The request identity every `wham/*` call presents: oc-codex-multi-auth's
+ * `createCodexHeaders` identity - originator, beta flag and Codex user agent -
+ * so Meridian reads usage, reset credits and redeems a reset exactly as
+ * `codex-reset` does. The version is the plugin's own default
+ * (`DEFAULT_CODEX_CLIENT_VERSION`). Shared with `resetCredit.ts` so the redeem
+ * cannot drift from the read identity.
+ */
+export function codexRequestHeaders(token: string, accountId: string | null): Record<string, string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     Accept: "application/json",
@@ -230,14 +232,23 @@ async function getJson(
     "User-Agent": codexUserAgent(),
   }
   // Without this header the endpoint answers with an empty account_id, which
-  // would fail validation below.
+  // the usage read would reject as an identity mismatch.
   if (accountId) headers["ChatGPT-Account-ID"] = accountId
+  return headers
+}
 
+async function getJson(
+  doFetch: typeof fetch,
+  url: string,
+  token: string,
+  accountId: string | null,
+  timeoutMs: number | undefined,
+): Promise<JsonResult> {
   let response: Response
   try {
     response = await doFetch(url, {
       method: "GET",
-      headers,
+      headers: codexRequestHeaders(token, accountId),
       // A bearer credential must never be replayed to a redirect target.
       redirect: "error",
       signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS),
@@ -340,7 +351,12 @@ function availableCredits(value: unknown): CodexResetCredit[] {
     if (credit?.status !== "available") continue
     const expiresAtRaw = stringOrNull(credit.expires_at)
     const parsed = expiresAtRaw ? Date.parse(expiresAtRaw) : Number.NaN
-    credits.push({ status: "available", expiresAt: Number.isFinite(parsed) ? parsed : null })
+    credits.push({
+      status: "available",
+      id: stringOrNull(credit.id),
+      title: stringOrNull(credit.title),
+      expiresAt: Number.isFinite(parsed) ? parsed : null,
+    })
   }
   return credits.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY))
 }
