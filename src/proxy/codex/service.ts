@@ -66,6 +66,22 @@ export function resetCodexUsageCache(): void {
 }
 
 /**
+ * Forget one seat's cached usage, held-off cooldown and failure run — every
+ * entry keyed (as `cacheKey` keys them) on the seat's `accountUserId`.
+ *
+ * Called after a dispatched reset-credit redemption, so the next read shows
+ * the reset instead of serving the pre-reset windows for a full cache
+ * lifetime. An in-flight read is left alone: it is already on the wire, and
+ * its own `finally` owns its entry.
+ */
+export function invalidateCodexUsageForSeat(accountUserId: string): void {
+  const prefix = `${accountUserId}|`
+  for (const key of [...lastGood.keys()]) if (key.startsWith(prefix)) lastGood.delete(key)
+  for (const key of [...heldOffUntil.keys()]) if (key.startsWith(prefix)) heldOffUntil.delete(key)
+  for (const key of [...failureRuns.keys()]) if (key.startsWith(prefix)) failureRuns.delete(key)
+}
+
+/**
  * Bound concurrent upstream work process-wide.
  *
  * A finishing task hands its slot straight to the next waiter rather than

@@ -348,13 +348,24 @@ export function planChatGptRename(input: {
  * A seat's banked rate-limit resets as its card states them.
  *
  * `expiresAt` holds one entry per banked reset, soonest first; null for one
- * whose expiry is not known. The whole list is null when the per-credit lookup
- * failed and only the count is known; the view itself is null when not even
- * the count is (no valid token to ask with, or both reads failed).
+ * whose expiry is not known. `credits` carries the resets themselves, soonest
+ * first and sliced to `available` like `expiresAt` — its `id` is what a
+ * redemption names, so a card can offer one. Unlike `expiresAt` it is not
+ * padded out to `available`: a padded entry would have to invent an id. Both
+ * lists are null when the per-credit lookup failed and only the count is
+ * known; the view itself is null when not even the count is (no valid token
+ * to ask with, or both reads failed).
  */
+export interface ChatGptResetsCredit {
+  id: string | null
+  expiresAt: number | null
+  title: string | null
+}
+
 export interface ChatGptResetsView {
   available: number
   expiresAt: Array<number | null> | null
+  credits: ChatGptResetsCredit[] | null
 }
 
 const soonestFirst = (a: number | null, b: number | null): number =>
@@ -363,12 +374,16 @@ const soonestFirst = (a: number | null, b: number | null): number =>
 export function chatGptResetsView(resets: CodexResetCredits | null | undefined): ChatGptResetsView | null {
   const available = resets ? resets.listedCount ?? resets.availableCount : null
   if (!resets || available === null || !Number.isInteger(available) || available < 0) return null
-  if (resets.credits === null) return { available, expiresAt: null }
+  if (resets.credits === null) return { available, expiresAt: null, credits: null }
   // One expiry per banked reset: the list may state more credits than its
   // count or fewer, and the count is what the seat holds.
   const expiresAt = resets.credits.map(credit => credit.expiresAt).sort(soonestFirst).slice(0, available)
   while (expiresAt.length < available) expiresAt.push(null)
-  return { available, expiresAt }
+  const credits = resets.credits
+    .map(credit => ({ id: credit.id, expiresAt: credit.expiresAt, title: credit.title }))
+    .sort((a, b) => soonestFirst(a.expiresAt, b.expiresAt))
+    .slice(0, available)
+  return { available, expiresAt, credits }
 }
 
 /** Who holds a seat's login, and what a person runs there for what Meridian will not do itself. */
