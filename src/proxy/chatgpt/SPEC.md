@@ -15,7 +15,8 @@ Serve OpenAI models from the operator's **ChatGPT subscription seats** (opt-in):
 passed through to the Codex backend on one seat, with seat failover, plan/credit
 policy, usage and cost telemetry. Also owns seat sign-in and renewal, the
 `meridian chatgpt-migrate` and `meridian instance-import` commands, and the
-read-only oc-codex usage view on the dashboard.
+oc-codex usage view on the dashboard — read-only except a seat's explicit
+banked-reset redemption.
 
 Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
 `src/proxy/upstream/`, `src/proxy/instanceImport/`, `backends/chatgpt*.ts`.
@@ -49,6 +50,16 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
     (`MERIDIAN_CREDENTIALS_READONLY`) treat a stamp younger than the exchange
     timeout plus 5 s as in flight, so they may lag a lost sign-in by up to
     about 20 s, and a stamp dated in the future is not trusted (#1463).
+- **Redemption is the integration's one sanctioned mutation**
+  (`codex/resetCredit.ts`). `/v1/usage/quota/reset` with a seat's credit id
+  dispatches exactly one explicit consume POST to the fixed
+  `chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume` with the
+  seat's own token — never a pool write, a lock or a token endpoint, and
+  never reached by the usage read. An expired or mismatched seat token is
+  refused before anything is sent; a ChatGPT token is never refreshed to
+  redeem. The request-ID ledger and `indeterminate` semantics are the Claude
+  path's (`../resetLedger.ts`), and every dispatched attempt drops the seat's
+  cached usage.
 - Seats are profiles with `type: "chatgpt"` and their own active pointer; they
   never live in Claude's profile config. All additions are absent unless
   ChatGPT is enabled, and existing fields keep their meaning

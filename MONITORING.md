@@ -84,10 +84,24 @@ Use `profile: "default"` for the single-account entry when no profiles are
 configured. API-key and static token-only profiles cannot redeem Claude grants
 and report `not_oauth`; token-only profiles also cannot read the host account's
 grant inventory under their own profile ID.
-`grantId` accepts 1–40 lowercase letters, digits, underscores or hyphens.
+`grantId` accepts 1–40 lowercase letters, digits, underscores or hyphens for a
+Claude grant, or a ChatGPT reset credit's `CodexRateLimitResetCredit_` plus 32
+hex digits for a ChatGPT seat.
 `requestId` accepts 1–64 letters, digits, underscores or hyphens.
 Generate a request ID once per intentional redemption and retain it with
 that operation.
+
+A ChatGPT seat's banked resets are redeemed through the same endpoint: name a
+`type: "chatgpt"` profile from `/profiles/list` and send one of its credit ids
+(the card's `resets.credits[].id`) as `grantId`. The request goes to
+chatgpt.com's consume endpoint with the seat's own access token and never to
+Anthropic; a Claude-shaped grant addressed to a seat, or a credit id addressed
+to a Claude profile, is refused with `not_oauth`. The response fields are the
+same; `result` is one of `reset`, `already_used`, `not_limited` or
+`unavailable` (the vendor's `already_redeemed`, `nothing_to_reset` and
+`no_credit`), and `cleared` repeats the vendor's `windows_reset` window names
+when present. An expired or missing seat token is refused with 503 `no_token`
+and nothing is sent; a ChatGPT token is never refreshed to redeem.
 
 The endpoint uses the selected profile's OAuth token to resolve its organization.
 It inherits API-key authentication and rejects cross-origin browser requests.

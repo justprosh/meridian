@@ -271,7 +271,7 @@ src/
 │   ├── backends/              ← Antigravity runtime (antigravity*.ts), ChatGPT backend, provider status
 │   ├── upstream/              ← Provider-neutral upstream seam: which provider serves a model
 │   ├── chatgpt/               ← ChatGPT seats: owned/follow-external sources, refresh, login; migrate/ CLI
-│   ├── codex/                 ← Read-only oc-codex-multi-auth pool reader and usage (never writes the pool)
+│   ├── codex/                 ← oc-codex-multi-auth pool reader and usage (never writes the pool); redeems a seat's banked reset
 │   ├── instanceImport/        ← `meridian instance-import` (never imported by the server)
 │   ├── openai.ts, openaiResponses.ts ← Pure OpenAI Chat Completions / Responses translation
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
