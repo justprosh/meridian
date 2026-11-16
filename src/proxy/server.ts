@@ -20,6 +20,7 @@ import { chatGptRefusalDiagnosis, createChatGptProfileSurface } from './chatgpt/
 import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
 import { getCodexUsage } from './codex/service'
+import { CODEX_RESET_CREDIT_ID_PATTERN, redeemCodexResetCreditOnce } from './codex/resetCredit'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
@@ -12003,10 +12004,58 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       return c.json({ code: "invalid_request", error: "Explicit profile, grantId and requestId are required" }, 400)
     }
     const body = parsed.data
+    // The grant's shape names the provider: a `CodexRateLimitResetCredit_…` id
+    // redeems a ChatGPT seat's banked reset, anything else goes to Anthropic.
+    // Neither shape can reach the other provider.
+    if (CODEX_RESET_CREDIT_ID_PATTERN.test(body.grantId)) {
+      const seatProfile = chatGptProfiles?.resolve(body.profile)
+      if (!seatProfile || !chatGptSource) {
+        const claude = getEffectiveProfiles(finalConfig.profiles).some(p => p.id === body.profile)
+        return claude
+          ? c.json({ code: "not_oauth", error: "Profile does not use ChatGPT" }, 400)
+          : c.json({ code: "profile_not_found", error: "Profile not found" }, 404)
+      }
+      // The seat's credentials, found the way the usage reading finds them:
+      // the source's pool, keyed by the profile's seat id, whichever mode
+      // holds the login. Eligibility marks do not gate a redemption — an
+      // exhausted seat is exactly the one whose banked reset matters — and an
+      // expired token is refused by the redeem itself, before dispatch.
+      const account = chatGptSource.usagePool().pool?.accounts.find(entry => entry.accountUserId === seatProfile.seat)
+      if (!account?.accessToken) {
+        return c.json({ code: "no_token", error: "The seat has no access token; nothing was sent", indeterminate: false }, 503)
+      }
+      const attempt = await redeemCodexResetCreditOnce(
+        seatProfile.id,
+        { creditId: body.grantId, requestId: body.requestId },
+        {
+          accountId: account.accountId,
+          accountUserId: account.accountUserId,
+          accessToken: account.accessToken,
+          email: account.email,
+        },
+      )
+      if (attempt.kind === "in_progress") {
+        return c.json({ code: "reset_in_progress", error: "Another reset for this profile is still in progress", indeterminate: false }, 409)
+      }
+      if (attempt.kind === "request_id_conflict") {
+        return c.json({ code: "request_id_conflict", error: "This requestId was already used with a different grantId", indeterminate: false }, 409)
+      }
+      const { result, replayed } = attempt
+      if (!replayed) chatGptUsageAt = 0
+      if (!result.ok) {
+        return c.json({ code: result.code, error: result.message, indeterminate: result.indeterminate, replayed }, result.status)
+      }
+      return c.json({ ...body, ...result.outcome, replayed })
+    }
     const profiles = getEffectiveProfiles(finalConfig.profiles)
     const profile = profiles.find(p => p.id === body.profile)
     const singleAccount = profiles.length === 0 && body.profile === "default"
     if (!profile && !singleAccount) {
+      // A ChatGPT seat addressed with a Claude grant id is refused rather
+      // than reported missing, now that this route knows seats exist.
+      if (chatGptProfiles?.resolve(body.profile)) {
+        return c.json({ code: "not_oauth", error: "Profile does not use Claude OAuth" }, 400)
+      }
       return c.json({ code: "profile_not_found", error: "Profile not found" }, 404)
     }
     const resolved = profile ? resolveProfile([profile], profile.id, profile.id) : undefined

@@ -32,6 +32,7 @@ import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
 import { followedUsageSnapshot } from "./followUsage"
 import { bundledClaudeCodeVersion } from "./models"
+import { createResetGate, type ResetAttempt } from "./resetLedger"
 
 // Policy for the query flag and User-Agent: profiles-routing.spec.md, "OAuth usage request identity".
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
@@ -557,7 +558,11 @@ export interface FetchOAuthUsageOpts {
 
 export const quotaResetBody = z.object({
   profile: z.string().min(1),
-  grantId: z.string().regex(/^[a-z0-9_-]{1,40}$/),
+  // A Claude grant id, or a ChatGPT reset credit's — `CodexRateLimitResetCredit_`
+  // plus 32 hex digits (codex/resetCredit.ts). The shape alone does not decide
+  // the provider: the route checks the grant against the profile's provider
+  // before dispatch, so a credit id cannot reach Anthropic and vice versa.
+  grantId: z.string().regex(/^(?:[a-z0-9_-]{1,40}|CodexRateLimitResetCredit_[0-9a-f]{32})$/),
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
 }).strict()
 
@@ -689,28 +694,9 @@ export async function redeemOAuthQuotaReset(
   }
 }
 
-const RESET_LEDGER_MAX_ENTRIES = 256
-const RESET_LEDGER_TTL_MS = 15 * 60_000
-/** Redemption currently running per ledger scope (profile). */
-const resetInflightByScope = new Map<string, { requestId: string; grantId: string }>()
-/** Settled, dispatched outcomes keyed by scope + request ID, oldest first. */
-const resetLedger = new Map<string, { grantId: string; result: OAuthResetResult; settledAt: number }>()
+const oauthResetGate = createResetGate<OAuthResetResult>()
 
-function resetLedgerKey(scope: string, requestId: string): string {
-  return `${scope}\u0000${requestId}`
-}
-
-function pruneResetLedger(now: number): void {
-  for (const [key, entry] of resetLedger) {
-    if (now - entry.settledAt < RESET_LEDGER_TTL_MS && resetLedger.size <= RESET_LEDGER_MAX_ENTRIES) break
-    resetLedger.delete(key)
-  }
-}
-
-export type OAuthResetAttempt =
-  | { kind: "settled"; result: OAuthResetResult; replayed: boolean }
-  | { kind: "in_progress" }
-  | { kind: "request_id_conflict" }
+export type OAuthResetAttempt = ResetAttempt<OAuthResetResult>
 
 /**
  * The route's entry point: at most one redemption per profile at a time, and a
@@ -721,32 +707,11 @@ export async function redeemOAuthQuotaResetOnce(
   input: OAuthQuotaResetRequest,
   opts?: Parameters<typeof redeemOAuthQuotaReset>[1],
 ): Promise<OAuthResetAttempt> {
-  const scope = input.profile
-  const key = resetLedgerKey(scope, input.requestId)
-  pruneResetLedger(Date.now())
-  const settled = resetLedger.get(key)
-  if (settled) {
-    return settled.grantId === input.grantId
-      ? { kind: "settled", result: settled.result, replayed: true }
-      : { kind: "request_id_conflict" }
-  }
-  const running = resetInflightByScope.get(scope)
-  if (running) {
-    return running.requestId === input.requestId && running.grantId !== input.grantId
-      ? { kind: "request_id_conflict" }
-      : { kind: "in_progress" }
-  }
-  resetInflightByScope.set(scope, { requestId: input.requestId, grantId: input.grantId })
-  try {
-    const result = await redeemOAuthQuotaReset(input, opts)
-    if (result.ok || result.dispatched) {
-      resetLedger.set(key, { grantId: input.grantId, result, settledAt: Date.now() })
-      pruneResetLedger(Date.now())
-    }
-    return { kind: "settled", result, replayed: false }
-  } finally {
-    resetInflightByScope.delete(scope)
-  }
+  return oauthResetGate.once(
+    input.profile,
+    { requestId: input.requestId, grantId: input.grantId },
+    () => redeemOAuthQuotaReset(input, opts),
+  )
 }
 
 /**
@@ -1003,6 +968,5 @@ export function resetOAuthUsageCache(): void {
   failureByProfile.clear()
   rateLimitRunByProfile.clear()
   lastRateLimitRefreshAtByProfile.clear()
-  resetInflightByScope.clear()
-  resetLedger.clear()
+  oauthResetGate.clear()
 }
