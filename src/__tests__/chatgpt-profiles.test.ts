@@ -450,6 +450,20 @@ describe("quota entries", () => {
     expect(b).toMatchObject({ credits: null, failure: null })
   })
 
+  it("carries the seat's banked resets with their ids, and none for a seat whose list is unknown", () => {
+    const resetCredits = { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, error: null,
+      credits: [{ status: "available", id: "CodexRateLimitResetCredit_0123456789abcdef0123456789abcdef", title: "Full reset", expiresAt: NOW + 86_400_000 }] }
+    const [a, b] = createChatGptProfileSurface({
+      source: { mode: "follow-external", seats: () => seats } as unknown as ChatGptCredentialSource,
+      observed: () => new Map() as never,
+      usage: () => ({ asOf: NOW, error: null, entries: [entry("user-a__ws-aaaaaa", { resetCredits }), entry("user-b__ws-bbbbbb", {})] }),
+      reserved: () => new Set(), names: () => undefined, activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
+    }).quotaEntries()
+    expect(a!.resets).toEqual({ available: 1, expiresAt: [NOW + 86_400_000],
+      credits: [{ id: "CodexRateLimitResetCredit_0123456789abcdef0123456789abcdef", title: "Full reset", expiresAt: NOW + 86_400_000 }] })
+    expect(b!.resets).toBeNull()
+  })
+
   it("drops a failed usage check once a response's headers gave newer figures", () => {
     const [a] = quota(new Map([["user-a__ws-aaaaaa", { at: NOW + 1_000, rateLimit: { primary_window: { used_percent: 45, limit_window_seconds: 604_800, reset_at: (NOW + 86_400_000) / 1000 } } }]]))
     expect(a).toMatchObject({ windowSource: "headers", failure: null, credits })
