@@ -85,7 +85,7 @@ configured. API-key and static token-only profiles cannot redeem Claude grants
 and report `not_oauth`; token-only profiles also cannot read the host account's
 grant inventory under their own profile ID.
 `grantId` accepts 1–40 lowercase letters, digits, underscores or hyphens for a
-Claude grant, or a ChatGPT reset credit's `CodexRateLimitResetCredit_` plus 32
+Claude grant, or a ChatGPT reset credit's `RateLimitResetCredit_` plus 32
 hex digits for a ChatGPT seat.
 `requestId` accepts 1–64 letters, digits, underscores or hyphens.
 Generate a request ID once per intentional redemption and retain it with

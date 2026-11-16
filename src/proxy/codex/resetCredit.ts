@@ -38,7 +38,7 @@ const CONSUME_URL = `${CHATGPT_ORIGIN}/backend-api/wham/rate-limit-reset-credits
 const DEFAULT_TIMEOUT_MS = 10_000
 
 /** The shape of a redeemable credit id, as the credit list states it. */
-export const CODEX_RESET_CREDIT_ID_PATTERN = /^CodexRateLimitResetCredit_[0-9a-f]{32}$/
+export const CODEX_RESET_CREDIT_ID_PATTERN = /^RateLimitResetCredit_[0-9a-f]{32}$/
 
 export interface CodexResetInput {
   /** The credit to redeem: a `CODEX_RESET_CREDIT_ID_PATTERN` match. */
