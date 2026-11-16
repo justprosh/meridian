@@ -298,6 +298,9 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           windowSource: reading.source,
           extraUsage: null,
           credits: usage?.credits ?? null,
+          // The card's banked resets, ids included, beside the windows they
+          // clear: a quota reader can then offer one without a second call.
+          resets: chatGptResetsView(usage?.resetCredits),
           creditsPolicy: policy?.policy ?? null,
           creditsPolicySource: policy?.source ?? null,
           planSpent: creditState?.planSpent ?? false,
